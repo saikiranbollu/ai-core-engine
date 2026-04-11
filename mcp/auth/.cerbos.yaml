@@ -1,0 +1,21 @@
+# Cerbos PDP Configuration
+# ========================
+# Runs as a sidecar alongside the MCP server in the same K8s pod.
+# gRPC on :3593 (used by Python SDK), HTTP on :3592 (health checks).
+
+server:
+  httpListenAddr: ":3592"
+  grpcListenAddr: ":3593"
+
+storage:
+  driver: "disk"
+  disk:
+    directory: /policies
+    watchForChanges: true
+
+audit:
+  enabled: true
+  backend: local
+  local:
+    storagePath: /tmp/cerbos-audit
+    retentionPeriod: 168h  # 7 days

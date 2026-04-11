@@ -1,0 +1,124 @@
+# =================================================================
+#  Cerbos Resource Policy — MCP Tool Access Control
+# =================================================================
+#  Resource "mcp_tool" covering all 56 tools across 13 categories
+#  + Sandbox + RLM with 3 access tiers.
+# =================================================================
+---
+apiVersion: "api.cerbos.dev/v1"
+resourcePolicy:
+  version: "default"
+  resource: "mcp_tool"
+  importDerivedRoles:
+    - "aice_workspace_roles"
+  rules:
+    # ── PUBLIC tools — any role may invoke ──
+    - actions: ["invoke"]
+      effect: EFFECT_ALLOW
+      roles: ["public", "developer", "admin"]
+      derivedRoles: ["public_via_developer", "public_via_admin"]
+      condition:
+        match:
+          any:
+            of:
+              # Category 1: Search & Query
+              - expr: "request.resource.attr.tool_name == 'search_database'"
+              - expr: "request.resource.attr.tool_name == 'search_nodes'"
+              - expr: "request.resource.attr.tool_name == 'get_node_by_id'"
+              # Category 2: API Intelligence
+              - expr: "request.resource.attr.tool_name == 'query_api_function'"
+              - expr: "request.resource.attr.tool_name == 'get_type_definition'"
+              - expr: "request.resource.attr.tool_name == 'generate_initialization_code'"
+              # Category 3: Dependency Analysis
+              - expr: "request.resource.attr.tool_name == 'query_dependencies'"
+              - expr: "request.resource.attr.tool_name == 'validate_api_usage'"
+              - expr: "request.resource.attr.tool_name == 'detect_polling_requirements'"
+              # Category 4: Traceability
+              - expr: "request.resource.attr.tool_name == 'find_requirement_traces'"
+              - expr: "request.resource.attr.tool_name == 'build_traceability_matrix'"
+              - expr: "request.resource.attr.tool_name == 'find_coverage_gaps'"
+              - expr: "request.resource.attr.tool_name == 'analyze_hw_sw_links'"
+              # Category 6: Memory & Context
+              - expr: "request.resource.attr.tool_name == 'session_start'"
+              - expr: "request.resource.attr.tool_name == 'session_store'"
+              - expr: "request.resource.attr.tool_name == 'session_retrieve'"
+              - expr: "request.resource.attr.tool_name == 'build_context'"
+              - expr: "request.resource.attr.tool_name == 'session_end'"
+              # Category 6+: Ephemeral Sandbox
+              - expr: "request.resource.attr.tool_name == 'sandbox_upload'"
+              - expr: "request.resource.attr.tool_name == 'sandbox_query'"
+              - expr: "request.resource.attr.tool_name == 'sandbox_status'"
+              - expr: "request.resource.attr.tool_name == 'sandbox_clear'"
+              # Category 6+: RLM
+              - expr: "request.resource.attr.tool_name == 'rlm_orchestrate'"
+              - expr: "request.resource.attr.tool_name == 'rlm_plan_preview'"
+              # Category 8: Feedback & Learning
+              - expr: "request.resource.attr.tool_name == 'submit_human_feedback'"
+              # Category 9: Review Gate
+              - expr: "request.resource.attr.tool_name == 'evaluate_confidence'"
+              - expr: "request.resource.attr.tool_name == 'complete_review'"
+              # Category 10: Ontology & Config
+              - expr: "request.resource.attr.tool_name == 'list_ontology_profiles'"
+              - expr: "request.resource.attr.tool_name == 'get_ontology_schema'"
+              # Category 11: Observability & Health
+              - expr: "request.resource.attr.tool_name == 'health_check'"
+              - expr: "request.resource.attr.tool_name == 'get_graph_statistics'"
+              - expr: "request.resource.attr.tool_name == 'list_available_modules'"
+              - expr: "request.resource.attr.tool_name == 'get_distribution'"
+              - expr: "request.resource.attr.tool_name == 'get_coverage_report'"
+
+    # ── DEVELOPER tools — developer + admin may invoke ──
+    - actions: ["invoke"]
+      effect: EFFECT_ALLOW
+      roles: ["developer", "admin"]
+      derivedRoles: ["developer_via_admin"]
+      condition:
+        match:
+          any:
+            of:
+              # Category 1: Search & Query
+              - expr: "request.resource.attr.tool_name == 'get_neighbors'"
+              - expr: "request.resource.attr.tool_name == 'shortest_path'"
+              - expr: "request.resource.attr.tool_name == 'execute_cypher'"
+              # Category 7: Cache Management
+              - expr: "request.resource.attr.tool_name == 'cache_get'"
+              - expr: "request.resource.attr.tool_name == 'cache_stats'"
+              # Category 8: Feedback & Learning
+              - expr: "request.resource.attr.tool_name == 'get_learning_metrics'"
+              - expr: "request.resource.attr.tool_name == 'get_failure_patterns'"
+              # Category 9: Review Gate
+              - expr: "request.resource.attr.tool_name == 'override_review_routing'"
+              - expr: "request.resource.attr.tool_name == 'get_review_analytics'"
+              # Category 10: Ontology & Config
+              - expr: "request.resource.attr.tool_name == 'validate_entity'"
+              - expr: "request.resource.attr.tool_name == 'get_ontology_compliance'"
+              # Category 11: Observability & Health
+              - expr: "request.resource.attr.tool_name == 'get_distribution'"
+              - expr: "request.resource.attr.tool_name == 'get_coverage_report'"
+              - expr: "request.resource.attr.tool_name == 'detect_communities'"
+              # Category 12: Visualization
+              - expr: "request.resource.attr.tool_name == 'visualize_subgraph'"
+              # Category 13: Authentication
+              - expr: "request.resource.attr.tool_name == 'get_token_info'"
+
+    # ── ADMIN tools — admin only ──
+    - actions: ["invoke"]
+      effect: EFFECT_ALLOW
+      roles: ["admin"]
+      condition:
+        match:
+          any:
+            of:
+              # Category 5: Ingestion Pipeline
+              - expr: "request.resource.attr.tool_name == 'ingest_file'"
+              - expr: "request.resource.attr.tool_name == 'ingest_module_from_repo'"
+              - expr: "request.resource.attr.tool_name == 'batch_ingest_modules'"
+              - expr: "request.resource.attr.tool_name == 'ingest_repository'"
+              # Category 7: Cache Management
+              - expr: "request.resource.attr.tool_name == 'cache_invalidate_module'"
+              - expr: "request.resource.attr.tool_name == 'cache_clear'"
+              - expr: "request.resource.attr.tool_name == 'cache_refresh_config'"
+              # Category 8: Feedback & Learning
+              - expr: "request.resource.attr.tool_name == 'process_results'"
+              # Category 13: Authentication
+              - expr: "request.resource.attr.tool_name == 'ensure_valid_token'"

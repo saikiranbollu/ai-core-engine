@@ -1,0 +1,126 @@
+# GraphRAG Configuration for ILLD & MCAL
+# Select the active instance: "illd" or "mcal"
+# This also selects the matching ontology profile in ontology.yaml
+active_instance: mcal
+
+# Select the vector store backend: qdrant
+vector_backend: qdrant
+
+# ---------------------------------------------------------------------------
+# Ontology Configuration
+# ---------------------------------------------------------------------------
+ontology:
+  config_file: "ontology.yaml"             # relative to this file's directory
+  active_profile: "${active_instance}"      # resolves to the active_instance value
+  allow_multi_profile: false                # set true to load both profiles simultaneously
+
+# ---------------------------------------------------------------------------
+# Neo4j Configuration
+# ---------------------------------------------------------------------------
+neo4j:
+  illd:
+    description: "ILLD - Reference Software (Cloud)"
+    uri: "bolt+ssc://bolt-passthrough-neo4j-mcswai-legato.icp.infineon.com:443"
+    username: "${NEO4J_USERNAME}"
+    password: "${NEO4J_PASSWORD}"
+    database: "neo4j"
+    encrypted: false
+    max_connection_lifetime: 3600
+    max_connection_pool_size: 50
+    connection_acquisition_timeout: 60
+    graph_settings:
+      node_label_prefix: "ILLD_"
+      embedding_dimension: 1536
+      similarity_threshold: 0.85
+
+  mcal:
+    description: "MCAL - Productive Software (Cloud)"
+    uri: "bolt+ssc://bolt-passthrough-neo4j-mcswai-mcal.icp.infineon.com:443"
+    username: "${NEO4J_USERNAME}"
+    password: "${NEO4J_PASSWORD}"
+    database: "neo4j"
+    encrypted: false
+    max_connection_lifetime: 3600
+    max_connection_pool_size: 50
+    connection_acquisition_timeout: 60
+    graph_settings:
+      node_label_prefix: "MCAL_"
+      embedding_dimension: 1536
+      similarity_threshold: 0.85
+
+# ---------------------------------------------------------------------------
+# Qdrant Configuration (remote vector store)
+# ---------------------------------------------------------------------------
+qdrant:
+  url: "https://qdrant-mcswai.eu-de-7.icp.infineon.com"
+  port: 443
+  api_key: "${QDRANT_API_KEY}"
+  https: true                          # use HTTPS transport
+  embedding_dimension: 384
+  distance_metric: "cosine"           # cosine | euclid | dot
+  grpc: false                         # gRPC disabled — HTTPS ingress only supports HTTP/1.1
+                                      # when running outside the cluster (HTTPS
+                                      # ingress only supports HTTP/1.1)
+  timeout: 30                         # request timeout in seconds
+  verify_ssl: false                   # set true if server has a trusted SSL cert
+  # In-cluster override: when KUBERNETES_SERVICE_HOST is set, the MCP server
+  # connects directly to the K8s service via plain gRPC (no TLS).
+  in_cluster_url: "http://qdrant.mcswai.svc.cluster.local"
+  in_cluster_grpc_port: 6334
+  illd:
+    description: "ILLD - Reference Software Vector Store (Qdrant)"
+    collection_name: "illd_graphrag"
+  mcal:
+    description: "MCAL - Productive Software Vector Store (Qdrant)"
+    collection_name: "mcal_graphrag"
+
+# ---------------------------------------------------------------------------
+# Jama REST API Configuration
+# ---------------------------------------------------------------------------
+jama:
+  base_url: "${JAMA_BASE_URL}"
+  api_key: "${JAMA_API_KEY}"
+  api_secret: "${JAMA_API_SECRET}"
+  verify_ssl: true
+  timeout: 120
+  max_workers: 10            # parallel threads for relationship fetching
+
+  # Jama project container IDs (AU3GM / MCAL)
+  containers:
+    prq: 7463476             # Product Requirement container
+    shrq: 7458908            # Stakeholder Requirement container
+
+  # ILLD-specific Jama configuration
+  illd:
+    project_id: 1986         # AURIX_RC1_iLLD project (key: AURC1)
+    container_id: 18002547   # Root container for iLLD requirements
+    item_type: 83            # Requirement item type for ILLD (NOT 57/58 like MCAL)
+
+# ---------------------------------------------------------------------------
+# ILLD Data Paths (used by illd_parsers, rag_ingestion, pdf_pipeline)
+# ---------------------------------------------------------------------------
+data:
+  base_path: "./data"                                # relative to HybridRAG/
+  raw_input_pattern: "{module}/raw"                  # PDFs go here
+  processed_output_pattern: "{module}/processed"     # JSON/MD output
+  default_module: "CXPI"
+
+# ---------------------------------------------------------------------------
+# Embedding Configuration (shared across RAG pipelines)
+# ---------------------------------------------------------------------------
+embedding:
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  revision: "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"   # pinned HF commit hash
+  dimension: 384
+  batch_size: 64
+
+# ---------------------------------------------------------------------------
+# PDF Pipeline (LLM-based PDF → Markdown conversion)
+# ---------------------------------------------------------------------------
+pdf_pipeline:
+  api_base_url: "https://gpt4ifx.icp.infineon.com"
+  model: "gpt-5.2"
+  timeout: 300               # seconds per API call
+  max_retries: 3
+  batch_size: 2              # pages per LLM batch (2–3 recommended)
+  dpi: 300                   # render DPI for page images

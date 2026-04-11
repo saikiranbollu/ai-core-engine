@@ -1,0 +1,24 @@
+# Cerbos Derived Roles — Workspace-Scoped Role Hierarchy
+# ======================================================
+# Implements tier inheritance: admin ⊃ developer ⊃ public
+#
+# A principal with the "admin" role automatically gets "developer"
+# and "public" derived roles. A principal with "developer" also
+# gets "public".
+
+---
+apiVersion: "api.cerbos.dev/v1"
+derivedRoles:
+  name: "aice_workspace_roles"
+  definitions:
+    # Admin inherits developer privileges
+    - name: "developer_via_admin"
+      parentRoles: ["admin"]
+
+    # Admin inherits public privileges
+    - name: "public_via_admin"
+      parentRoles: ["admin"]
+
+    # Developer inherits public privileges
+    - name: "public_via_developer"
+      parentRoles: ["developer"]

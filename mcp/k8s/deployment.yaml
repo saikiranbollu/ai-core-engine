@@ -1,0 +1,83 @@
+# AI Core Engine MCP Server — Kubernetes Deployment
+# ==================================================
+# Single-container pod running app.py which boots both
+# the Cerbos PDP sidecar (subprocess) and the MCP server.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aice-mcp-server
+  labels:
+    app: aice-mcp-server
+    component: core-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aice-mcp-server
+  template:
+    metadata:
+      labels:
+        app: aice-mcp-server
+        component: core-engine
+    spec:
+      containers:
+        - name: aice-mcp
+          image: aice-mcp-server:latest
+          command: ["python", "mcp/app.py"]
+          ports:
+            - name: mcp-http
+              containerPort: 8080
+              protocol: TCP
+            - name: cerbos-http
+              containerPort: 3592
+              protocol: TCP
+            - name: cerbos-grpc
+              containerPort: 3593
+              protocol: TCP
+          env:
+            - name: CERBOS_HOST
+              value: "localhost"
+            - name: CERBOS_HTTP_PORT
+              value: "3592"
+            - name: CERBOS_GRPC_PORT
+              value: "3593"
+            - name: FASTMCP_PORT
+              value: "8080"
+            - name: API_KEY_REGISTRY_PATH
+              value: "/app/mcp/auth/api_keys.yaml"
+            # API key is sent per-request via Authorization header.
+            # No server-side MCP_API_KEY env var needed.
+            # Neo4j / Qdrant / Redis credentials — inject from secrets
+            - name: NEO4J_URI
+              valueFrom:
+                secretKeyRef:
+                  name: aice-db-secrets
+                  key: neo4j-uri
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aice-db-secrets
+                  key: neo4j-password
+            - name: REDIS_URL
+              value: "redis://:password@redis.mcswai.svc.cluster.local:6379/0"
+          livenessProbe:
+            httpGet:
+              path: /_cerbos/health
+              port: cerbos-http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /_cerbos/health
+              port: cerbos-http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      restartPolicy: Always

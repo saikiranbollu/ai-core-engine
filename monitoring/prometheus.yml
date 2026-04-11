@@ -1,0 +1,22 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  Prometheus Configuration — AI Core Engine
+#  Sprint 10
+# ═══════════════════════════════════════════════════════════════════════
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ── MCP Server metrics ──
+  - job_name: "aice-mcp-server"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["mcp-server:8000"]
+        labels:
+          service: "mcp-server"
+
+  # ── Prometheus self-monitoring ──
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

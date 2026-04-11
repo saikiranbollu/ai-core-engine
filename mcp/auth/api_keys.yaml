@@ -1,0 +1,66 @@
+# API Key Registry
+# ================
+# Maps API keys to principals with per-workspace role assignments.
+#
+# Roles: public, developer, admin
+# Role hierarchy (enforced in Cerbos policies):
+#   admin ⊃ developer ⊃ public
+#
+# Workspace scoping: a principal can hold different roles per workspace.
+# Use "*" as a wildcard workspace for global access.
+#
+# SECURITY: In production, replace this file with a secrets-manager
+# backed store. Rotate keys regularly.
+#
+# SECURITY: In production, replace this file with a secrets-manager
+# backed store. Rotate keys regularly.
+
+keys:
+  # ── Domain Assistants (Public tier) ──
+  "key-gest-001":
+    principal_id: "gest_assistant"
+    roles:
+      illd: ["public"]
+      mcal: ["public"]
+
+  "key-cia-001":
+    principal_id: "cia_assistant"
+    roles:
+      illd: ["public"]
+      mcal: ["public"]
+
+  "key-reva-001":
+    principal_id: "reva_assistant"
+    roles:
+      illd: ["public"]
+      mcal: ["public"]
+
+  "key-acra-001":
+    principal_id: "acra_assistant"
+    roles:
+      illd: ["public"]
+      mcal: ["public"]
+
+  # ── Advanced Assistants (Developer tier) ──
+  "key-saga-001":
+    principal_id: "saga_assistant"
+    roles:
+      illd: ["developer"]
+      mcal: ["public"]
+
+  "key-triplea-001":
+    principal_id: "triplea_assistant"
+    roles:
+      illd: ["developer"]
+      mcal: ["developer"]
+
+  # ── Admin / Infrastructure ──
+  "key-admin-pipeline":
+    principal_id: "ingestion_pipeline"
+    roles:
+      "*": ["admin"]
+
+  "key-admin-ops":
+    principal_id: "platform_ops"
+    roles:
+      "*": ["admin"]

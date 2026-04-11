@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.env.local
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+.venv/
+.vscode/
+.github/
+
+# Environment secrets
+env/*.env
+
+# Test scripts (exploratory / debug helpers)
+src/HybridRAG/code/TestScripts/
+
+# Local vector-store databases
+src/HybridRAG/chroma_data/
+*.sqlite3
+
+# Visualization outputs
+src/HybridRAG/visualize/*.html
+
+# Neo4j local data
+*.db
+neo4j_data/
+qdrant_data/
+redis_data/
+chroma_data/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+references
+
+# Temp / generated data
+temp/
+data/
+src/HybridRAG/jama-req/
+src/HybridRAG/swa/
+src/HybridRAG/swud/
+src/HybridRAG/testspec/
+
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+
+.temp_explore/
+.temp_intermediary/

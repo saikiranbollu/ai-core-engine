@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# Thread Pool Configuration – AICE Ingestion Pipeline
+# ---------------------------------------------------------------------------
+# Controls the maximum number of worker threads for concurrent operations
+# in each component. Set max_workers to 1 to disable parallelism for a
+# specific component. A value of 0 or null uses Python's default
+# (min(32, os.cpu_count() + 4)).
+#
+# Adjust these values based on your system resources, API rate limits,
+# and I/O characteristics.
+# ---------------------------------------------------------------------------
+
+thread_pool:
+
+  # Pipeline orchestrator – parallel file processing during ingestion runs
+  orchestrator:
+    max_workers: 4
+
+  # Connectors – parallel API calls to external systems
+  connectors:
+    jama:
+      max_workers: 4
+    jenkins:
+      max_workers: 4
+    polarion:
+      max_workers: 4
+    bitbucket:
+      max_workers: 4
+
+  # Incremental ingestion – parallel file hashing / change detection
+  incremental:
+    max_workers: 4
+
+  # Parsers – parallel LLM / API calls during document processing
+  parsers:
+    pdf:
+      max_workers: 6
+    swa:
+      max_workers: 4

@@ -1,0 +1,23 @@
+DA_ID,DA_Name,V_Model_Phase,Primary_LLM,IP_Class,Tool_Impact_TI,Tool_Detection_TD_Target,Tool_Confidence_Level_TCL,Suggested_Priority,ASIL_Scope,Qualification_Methods_26262_8,Human_Review_Default,ASIL_Override_Required,Notes_vs_Original_Matrix
+REVA,Requirements Review,Requirements,GPT4IFX,Customer-NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original
+PRQ_Drafter,Requirements Drafting,Requirements,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,FULL,Always FULL for ASIL-C/D,Matches original
+RMA,Requirements Management,Requirements,GPT4IFX,IFX-Confidential,TI2,TD1,TCL1,MEDIUM,A-D,1b,AUTO,No,Missing from original
+SAGA,SW Architecture,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Missing from original
+SAVA,SW Arch Verification,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original
+SASA,SW Arch Safety Analysis,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,CRITICAL,A-D,1b + 1c + 1d,FULL,Always FULL,Raised from HIGH
+HAZOPA,HAZOP Analysis,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,CRITICAL,A-D,1b + 1c + 1d,FULL,Always FULL,Raised from MEDIUM (original)
+DaFaA,Dataflow/Fault Analysis,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original
+CIA,Code Implementation Assistant,Design/Impl,GPT4IFX for mcal; Copilot for illd,NDA,TI2,TD2,TCL2,CRITICAL,A-D,1b + 1c,FULL,Always FULL for ASIL-D,Missing from original - highest-volume code gen
+CTA,Code Transformation Assistant,Design/Impl,GPT4IFX,NDA,TI2,TD2,TCL2,CRITICAL,A-D,1b + 1c,FULL,Always FULL for ASIL-D,Missing from original - migration risks
+GECA,Config Generation Assistant,Design/Impl,GPT4IFX,NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Raised from LOW (original)
+GEVT,Config Verification/Test,Design/Impl,GPT4IFX,NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original
+ACRA,Code Review Assistant,Verification,GPT4IFX,NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original
+GEST,Test Generation Assistant,Verification,GPT4IFX,NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Raised from LOW (original) - weakens TD for code gen if poor
+ATRA,Test/Arch Req Traceability,Verification,GPT4IFX,NDA,TI2,TD1,TCL1,MEDIUM,A-D,1b,AUTO,No,Matches original (structural)
+ATQA,Test Quality Assessment,Verification,GPT4IFX,NDA,TI2,TD2,TCL2,MED-HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Raised from LOW (original)
+TripleA,Req-Arch-Impl-Test Integrity,Cross-cutting,GPT4IFX,IFX-Confidential,TI2,TD1,TCL1,MEDIUM,A-D,1b,AUTO,No,Missing from original
+PAGE,Page/Documentation Gen,Support,Copilot,Public+Internal,TI1,TD1,TCL1,LOW,A-D,None required (TCL1),QUICK,No,Missing from original
+KW,Knowledge Worker (Ingestion),Support,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,MEDIUM,A-D,1b + 1c,QUICK,No,Missing from original - prompt-injection attack surface
+M2MA,Model-to-Model Agent,Support,Unknown,Varies,TI2,TD2,TCL2,MEDIUM,A-D,1b + 1c,QUICK,No,Clarification needed - placeholder
+ZA,Zephyr Assistant (BSP?),Platform,GPT4IFX,Mixed,TI2,TD2,TCL2,MED-HIGH,A-D,1b + 1c,FULL,Always FULL,If BSP code gen; clarify scope
+NXA,NuttX Assistant (BSP?),Platform,GPT4IFX,Mixed,TI2,TD2,TCL2,MED-HIGH,A-D,1b + 1c,FULL,Always FULL,If BSP code gen; clarify scope

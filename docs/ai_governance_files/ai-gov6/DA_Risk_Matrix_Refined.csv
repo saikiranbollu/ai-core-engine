@@ -1,0 +1,24 @@
+DA_ID,DA_Name,V_Model_Phase,Primary_LLM,IP_Class,Tool_Impact_TI,Tool_Detection_TD_Target,Tool_Confidence_Level_TCL,Suggested_Priority,ASIL_Scope,Qualification_Methods_26262_8,Human_Review_Default,ASIL_Override_Required,Notes_vs_Original_Matrix
+REVA,Requirements Review,Requirements,GPT4IFX,Customer-NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original; TD2 because requirement quality not statically verifiable
+PRQ_Drafter,Requirements Drafting,Requirements,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,FULL,Always FULL for ASIL-C/D,Matches original; TD2 because new requirements cannot be auto-checked
+RMA,Requirements Management,Requirements,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,MEDIUM,A-D,1b + 1c,QUICK,No,Missing from original; TD2 because traceability semantics need expert review
+SAGA,SW Architecture,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Missing from original; TD2 because architecture correctness needs human judgment
+SAVA,SW Arch Verification,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original
+SASA,SW Arch Safety Analysis,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,CRITICAL,A-D,1b + 1c,FULL,Always FULL + Safety Mgr,Raised from HIGH; Safety Manager owns TCER
+HAZOPA,HAZOP Analysis,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,CRITICAL,A-D,1b + 1c,FULL,Always FULL + Safety Mgr,Raised from MEDIUM in original
+DaFaA,Dataflow/Fault Analysis,Architecture,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original
+CIA,Code Implementation Assistant,Design/Impl,GPT4IFX for mcal; Copilot for illd,NDA,TI2,TD1,TCL1,CRITICAL,A-D,None formal (TCL1) + validity check,FULL,Always FULL + indep + Safety Mgr for ASIL-D,Missing from original - highest-volume code gen; TD1 defensible per ISO 26262-8 §11.4.5.5 Ex.3 given full static analysis pipeline (precondition: no gate bypassed)
+CTA,Code Transformation Assistant,Design/Impl,GPT4IFX,NDA,TI2,TD1,TCL1,HIGH,A-D,None formal (TCL1) + validity check,FULL,Always FULL + indep for ASIL-D,Missing from original; TD1 same rationale as CIA (pure code output)
+GECA,Config Generation Assistant,Design/Impl,GPT4IFX,NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,FULL,Force FULL+indep for ASIL>=C,Raised from LOW; TD2 because semantic config-intent errors beyond static check
+GEVT,Config Verification/Test,Design/Impl,GPT4IFX,NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original
+ACRA,Code Review Assistant,Verification,GPT4IFX,NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Matches original; TD2 because ACRA miss-detection needs indep review
+GEST_TestCode,Test Code Generation,Verification,GPT4IFX,NDA,TI2,TD1,TCL1,HIGH,A-D,None formal (TCL1) + validity check,QUICK,Force FULL for ASIL>=C,Split from GEST; test code flows through MISRA+compile+peer review
+GEST_TestSpec,Test Spec Generation,Verification,GPT4IFX,NDA,TI2,TD2,TCL2,HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Split from GEST; spec correctness needs expert review
+ATRA,Test/Arch Req Traceability,Verification,GPT4IFX,NDA,TI2,TD1,TCL1,MEDIUM,A-D,None formal (TCL1),AUTO,No,Matches original (structural/deterministic)
+ATQA,Test Quality Assessment,Verification,GPT4IFX,NDA,TI2,TD2,TCL2,MED-HIGH,A-D,1b + 1c,QUICK,Force FULL for ASIL>=C,Raised from LOW
+TripleA,Req-Arch-Impl-Test Integrity,Cross-cutting,GPT4IFX,IFX-Confidential,TI2,TD1,TCL1,MEDIUM,A-D,None formal (TCL1),AUTO,No,Missing from original; graph-query semantics
+PAGE,Page/Documentation Gen,Support,Copilot,Public+Internal,TI1,TD1,TCL1,LOW,A-D,None required (TCL1),QUICK,No for non-safety docs; FULL+Legal for safety manual,Missing from original; safety manuals elevated to TI2
+KW,Knowledge Worker (Ingestion),Support,GPT4IFX,IFX-Confidential,TI2,TD2,TCL2,MEDIUM,A-D,1b + 1c,QUICK,No,Missing from original; prompt-injection attack surface via ingestion
+M2MA,Model-to-Model Agent,Support,GPT4IFX,Varies,TI2,TD2,TCL2,MEDIUM,A-D,1b + 1c,QUICK,No,Scope: model transformation; TD2 pending validation strategy
+ZA,Zephyr Assistant (BSP),Platform,GPT4IFX,Mixed,TI2,TD2,TCL2,MED-HIGH,A-D,1b + 1c,FULL,Always FULL for safety-relevant BSP,BSP code through pipeline but OS-integration semantics not fully static-checked
+NXA,NuttX Assistant (BSP),Platform,GPT4IFX,Mixed,TI2,TD2,TCL2,MED-HIGH,A-D,1b + 1c,FULL,Always FULL for safety-relevant BSP,Same rationale as ZA

@@ -187,26 +187,23 @@ void Test_IfxCxpi_Cxpi_initModule_001(void)
 
         # ── Step 5: evaluate_confidence ────────────────────────────────
         conf = calc.evaluate({
-            "has_kg_context": True,
-            "has_dependency_order": True,
+            "pattern_match": True,
+            "call_order_valid": True,
             "validation_score": 92,
-            "has_proven_patterns": True,
-            "misra_compliant": True,
-            "similar_approved": True,
-            "is_safety_critical": False,
+            "api_match_ratio": 0.98,
         }, response_id="gest_e2e_resp_001")
 
         assert conf["score"] >= 80
         assert conf["review_type"] == "AUTO"
         assert conf["response_id"] == "gest_e2e_resp_001"
-        assert len(conf["breakdown"]) >= 5
+        assert len(conf["breakdown"]) >= 4
 
         session_mgr.store("GEST_20260322_E2E", "confidence", conf)
 
         # ── Step 6a: complete_review ───────────────────────────────────
         review = sink.complete_review(
             "gest_e2e_resp_001", "APPROVE", reviewer_id="sai_kiran",
-            rationale="Test covers init sequence correctly. MISRA compliant.")
+            rationale="Test covers init sequence correctly.")
         assert review["review_id"].startswith("rv_")
 
         # ── Step 6b: submit_human_feedback ─────────────────────────────
@@ -331,9 +328,10 @@ class TestCrossServiceIntegration:
 
         calc = ConfidenceCalculator()
         conf = calc.evaluate({
-            "has_kg_context": True,
-            "format_correct": True,
-            "has_dependency_order": code_result["fields_from_kg"] > 0,
+            "pattern_match": True,
+            "output_well_formed": True,
+            "api_verified": True,
+            "call_order_valid": code_result["fields_from_kg"] > 0,
         })
         assert conf["review_type"] in ("AUTO", "QUICK", "FULL")
 

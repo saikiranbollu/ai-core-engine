@@ -298,12 +298,11 @@ class TestFullSessionLifecycle:
 
         # Step 5: evaluate_confidence (simulated)
         confidence_signals = {
-            "has_kg_context": True,
-            "has_dependency_order": True,
+            "pattern_match": True,
+            "call_order_valid": True,
             "validation_score": 85,
-            "is_safety_critical": False,
         }
-        # Base=50 + context(+30) + deps(+20) + validation(+10) - not_safety(0) = ~110 → capped 100 → AUTO
+        # Base=20 + pattern(+10) + order(+25) + validation(+15) = 70 → QUICK
         mgr.store("GEST_20260322_001", "confidence_signals", confidence_signals)
 
         # Step 6: session_end

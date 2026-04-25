@@ -28,92 +28,118 @@ class TestConfidenceCalculator:
         self.calc = ConfidenceCalculator()
 
     def test_base_score_no_signals(self):
-        """No signals → base score 50 → QUICK."""
+        """No signals → base score 20 → FULL."""
         result = self.calc.evaluate({})
-        assert result["score"] == 50
-        assert result["review_type"] == "QUICK"
+        assert result["score"] == 20
+        assert result["review_type"] == "FULL"
 
     def test_auto_routing_high_confidence(self):
         """All quality signals → score >= 80 → AUTO."""
         result = self.calc.evaluate({
-            "has_kg_context": True,          # +30
-            "has_dependency_order": True,     # +20
-            "format_correct": True,          # +10
+            "pattern_match": True,            # +10
+            "api_verified": True,             # +25
+            "call_order_valid": True,         # +25
         })
-        # 50 + 30 + 20 + 10 = 110 → capped at 100
+        # 20 + 10 + 25 + 25 = 80
         assert result["score"] >= 80
         assert result["review_type"] == "AUTO"
 
     def test_full_routing_low_confidence(self):
         """Risk signals → score < 50 → FULL."""
         result = self.calc.evaluate({
-            "missing_requirements": True,    # -30
             "is_safety_critical": True,      # -15
+            "no_failure_match": True,        # -10
         })
-        # 50 - 30 - 15 = 5
+        # 20 - 15 - 10 = -5 → clamped to 0
         assert result["score"] < 50
         assert result["review_type"] == "FULL"
 
     def test_quick_routing_medium(self):
         """Mixed signals → QUICK."""
         result = self.calc.evaluate({
-            "has_kg_context": True,          # +30
-            "complex_logic": True,           # -10
-            "novel_pattern": True,           # -15
+            "api_verified": True,            # +25
+            "call_order_valid": True,        # +25
+            "is_safety_critical": True,      # -15
         })
-        # 50 + 30 - 10 - 15 = 55 → QUICK
+        # 20 + 25 + 25 - 15 = 55 → QUICK
         assert 50 <= result["score"] < 80
         assert result["review_type"] == "QUICK"
 
     def test_score_capped_at_100(self):
         result = self.calc.evaluate({
-            "has_kg_context": True,
-            "high_relevance": True,
-            "has_proven_patterns": True,
-            "format_correct": True,
-            "misra_compliant": True,
-            "similar_approved": True,
-            "has_dependency_order": True,
+            "pattern_match": True,
+            "api_verified": True,
+            "call_order_valid": True,
+            "config_valid": True,
+            "output_well_formed": True,
         })
+        # 20 + 10 + 25 + 25 + 15 + 5 = 100
         assert result["score"] == 100
 
     def test_score_floored_at_0(self):
         result = self.calc.evaluate({
-            "missing_requirements": True,
-            "low_relevance": True,
-            "novel_pattern": True,
-            "compliance_warnings": True,
-            "complex_logic": True,
             "is_safety_critical": True,
+            "no_failure_match": True,
         })
+        # 20 - 15 - 10 = -5 → clamped to 0
         assert result["score"] == 0
 
     def test_breakdown_included(self):
-        result = self.calc.evaluate({"has_kg_context": True, "is_safety_critical": True})
+        result = self.calc.evaluate({"pattern_match": True, "is_safety_critical": True})
         assert len(result["breakdown"]) == 2
         signals = {b["signal"] for b in result["breakdown"]}
-        assert "has_kg_context" in signals
+        assert "pattern_match" in signals
         assert "is_safety_critical" in signals
 
     def test_validation_score_mapping(self):
-        """validation_score >= 80 → format_correct = True."""
+        """validation_score >= 80 → output_well_formed = True."""
         result = self.calc.evaluate({"validation_score": 92})
-        assert result["score"] == 60  # 50 + 10 (format_correct)
+        assert result["score"] == 25  # 20 + 5 (output_well_formed)
 
     def test_validation_score_low(self):
-        """validation_score < 80 → format_correct not triggered."""
+        """validation_score < 80 → output_well_formed not triggered."""
         result = self.calc.evaluate({"validation_score": 70})
-        assert result["score"] == 50  # No change
+        assert result["score"] == 20  # No change
 
-    def test_relevance_score_high(self):
-        """relevance_score >= 0.9 → high_relevance."""
-        result = self.calc.evaluate({"relevance_score": 0.95})
-        assert result["score"] == 70  # 50 + 20
+    def test_api_verified_signal(self):
+        """api_verified = True → +25."""
+        result = self.calc.evaluate({"api_verified": True})
+        assert result["score"] == 45  # 20 + 25
 
-    def test_relevance_score_low(self):
-        """relevance_score < 0.7 → low_relevance."""
-        result = self.calc.evaluate({"relevance_score": 0.5})
-        assert result["score"] == 30  # 50 - 20
+    def test_api_match_ratio_mapping(self):
+        """api_match_ratio >= 0.95 → api_verified = True."""
+        result = self.calc.evaluate({"api_match_ratio": 0.98})
+        assert result["score"] == 45  # 20 + 25 (api_verified)
+
+    def test_api_match_ratio_low(self):
+        """api_match_ratio < 0.95 → no api_verified."""
+        result = self.calc.evaluate({"api_match_ratio": 0.80})
+        assert result["score"] == 20  # No change
+
+    def test_config_valid_signal(self):
+        """config_valid = True → +15."""
+        result = self.calc.evaluate({"config_valid": True})
+        assert result["score"] == 35  # 20 + 15
+
+    def test_config_match_ratio_mapping(self):
+        """config_match_ratio >= 0.90 → config_valid = True."""
+        result = self.calc.evaluate({"config_match_ratio": 0.95})
+        assert result["score"] == 35  # 20 + 15 (config_valid)
+
+    def test_config_match_ratio_low(self):
+        """config_match_ratio < 0.90 → no config_valid."""
+        result = self.calc.evaluate({"config_match_ratio": 0.85})
+        assert result["score"] == 20  # No change
+
+    def test_no_failure_match_signal(self):
+        """no_failure_match = True → -10."""
+        result = self.calc.evaluate({"no_failure_match": True})
+        assert result["score"] == 10  # 20 - 10
+
+    def test_safety_critical_signal(self):
+        """is_safety_critical alone → -15."""
+        result = self.calc.evaluate({"is_safety_critical": True})
+        assert result["score"] == 5  # 20 - 15
 
     def test_response_id_auto_generated(self):
         result = self.calc.evaluate({})
@@ -124,40 +150,39 @@ class TestConfidenceCalculator:
         assert result["response_id"] == "my_resp_001"
 
     def test_routing_info(self):
-        result = self.calc.evaluate({"has_kg_context": True, "has_dependency_order": True})
+        result = self.calc.evaluate({"pattern_match": True, "api_verified": True})
         assert "routing" in result
         assert result["routing"]["threshold_auto"] == 80
         assert result["routing"]["threshold_quick"] == 50
         assert isinstance(result["routing"]["estimated_minutes"], int)
 
-    def test_pptx_example_gest_high(self):
-        """PPTX slide 25 example: GEST generates tests → HIGH → AUTO."""
+    def test_example_gest_high(self):
+        """All quality signals present → AUTO."""
         result = self.calc.evaluate({
-            "has_kg_context": True,          # +30
-            "has_proven_patterns": True,     # +15
-            "high_relevance": True,          # +20
-            "misra_compliant": True,         # +10
-            "similar_approved": True,        # +5
+            "pattern_match": True,            # +10
+            "api_verified": True,             # +25
+            "call_order_valid": True,         # +25
+            "config_valid": True,             # +15
+            "output_well_formed": True,       # +5
         })
-        # 50 + 30 + 15 + 20 + 10 + 5 = 130 → capped 100
+        # 20 + 10 + 25 + 25 + 15 + 5 = 100
         assert result["review_type"] == "AUTO"
 
-    def test_pptx_example_cia_complex(self):
-        """PPTX slide 25 example: CIA complex algorithm → LOW → FULL."""
+    def test_example_safety_critical_with_apis(self):
+        """APIs verified but safety-critical → QUICK."""
         result = self.calc.evaluate({
-            "has_kg_context": True,          # +30
-            "novel_pattern": True,           # -15
-            "complex_logic": True,           # -10
-            "low_relevance": True,           # -20
+            "api_verified": True,             # +25
+            "call_order_valid": True,         # +25
+            "is_safety_critical": True,       # -15
         })
-        # 50 + 30 - 15 - 10 - 20 = 35
-        assert result["score"] == 35
-        assert result["review_type"] == "FULL"
+        # 20 + 25 + 25 - 15 = 55 → QUICK
+        assert result["score"] == 55
+        assert result["review_type"] == "QUICK"
 
     def test_custom_weights(self):
-        calc = ConfidenceCalculator(weights={"has_kg_context": 50})
-        result = calc.evaluate({"has_kg_context": True})
-        assert result["score"] == 100  # 50 + 50
+        calc = ConfidenceCalculator(weights={"pattern_match": 60})
+        result = calc.evaluate({"pattern_match": True})
+        assert result["score"] == 80  # 20 + 60
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -250,8 +275,8 @@ class TestContinuousLearningLoop:
 
         # Step 1: DA generates output, evaluate confidence
         conf = calc.evaluate({
-            "has_kg_context": True,
-            "has_dependency_order": True,
+            "api_verified": True,
+            "call_order_valid": True,
             "validation_score": 85,
         }, response_id="gen_001")
         assert conf["review_type"] in ("AUTO", "QUICK", "FULL")
@@ -269,7 +294,7 @@ class TestContinuousLearningLoop:
         # Step 4: Verify metrics updated
         metrics = sink.get_learning_metrics(include_pattern_details=True)
         assert metrics["total_feedbacks"] == 1
-        assert metrics["approved_patterns_count"] == 0  # APPROVE_WITH_EDITS != APPROVE
+        assert metrics["approved_patterns_count"] == 1  # APPROVE_WITH_EDITS counts as approved (confidence=0.75)
 
         # Step 5: Simulate a REJECT to build failure patterns
         sink.submit_feedback(
@@ -286,8 +311,9 @@ class TestContinuousLearningLoop:
 
         # Generate 5 outputs with HIGH confidence → AUTO
         for i in range(5):
-            conf = calc.evaluate({"has_kg_context": True, "has_dependency_order": True,
-                                   "misra_compliant": True}, response_id=f"auto_{i}")
+            conf = calc.evaluate({"api_verified": True, "call_order_valid": True,
+                                   "config_valid": True, "output_well_formed": True},
+                                  response_id=f"auto_{i}")
             assert conf["review_type"] == "AUTO"
 
         # 4 approved, 1 rejected → 80% accuracy for AUTO routing

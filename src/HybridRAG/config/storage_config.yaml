@@ -62,7 +62,7 @@ qdrant:
                                       # when running outside the cluster (HTTPS
                                       # ingress only supports HTTP/1.1)
   timeout: 30                         # request timeout in seconds
-  verify_ssl: false                   # set true if server has a trusted SSL cert
+  verify_ssl: true                    # Infineon SSL CA 4 cert is publicly trusted
   # In-cluster override: when KUBERNETES_SERVICE_HOST is set, the MCP server
   # connects directly to the K8s service via plain gRPC (no TLS).
   in_cluster_url: "http://qdrant.mcswai.svc.cluster.local"

@@ -38,6 +38,10 @@ chroma_data/
 # OS / editor
 .DS_Store
 Thumbs.db
+# Temporary exploration / intermediary folders
+temp_explore/
+temp_intermediary/
+AICE_INTEGRATION_PLAN.md
 *.swp
 *.swo
 *~

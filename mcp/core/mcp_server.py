@@ -72,6 +72,8 @@ try:
         RLM_REQUESTS_TOTAL, RLM_SUBQUERIES,
         INGESTION_FILES_TOTAL, BACKEND_UP,
         REVIEW_ROUTING_TOTAL, PROMETHEUS_AVAILABLE,
+        QUERY_LATENCY, CACHE_HIT_RATE, CACHE_SIZE, ERROR_TOTAL,
+        INGESTION_DURATION,
         make_metrics_app,
     )
 except ImportError:
@@ -99,6 +101,11 @@ except ImportError:
     INGESTION_FILES_TOTAL = _noop
     BACKEND_UP = _noop
     REVIEW_ROUTING_TOTAL = _noop
+    QUERY_LATENCY = _noop
+    CACHE_HIT_RATE = _noop
+    CACHE_SIZE = _noop
+    ERROR_TOTAL = _noop
+    INGESTION_DURATION = _noop
 
 # ── Path bootstrapping: make src/ importable ──────────────────────────────
 _MCP_DIR = Path(__file__).resolve().parent          # mcp/core/
@@ -113,6 +120,14 @@ logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO")),
     format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
 )
+
+# Install log sanitizer before any other logging occurs
+try:
+    from src.Observability.log_sanitizer import install_log_sanitizer
+    install_log_sanitizer()
+except ImportError:
+    pass  # sanitizer not available — continue without it
+
 logger = logging.getLogger("aice_mcp")
 
 # ── Per-tool timing context vars (for _finish_tool) ─────────────────────────
@@ -142,6 +157,47 @@ def _ok(data: Any) -> str:
 def _err(code: str, message: str) -> str:
     _finish_tool("error")
     return json.dumps({"error": True, "error_code": code, "message": message})
+
+
+# ── Metrics helpers (Tickets 7 & 8) ──────────────────────────────────────
+
+def _update_cache_gauges(cache) -> None:
+    """Push current cache size and hit rate into Prometheus gauges."""
+    try:
+        if hasattr(cache, '_lru') and cache._lru:
+            lru = cache._lru
+            CACHE_SIZE.labels(cache_type="lru").set(len(getattr(lru, '_cache', {})))
+            hits = getattr(lru, '_hits', 0)
+            misses = getattr(lru, '_misses', 0)
+            total = hits + misses
+            if total > 0:
+                CACHE_HIT_RATE.labels(cache_type="lru").set(hits / total)
+        if hasattr(cache, '_semantic') and cache._semantic:
+            sem = cache._semantic
+            CACHE_SIZE.labels(cache_type="semantic").set(len(getattr(sem, '_store', {})))
+            hits = getattr(sem, '_hits', 0)
+            misses = getattr(sem, '_misses', 0)
+            total = hits + misses
+            if total > 0:
+                CACHE_HIT_RATE.labels(cache_type="semantic").set(hits / total)
+    except Exception:
+        pass  # best-effort — never break request path for metrics
+
+
+def _classify_and_record_error(exc: Exception, component: str) -> None:
+    """Classify an exception and increment the ERROR_TOTAL counter."""
+    exc_name = type(exc).__name__.lower()
+    if "timeout" in exc_name or "timed out" in str(exc).lower():
+        error_type = "timeout"
+    elif any(kw in exc_name for kw in ("connect", "refused", "unreachable", "dns")):
+        error_type = "connection"
+    elif any(kw in exc_name for kw in ("auth", "permission", "forbidden", "401", "403")):
+        error_type = "auth"
+    elif any(kw in exc_name for kw in ("validation", "value", "type", "key")):
+        error_type = "validation"
+    else:
+        error_type = "internal"
+    ERROR_TOTAL.labels(error_type=error_type, component=component).inc()
 
 # ── Per-request API key propagation ────────────────────────────────────────
 # For HTTP transports (streamable-http, sse) the API key is extracted from
@@ -287,6 +343,7 @@ def _get_neo4j(profile: str = "illd"):
         return driver
     except Exception as e:
         logger.error("Neo4j init for profile '%s': %s", profile, e)
+        _classify_and_record_error(e, "neo4j")
         return None
 
 def _get_qdrant():
@@ -389,6 +446,7 @@ def _get_qdrant():
             logger.info("[Qdrant] Connected → %s (grpc=%s)", qdrant_url, prefer_grpc)
         except Exception as e:
             logger.error("Qdrant init: %s", e)
+            _classify_and_record_error(e, "qdrant")
     return _qdrant_client
 
 def _get_redis():
@@ -396,11 +454,19 @@ def _get_redis():
     if _redis_client is None:
         try:
             import redis as _redis
-            _redis_client = _redis.from_url(
-                os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
-                decode_responses=True)
+            redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+            kwargs = {"decode_responses": True}
+            # Enable TLS for rediss:// scheme or explicit REDIS_TLS=true
+            if redis_url.startswith("rediss://") or os.environ.get("REDIS_TLS", "").lower() in ("true", "1"):
+                kwargs["ssl"] = True
+                kwargs["ssl_cert_reqs"] = os.environ.get("REDIS_SSL_CERT_REQS", "required")
+                ca_path = os.environ.get("REDIS_SSL_CA_CERTS")
+                if ca_path:
+                    kwargs["ssl_ca_certs"] = ca_path
+            _redis_client = _redis.from_url(redis_url, **kwargs)
         except Exception as e:
             logger.error("Redis init: %s", e)
+            _classify_and_record_error(e, "redis")
     return _redis_client
 
 # ── PostgreSQL (audit, feedback, sessions, ingestion tracking) ─────────────
@@ -647,8 +713,26 @@ def _get_session_manager(workspace_id: str = "illd"):
 
 def _get_context_builder(max_tokens=8000, budget_unit="tokens"):
     try:
-        from src.MemoryLayer.memory.context_builder import ContextBuilder
-        return ContextBuilder(max_tokens=max_tokens, budget_unit=budget_unit)
+        from src.MemoryLayer.memory.context_builder import LegacyContextBuilder
+        # Wire approved-pattern lookup (Ticket 1)
+        pattern_store = None
+        try:
+            from src.MemoryLayer.memory.semantic_memory import PatternStore, Embedder
+            embedder = Embedder()
+            qdrant = _get_qdrant()
+            if qdrant:
+                pattern_store = PatternStore(
+                    embedder=embedder,
+                    collection="approved_patterns",
+                    _client=qdrant,
+                )
+        except Exception:
+            pass  # graceful degradation — patterns simply won't be included
+        return LegacyContextBuilder(
+            max_tokens=max_tokens,
+            budget_unit=budget_unit,
+            pattern_store=pattern_store,
+        )
     except Exception as e:
         logger.error("ContextBuilder import failed: %s", e)
         return None
@@ -1056,6 +1140,8 @@ async def search_database(
                 cache_type = hit.get("cache_type", "lru")
                 CACHE_REQUESTS_TOTAL.labels(cache_type=cache_type, result="hit").inc()
                 SEARCH_REQUESTS_TOTAL.labels(workspace=workspace_id).inc()
+                # Update cache gauges
+                _update_cache_gauges(cache)
                 return _ok(hit.get("result") or hit.get("value"))
             else:
                 CACHE_REQUESTS_TOTAL.labels(cache_type="lru", result="miss").inc()
@@ -1063,7 +1149,11 @@ async def search_database(
         SEARCH_REQUESTS_TOTAL.labels(workspace=workspace_id).inc()
         svc = _get_search_service(workspace_id)
         if not svc or not svc.available:
+            ERROR_TOTAL.labels(error_type="connection", component="search").inc()
             return _err("BACKEND_UNAVAILABLE", "Neo4j not connected — run health_check for details")
+
+        # ── Measure per-backend query latency (Ticket 7) ──
+        search_t0 = time.time()
         result = await svc.hybrid_search_async(
             query=query, max_results=max_results,
             include_relationships=include_relationships,
@@ -1071,14 +1161,19 @@ async def search_database(
             filter_by_node_type=filter_by_node_type,
             offset=offset, workspace_id=workspace_id, alpha=alpha,
         )
+        search_elapsed = time.time() - search_t0
+        QUERY_LATENCY.labels(backend="total").observe(search_elapsed)
+        SEARCH_DURATION.labels(stage="total").observe(search_elapsed)
 
         # ── Store in cache ──
         if cache and result:
             cache.put(cache_key, result, metadata=cache_meta)
+            _update_cache_gauges(cache)
 
         return _ok(result)
     except Exception as exc:
         logger.exception("search_database failed")
+        _classify_and_record_error(exc, "search")
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()

@@ -125,6 +125,56 @@ if ENABLE_METRICS:
             registry=REGISTRY,
         )
 
+        # ── Query metrics (Ticket 7) ──────────────────────────────────────
+        QUERY_TOTAL = Counter(
+            "aice_query_total",
+            "Total queries by type",
+            ["query_type"],  # "hybrid", "vector", "graph", "pattern"
+            registry=REGISTRY,
+        )
+
+        QUERY_LATENCY = Histogram(
+            "aice_query_latency_seconds",
+            "Per-backend query latency breakdown",
+            ["backend"],  # "vector", "graph", "merge", "total"
+            buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+            registry=REGISTRY,
+        )
+
+        # ── Cache gauges (Ticket 7) ────────────────────────────────────────
+        CACHE_HIT_RATE = Gauge(
+            "aice_cache_hit_rate",
+            "Rolling cache hit ratio (0.0–1.0)",
+            ["cache_type"],  # "lru", "semantic", "combined"
+            registry=REGISTRY,
+        )
+
+        CACHE_SIZE = Gauge(
+            "aice_cache_size",
+            "Current number of entries in cache",
+            ["cache_type"],  # "lru", "semantic"
+            registry=REGISTRY,
+        )
+
+        # ── Error metrics (Ticket 8) ───────────────────────────────────────
+        ERROR_TOTAL = Counter(
+            "aice_error_total",
+            "Total errors by type and component",
+            ["error_type", "component"],
+            # error_type: "timeout", "connection", "auth", "validation", "internal"
+            # component:  "neo4j", "qdrant", "redis", "llm", "cache", "search", "mcp"
+            registry=REGISTRY,
+        )
+
+        # ── Ingestion duration (Ticket 9 dashboard support) ────────────────
+        INGESTION_DURATION = Histogram(
+            "aice_ingestion_duration_seconds",
+            "Total ingestion pipeline run duration",
+            ["module"],
+            buckets=(10, 30, 60, 120, 300, 600, 1200, 1800, 3600),
+            registry=REGISTRY,
+        )
+
         PROMETHEUS_AVAILABLE = True
         logger.info("[Metrics] prometheus_client loaded — metrics enabled")
 
@@ -163,6 +213,12 @@ if not ENABLE_METRICS or not globals().get("PROMETHEUS_AVAILABLE", False):
     INGESTION_FILES_TOTAL = _noop
     BACKEND_UP = _noop
     REVIEW_ROUTING_TOTAL = _noop
+    QUERY_TOTAL = _noop
+    QUERY_LATENCY = _noop
+    CACHE_HIT_RATE = _noop
+    CACHE_SIZE = _noop
+    ERROR_TOTAL = _noop
+    INGESTION_DURATION = _noop
 
 
 def make_metrics_app():

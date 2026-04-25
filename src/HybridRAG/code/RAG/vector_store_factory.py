@@ -279,6 +279,13 @@ def _create_qdrant_client(raw: dict, instance: str):
     api_key = qdrant_cfg.get("api_key", "")
     https = qdrant_cfg.get("https", True)
     verify_ssl = qdrant_cfg.get("verify_ssl", False)
+    # When verify_ssl is true, use the Infineon CA bundle so httpx/certifi
+    # can verify the corporate-issued certificate.
+    if verify_ssl is True:
+        _ca = Path(__file__).resolve().parents[1] / "ca-bundle.crt"
+        if _ca.exists():
+            verify_ssl = str(_ca)
+            logger.info("Using CA bundle for Qdrant TLS: %s", _ca)
     embedding_dim = qdrant_cfg.get("embedding_dimension", 384)
     grpc = qdrant_cfg.get("grpc", False)
     timeout = qdrant_cfg.get("timeout", 30)

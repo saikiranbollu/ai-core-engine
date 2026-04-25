@@ -68,10 +68,13 @@ class LegacyContextBuilder:
     call signature.
     """
 
-    def __init__(self, max_tokens: int = 8000, budget_unit: str = "tokens"):
+    MAX_APPROVED_PATTERNS = 3
+
+    def __init__(self, max_tokens: int = 8000, budget_unit: str = "tokens", pattern_store=None):
         self.max_tokens = max_tokens
         self.budget_unit = budget_unit
         self._max_chars = max_tokens * CHARS_PER_TOKEN if budget_unit == "tokens" else max_tokens
+        self._pattern_store = pattern_store
 
     def build(
         self,
@@ -145,12 +148,46 @@ class LegacyContextBuilder:
             else:
                 dropped.append(item.get("node_id", item.get("id", "unknown")))
 
-        # 5. Render final context
+        # 5. Query approved patterns from semantic memory (max 3, by usage_count)
+        pattern_texts: List[str] = []
+        if self._pattern_store and included:
+            try:
+                # Use first RAG result as the similarity query
+                query_text = self._extract_content(included[0])
+                module = (session_context or {}).get("module", "")
+                if module and query_text:
+                    similar = self._pattern_store.find_similar(
+                        query_text=query_text,
+                        module=module,
+                        top_k=self.MAX_APPROVED_PATTERNS * 2,
+                    )
+                    # Prioritize by usage_count, then take top 3
+                    similar.sort(key=lambda p: p.usage_count, reverse=True)
+                    for sp in similar[: self.MAX_APPROVED_PATTERNS]:
+                        full = self._pattern_store.get(sp.pattern_id)
+                        if full:
+                            pattern_texts.append(full.pattern_text)
+                            budget_remaining -= len(full.pattern_text)
+                            # Track usage
+                            self._pattern_store.increment_usage(sp.pattern_id)
+                    logger.info(
+                        "[ContextBuilder] Included %d approved patterns for module=%s",
+                        len(pattern_texts), module,
+                    )
+            except Exception as exc:
+                logger.warning("[ContextBuilder] Approved pattern lookup failed: %s", exc)
+
+        # 6. Render final context
         context_parts = []
         if session_text:
             context_parts.append(session_text)
         if history_text:
             context_parts.append(f"[Conversation History]:\n{history_text}")
+
+        # Approved patterns section (few-shot examples)
+        if pattern_texts:
+            for pt in pattern_texts:
+                context_parts.append(f"[APPROVED_PATTERN]\n{pt}")
 
         for item in included:
             content = self._extract_content(item)

@@ -1,0 +1,103 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Cache Hit Rate (LRU)",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "aice_cache_hit_rate{cache_type=\"lru\"}",
+          "legendFormat": "LRU Hit Rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "thresholds": { "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.4}, {"color": "green", "value": 0.6}] } },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Cache Hit Rate (Semantic)",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "aice_cache_hit_rate{cache_type=\"semantic\"}",
+          "legendFormat": "Semantic Hit Rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "thresholds": { "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.3}, {"color": "green", "value": 0.5}] } },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Combined Hit/Miss Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(aice_cache_requests_total{result=\"hit\"}[5m]))",
+          "legendFormat": "hits/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(aice_cache_requests_total{result=\"miss\"}[5m]))",
+          "legendFormat": "misses/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Cache Size (entries)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "aice_cache_size",
+          "legendFormat": "{{ cache_type }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Cache Hits by Type Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(aice_cache_requests_total{result=\"hit\"}[5m])) by (cache_type)",
+          "legendFormat": "{{ cache_type }} hits/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["aice", "cache", "performance"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AICE — Cache Performance",
+  "uid": "aice-cache-performance",
+  "version": 1
+}

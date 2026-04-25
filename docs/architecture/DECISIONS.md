@@ -282,16 +282,17 @@
 
 ---
 
-## ADR-017: MinIO / S3 Object Storage — Deferred
+## ADR-017: MinIO / S3 Object Storage — Adopted
 
 | Field | Value |
 |-------|-------|
-| **Status** | Deferred |
-| **Date** | Evaluated Sprint 5, deferred |
-| **Context** | Source documents (PDFs, ARXML files, Excel specs) are currently read from local filesystem paths during ingestion. For multi-node deployment or CI/CD pipelines, a shared object store would be needed. |
-| **Decision** | **Defer MinIO/S3 adoption.** Ingestion reads from local paths. Corpus snapshots (if needed) would use S3 with date-stamped naming and 2-year retention. |
-| **Rationale** | (1) Current deployment is single-node Docker Compose — local filesystem is sufficient. (2) Adding object storage increases infrastructure complexity and cost. (3) Ingestion is an admin-only operation, not a hot path. (4) The parsed knowledge lives in Neo4j + Qdrant after ingestion — the original files are not re-read at query time. |
-| **When to reconsider** | When deploying to multi-node Kubernetes where ingestion workers don't share a filesystem, or when implementing KG backup/restore workflows. |
+| **Status** | Adopted |
+| **Date** | Evaluated Sprint 5 (deferred), adopted Sprint 6 |
+| **Context** | Source documents (PDFs, ARXML files, Excel specs) are currently read from local filesystem paths during ingestion. Corpus backup/restore workflows require a shared, durable object store for Neo4j and Qdrant snapshots. |
+| **Decision** | **Adopt MinIO** as S3-compatible object storage for corpus snapshots. MinIO runs as a StatefulSet in the test K8s namespace with a 10Gi PVC. Python client: `minio>=7.2.0`. Default bucket: `corpus-backups`. |
+| **Naming convention** | `{profile}/{component}/{profile}-{component}-{ISO8601}.{ext}` (e.g., `illd/neo4j/illd-neo4j-2026-04-20T14-30-00Z.cypher`). 2-year retention (manual cleanup). |
+| **Rationale** | (1) MinIO is open-source (AGPL-3.0), S3-compatible, and lightweight — single binary or container. (2) Consistent with on-premise deployment model (ADR-019). (3) Python `minio` SDK is Apache-2.0 licensed. (4) Qdrant snapshot API and Neo4j APOC export provide the data to back up. (5) Date-stamped naming supports future automated retention policies. |
+| **Implementation** | `mcp/k8s/test/minio.yaml` (StatefulSet + Service), `src/IngestionPipeline/backup/` package (neo4j_dump, qdrant_export, s3_upload, snapshot_all, restore). CLI-only, manual trigger. |
 
 ---
 

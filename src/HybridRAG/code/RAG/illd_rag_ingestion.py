@@ -158,13 +158,17 @@ class ILLDRAGIngestor:
     # 1. SWA ingestion
     # =====================================================================
 
-    def ingest_swa(self, swa_data: dict):
+    def ingest_swa(self, swa_data: dict, source_file: str = None):
         """Ingest SWA parser output into functions, structs, enums,
-        typedefs, and macros collections."""
+        typedefs, and macros collections.
+
+        *source_file* — originating header filename, stored in metadata.
+        """
         if not swa_data:
             return
 
-        logger.info("Ingesting SWA data into Qdrant …")
+        logger.info("Ingesting SWA data into Qdrant (file=%s) …",
+                    source_file or "default")
 
         # -- Functions --
         for func in (swa_data.get("functions") or []):
@@ -188,10 +192,13 @@ class ILLDRAGIngestor:
                     f"Purpose: {purpose}\n"
                     f"Dependencies: {deps_text}")
 
+            meta = {"type": "function", "function": fname, "return_type": rtype}
+            if source_file:
+                meta["source_file"] = source_file
             self._embed_and_upsert("functions", [{
                 "id": f"func_{fname}",
                 "text": text,
-                "metadata": {"type": "function", "function": fname, "return_type": rtype},
+                "metadata": meta,
             }])
 
         # -- Structs --
@@ -211,10 +218,13 @@ class ILLDRAGIngestor:
                     f"Purpose: {purpose}\n"
                     f"Members: {member_text}")
 
+            s_meta = {"type": "struct", "struct": sname}
+            if source_file:
+                s_meta["source_file"] = source_file
             self._embed_and_upsert("structs", [{
                 "id": f"struct_{sname}",
                 "text": text,
-                "metadata": {"type": "struct", "struct": sname},
+                "metadata": s_meta,
             }])
 
         # -- Enums --
@@ -233,10 +243,13 @@ class ILLDRAGIngestor:
             text = (f"enum {ename}\nBrief: {brief}\n"
                     f"Purpose: {purpose}\nValues: {val_text}")
 
+            e_meta = {"type": "enum", "enum": ename}
+            if source_file:
+                e_meta["source_file"] = source_file
             self._embed_and_upsert("enums", [{
                 "id": f"enum_{ename}",
                 "text": text,
-                "metadata": {"type": "enum", "enum": ename},
+                "metadata": e_meta,
             }])
 
         # -- Typedefs --
@@ -249,10 +262,13 @@ class ILLDRAGIngestor:
             text = (f"typedef {tname}\nDefinition: {ttype}\n"
                     f"Description: {brief}")
 
+            td_meta = {"type": "typedef", "name": tname}
+            if source_file:
+                td_meta["source_file"] = source_file
             self._embed_and_upsert("typedefs", [{
                 "id": f"typedef_{tname}",
                 "text": text,
-                "metadata": {"type": "typedef", "name": tname},
+                "metadata": td_meta,
             }])
 
         # -- Macros --
@@ -265,10 +281,13 @@ class ILLDRAGIngestor:
             text = (f"macro {mname}\nValue: {mval}\n"
                     f"Description: {desc}")
 
+            m_meta = {"type": "macro", "name": mname}
+            if source_file:
+                m_meta["source_file"] = source_file
             self._embed_and_upsert("macros", [{
                 "id": f"macro_{mname}",
                 "text": text,
-                "metadata": {"type": "macro", "name": mname},
+                "metadata": m_meta,
             }])
 
         logger.info("SWA Qdrant ingestion complete.")
@@ -444,12 +463,16 @@ class ILLDRAGIngestor:
     # 5. Source Code ingestion
     # =====================================================================
 
-    def ingest_source(self, c_data: dict):
-        """Ingest C parser output → source collection."""
+    def ingest_source(self, c_data: dict, source_file: str = None):
+        """Ingest C parser output → source collection.
+
+        *source_file* — originating .c filename, stored in metadata.
+        """
         if not c_data:
             return
 
-        logger.info("Ingesting C source analysis into Qdrant …")
+        logger.info("Ingesting C source analysis into Qdrant (file=%s) …",
+                    source_file or "default")
         chunks = []
         functions = c_data.get("functions", {})
 
@@ -475,15 +498,18 @@ class ILLDRAGIngestor:
                     f"Start Line: {start_line}\n"
                     f"Register Accesses:\n{accesses_text}")
 
+            src_meta = {
+                "type": "source_implementation",
+                "function": str(func_name),
+                "start_line": str(start_line),
+                "num_register_accesses": len([a for a in reg_accesses if isinstance(a, dict)]),
+            }
+            if source_file:
+                src_meta["source_file"] = source_file
             chunks.append({
                 "id": f"impl_{func_name}",
                 "text": text,
-                "metadata": {
-                    "type": "source_implementation",
-                    "function": str(func_name),
-                    "start_line": str(start_line),
-                    "num_register_accesses": len([a for a in reg_accesses if isinstance(a, dict)]),
-                },
+                "metadata": src_meta,
             })
 
         self._embed_and_upsert("source", chunks)

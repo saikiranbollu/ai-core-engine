@@ -256,16 +256,20 @@ class ILLDKGBuilder:
     # 1. SWA Header ingestion (illd_swa_parser output)
     # =====================================================================
 
-    def ingest_swa(self, swa_data: dict):
+    def ingest_swa(self, swa_data: dict, source_file: str = None):
         """
         Ingest SWA parser output → Function, Struct, StructMember, Enum,
         EnumValue, Typedef, Parameter, ReturnType nodes + edges.
+
+        *source_file* — the originating header filename (e.g. IfxLcss_Pwm_swa.h).
+        Stored on every top-level node for traceability.
         """
         if not swa_data:
             logger.warning("No SWA data to ingest.")
             return
 
-        logger.info("Ingesting SWA data for module %s …", self.module)
+        logger.info("Ingesting SWA data for module %s (file=%s) …",
+                    self.module, source_file or "default")
         mod = self.module  # Always use pipeline module, not parser-derived
 
         # --- Functions → Function nodes ---
@@ -285,7 +289,7 @@ class ILLDKGBuilder:
                 continue
 
             fid = f"FUNC_{fname}"
-            func_nodes.append({
+            node = {
                 "id": fid,
                 "name": fname,
                 "brief": self._safe_str(func.get("brief")),
@@ -294,7 +298,10 @@ class ILLDKGBuilder:
                 "source": "SWA_Functions",
                 "module": mod,
                 "label": fname,
-            })
+            }
+            if source_file:
+                node["source_file"] = source_file
+            func_nodes.append(node)
 
             # Parameters
             params = func.get("parameters") or []
@@ -365,7 +372,7 @@ class ILLDKGBuilder:
                 continue
 
             sid = f"STRUCT_{sname}"
-            struct_nodes.append({
+            snode = {
                 "id": sid,
                 "name": sname,
                 "brief": self._safe_str(s.get("brief")),
@@ -373,7 +380,10 @@ class ILLDKGBuilder:
                 "source": "SWA_Structs",
                 "module": mod,
                 "label": sname,
-            })
+            }
+            if source_file:
+                snode["source_file"] = source_file
+            struct_nodes.append(snode)
 
             members = s.get("members") or []
             for m in members:
@@ -412,7 +422,7 @@ class ILLDKGBuilder:
                 continue
 
             eid = f"ENUM_{ename}"
-            enum_nodes.append({
+            enode = {
                 "id": eid,
                 "name": ename,
                 "brief": self._safe_str(e.get("brief")),
@@ -420,7 +430,10 @@ class ILLDKGBuilder:
                 "source": "SWA_Enums",
                 "module": mod,
                 "label": ename,
-            })
+            }
+            if source_file:
+                enode["source_file"] = source_file
+            enum_nodes.append(enode)
 
             values = e.get("values") or []
             for v in values:
@@ -453,7 +466,7 @@ class ILLDKGBuilder:
             tname = td.get("name", "")
             if not tname:
                 continue
-            typedef_nodes.append({
+            tdnode = {
                 "id": f"TYPEDEF_{tname}",
                 "name": tname,
                 "brief": self._safe_str(td.get("brief")),
@@ -462,7 +475,10 @@ class ILLDKGBuilder:
                 "source": "SWA_Typedefs",
                 "module": mod,
                 "label": tname,
-            })
+            }
+            if source_file:
+                tdnode["source_file"] = source_file
+            typedef_nodes.append(tdnode)
 
         self._merge_nodes("Typedef", "id", typedef_nodes)
 
@@ -1095,18 +1111,21 @@ class ILLDKGBuilder:
     # 5. Source Code ingestion (c_parser output)
     # =====================================================================
 
-    def ingest_source(self, c_data: dict):
+    def ingest_source(self, c_data: dict, source_file: str = None):
         """
         Ingest C parser output → enrich Function nodes with call graph.
 
         Creates:
         - CALLS_INTERNALLY edges (Function → Function)
+
+        *source_file* — the originating .c filename for traceability.
         """
         if not c_data:
             logger.warning("No C source data to ingest.")
             return
 
-        logger.info("Ingesting C source analysis …")
+        logger.info("Ingesting C source analysis (file=%s) …",
+                    source_file or "default")
         functions = c_data.get("functions", {})
 
         call_edges = []

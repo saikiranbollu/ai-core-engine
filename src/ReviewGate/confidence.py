@@ -3,8 +3,8 @@ Confidence Calculator — Sprint 4
 ==================================
 Deterministic formula (NOT LLM-based) for review routing.
 
-From PPTX v3 Slide 25:
-  Base Score = 50
+ISO 26262 principle: assume failure until proven safe.
+  Base Score = 20 (FULL review territory)
   Quality signals add points, risk signals subtract.
   AUTO (>=80) | QUICK (50-79) | FULL (<50)
 
@@ -22,24 +22,51 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Default weights (from PPTX slide 25)
+# Default weights — 7 signals
+#
+# Every signal validates the OUTPUT (generated code), not the INPUT
+# (whether the database had data).  If the DB was incomplete, the
+# output-quality signals catch it: api_verified fails when SWA was
+# never ingested, call_order_valid fails when dependencies are unknown.
+#
+# Removed: has_context, missing_requirements, missing_hw_spec
+# (all were input-quality checks redundant with the output signals).
+# Note: No MISRA check — this is reference software (non-productive).
 # ─────────────────────────────────────────────────────────────────────────
 DEFAULT_WEIGHTS = {
-    # Quality signals (positive)
-    "has_kg_context":        30,   # All inputs available (requirements, specs, examples)
-    "high_relevance":        20,   # Context relevance > 0.9
-    "has_proven_patterns":   15,   # Used proven patterns from knowledge base
-    "format_correct":        10,   # Output matches expected format/structure
-    "misra_compliant":       10,   # MISRA/AUTOSAR compliance checks passed
-    "similar_approved":       5,   # Similar past generation was approved
-    "has_dependency_order":  20,   # Dependency/init order resolved
+    # Quality signals (positive) — validate the generated output
+    "api_verified":         25,   # All API calls exist in the module's KG
+    "call_order_valid":     25,   # Call sequence follows DEPENDS_ON graph
+    "config_valid":         15,   # Enum values and struct fields verified against KG
+    "output_well_formed":    5,   # Code parses, has required structure
+    "pattern_match":        10,   # Generated API sequence matches approved pattern
     # Risk signals (negative)
-    "missing_requirements": -30,   # Missing requirements or specs
-    "low_relevance":        -20,   # Context relevance < 0.7
-    "novel_pattern":        -15,   # Novel pattern (not in knowledge base)
-    "compliance_warnings":  -20,   # Compliance check warnings
-    "complex_logic":        -10,   # Complex logic or edge cases
-    "is_safety_critical":   -15,   # ASIL-B or higher
+    "is_safety_critical":  -15,   # ASIL-B+ or complex (DMA/ISR/multi-channel)
+    "no_failure_match":    -10,   # Resembles a previously rejected pattern
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# GEST Domain Assistant weights
+#
+# Same 7-signal structure, re-weighted for test-code generation:
+#  - Dependency order matters most (wrong init order = HW crash)
+#  - API verification equally critical (calling nonexistent fn = won't compile)
+#  - Config validation equally critical (wrong enum = HW misconfigured)
+#  - Validation matters less (test code doesn't ship in prod firmware)
+#  - Pattern match is a future bonus (same as default, grows over months)
+#  - Safety penalty is heavier (ASIL test code = more expert review)
+#  - Failure memory is heavier (repeating rejected test on HW = dangerous)
+# ─────────────────────────────────────────────────────────────────────
+GEST_WEIGHTS = {
+    # Quality signals (positive) — validate the generated output
+    "call_order_valid":     25,   # Init sequence follows correct hardware order
+    "api_verified":         25,   # All API calls verified against module's KG
+    "config_valid":         15,   # Enum values and struct fields verified against KG
+    "output_well_formed":    5,   # Format + compile checks (less critical for tests)
+    "pattern_match":        10,   # Matched approved test recipe in pattern library
+    # Risk signals (negative)
+    "is_safety_critical":  -20,   # ASIL-B+ or DMA/ISR/multi-channel complexity
+    "no_failure_match":    -15,   # Resembles a previously rejected test pattern
 }
 
 # Review routing thresholds
@@ -86,8 +113,9 @@ class ConfidenceCalculator:
             Quality/risk signal flags. Keys should match weight names.
             Values: bool (True/False) or numeric (0.0-1.0 for scaled signals).
             Special keys:
-              - validation_score: int 0-100, mapped to format_correct if > 80
-              - relevance_score: float 0-1, mapped to high/low relevance
+              - validation_score: int 0-100, mapped to output_well_formed if >= 80
+              - api_match_ratio: float 0-1, mapped to api_verified if >= 0.95
+              - config_match_ratio: float 0-1, mapped to config_valid if >= 0.90
         response_id : str, optional
             If not provided, auto-generated.
 
@@ -96,24 +124,26 @@ class ConfidenceCalculator:
         dict with: score, review_type, routing, breakdown, response_id
         """
         rid = response_id or f"resp_{uuid.uuid4().hex[:8]}"
-        base_score = 50
+        base_score = 20
         breakdown: List[Dict[str, Any]] = []
 
         # Map special composite signals
         mapped = dict(signals)
 
-        # validation_score → format_correct
+        # validation_score → output_well_formed
         vs = mapped.pop("validation_score", None)
         if vs is not None and isinstance(vs, (int, float)):
-            mapped.setdefault("format_correct", vs >= 80)
+            mapped.setdefault("output_well_formed", vs >= 80)
 
-        # relevance_score → high_relevance / low_relevance
-        rs = mapped.pop("relevance_score", None)
-        if rs is not None and isinstance(rs, (int, float)):
-            if rs >= 0.9:
-                mapped.setdefault("high_relevance", True)
-            elif rs < 0.7:
-                mapped.setdefault("low_relevance", True)
+        # api_match_ratio → api_verified
+        amr = mapped.pop("api_match_ratio", None)
+        if amr is not None and isinstance(amr, (int, float)):
+            mapped.setdefault("api_verified", amr >= 0.95)
+
+        # config_match_ratio → config_valid
+        cmr = mapped.pop("config_match_ratio", None)
+        if cmr is not None and isinstance(cmr, (int, float)):
+            mapped.setdefault("config_valid", cmr >= 0.90)
 
         # Calculate score
         total_adjust = 0
@@ -216,7 +246,7 @@ class FeedbackSink:
 
         Sprint 9: APPROVE/APPROVE_WITH_EDITS now writes to PatternStore (Neo4j)
         and indexes in PatternIndex (Qdrant) for future similarity matching.
-        This enables the confidence scorer's 'has_proven_patterns' signal.
+        This enables the confidence scorer's 'has_proven_pattern' signal.
         """
         valid_decisions = {"APPROVE", "APPROVE_WITH_EDITS", "REJECT", "ESCALATE"}
         if decision not in valid_decisions:

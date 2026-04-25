@@ -15,6 +15,7 @@ pydantic-settings>=2.0.0  # required by mcp SDK
 neo4j>=5.20.0
 qdrant-client>=1.9.0
 redis>=5.0                # Working-memory backend (MemoryLayer)
+minio>=7.2.0              # S3-compatible client for corpus snapshots (MinIO)
 
 # ─── HTTP & Networking ─────────────────────────────────────
 httpx>=0.27.0
@@ -79,7 +80,8 @@ jenkinsapi>=0.3.13
 
 # ─── Code Analysis ────────────────────────────────────────
 tree-sitter>=0.22
-
+# ─── Token Counting ────────────────────────────────────────────────
+tiktoken>=0.7.0           # Accurate GPT-4 token counting (ContextBuilder)
 # ─── Observability & Utilities ─────────────────────────────
 psycopg2-binary>=2.9      # PostgreSQL (ASPICE audit/feedback/sessions)
 prometheus_client>=0.21   # Prometheus metrics (/metrics endpoint)

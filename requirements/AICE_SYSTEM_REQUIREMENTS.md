@@ -169,12 +169,12 @@
 
 | Req ID | Requirement | Priority | Rationale | Status |
 |--------|-------------|----------|-----------|--------|
-| AICE-RG-001 | The `evaluate_confidence` tool shall compute a deterministic confidence score (0-100) using 13 weighted signals, without any LLM dependency | Must | Auditable, reproducible scoring | IMPLEMENTED |
+| AICE-RG-001 | The `evaluate_confidence` tool shall compute a deterministic confidence score (0-100) using 8 weighted signals, without any LLM dependency | Must | Auditable, reproducible scoring | IMPLEMENTED |
 | AICE-RG-002 | Scoring shall route to: AUTO (score ≥ 80, ~5 min spot check), QUICK (50-79, ~15-20 min review), FULL (< 50, ≥1 hr deep review) | Must | Risk-proportionate human review | IMPLEMENTED |
 | AICE-RG-003 | The `complete_review` tool shall record the final review verdict with reviewer_id and rationale | Must | ASPICE review evidence | IMPLEMENTED |
 | AICE-RG-004 | The `override_routing` tool shall allow manual override of review routing (e.g., escalate AUTO to FULL) | Should | Human override for safety-critical | IMPLEMENTED |
 | AICE-RG-005 | The `process_results` tool shall parse test/analysis results from external tools: VP XML, Polyspace CSV/XML, JUnit XML, GCOV/LCOV coverage, GCC/Tasking compiler logs | Must | CI/CD result ingestion | IMPLEMENTED |
-| AICE-RG-006 | Key scoring signals shall include: has_kg_context (+30), high_relevance (+20), has_dependency_order (+20), missing_requirements (-30), is_safety_critical (-15) — 13 signals total | Must | Comprehensive risk assessment | IMPLEMENTED |
+| AICE-RG-006 | Key scoring signals shall include: has_context (+30), has_dependency_order (+20), has_proven_pattern (+15), passes_validation (+10), api_coverage (+10), missing_requirements (-15), missing_hw_spec (-15), is_high_risk (-15) — 8 signals total. No MISRA (reference software). | Must | Focused risk assessment | IMPLEMENTED |
 
 ---
 

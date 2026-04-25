@@ -142,7 +142,7 @@ class RemoteSourceFetcher:
     BB_BASE = "https://bitbucket.vih.infineon.com"
     BB_PROJECT = "ILLD"
     BB_REPO = "rc1_sw_dep"
-    BB_BASE_PATH = "Alpha1_VP-EIR1_iLLD/Baselined_Versions"
+    BB_BASE_PATH = "Alpha2_VP-EIR2_iLLD/Baselined_Versions"
 
     def __init__(self, module: str, work_dir: Optional[Path] = None):
         self.module = module.upper()
@@ -241,8 +241,11 @@ class RemoteSourceFetcher:
 
     def _bb_download_file(self, file_path: str) -> Optional[bytes]:
         """Download a raw file from Bitbucket Server."""
+        from urllib.parse import quote
         client = self._get_bb_client()
-        url = f"{self._bb_api_url()}/raw/{file_path}"
+        # Encode each path segment individually (handles brackets etc.)
+        encoded = "/".join(quote(seg, safe="") for seg in file_path.split("/"))
+        url = f"{self._bb_api_url()}/raw/{encoded}"
         resp = client.get(url)
         if resp.status_code == 200:
             return resp.content
@@ -289,36 +292,50 @@ class RemoteSourceFetcher:
 
         Tries exact match first, then scans the directory for variants
         (some modules use lowercase in the filename).
+        Returns the first match (backward compat). Use fetch_all_swa_headers()
+        for modules with multiple SWA files.
         """
-        # Try exact match
-        path = f"lld/{self.module_cap}/doc/arch/input/Ifx{self.module_cap}_{self.module_cap}_swa.h"
-        result = self.fetch_gitlab_file(path)
-        if result:
-            return result
+        results = self.fetch_all_swa_headers()
+        return results[0] if results else None
 
-        # Scan directory for case-insensitive match
+    def fetch_all_swa_headers(self) -> List[Path]:
+        """Fetch ALL SWA headers for this module from GitLab.
+
+        Returns a list of local Paths (may be empty).
+        """
         remote_dir = f"lld/{self.module_cap}/doc/arch/input"
         entries = self._gl_list_tree(remote_dir)
         swa_files = [
             e for e in entries
             if e.get("name", "").lower().endswith("_swa.h")
         ]
-        if swa_files:
-            match_path = f"{remote_dir}/{swa_files[0]['name']}"
-            self.logger.info("Found SWA variant: %s", match_path)
-            return self.fetch_gitlab_file(match_path)
+        if not swa_files:
+            self.logger.warning("No SWA header found for module %s", self.module)
+            return []
 
-        self.logger.warning("No SWA header found for module %s", self.module)
-        return None
+        results: List[Path] = []
+        for sf in swa_files:
+            match_path = f"{remote_dir}/{sf['name']}"
+            self.logger.info("Fetching SWA: %s", match_path)
+            local = self.fetch_gitlab_file(match_path)
+            if local:
+                results.append(local)
+        return results
 
     def fetch_source_code(self) -> Optional[Path]:
-        """Fetch the C source file for this module from GitLab."""
-        path = f"lld/{self.module_cap}/src/Ifx{self.module_cap}_{self.module_cap}.c"
-        result = self.fetch_gitlab_file(path)
-        if result:
-            return result
+        """Fetch the C source file for this module from GitLab.
 
-        # Scan directory for case-insensitive match
+        Returns the first match (backward compat). Use fetch_all_source_codes()
+        for modules with multiple C files.
+        """
+        results = self.fetch_all_source_codes()
+        return results[0] if results else None
+
+    def fetch_all_source_codes(self) -> List[Path]:
+        """Fetch ALL C source files for this module from GitLab.
+
+        Returns a list of local Paths (may be empty).
+        """
         remote_dir = f"lld/{self.module_cap}/src"
         entries = self._gl_list_tree(remote_dir)
         c_files = [
@@ -326,12 +343,18 @@ class RemoteSourceFetcher:
             if e.get("name", "").lower().endswith(".c")
             and self.module_cap.lower() in e.get("name", "").lower()
         ]
-        if c_files:
-            match_path = f"{remote_dir}/{c_files[0]['name']}"
-            self.logger.info("Found C source variant: %s", match_path)
-            return self.fetch_gitlab_file(match_path)
+        if not c_files:
+            self.logger.warning("No C source found for module %s", self.module)
+            return []
 
-        return None
+        results: List[Path] = []
+        for cf in c_files:
+            match_path = f"{remote_dir}/{cf['name']}"
+            self.logger.info("Fetching C source: %s", match_path)
+            local = self.fetch_gitlab_file(match_path)
+            if local:
+                results.append(local)
+        return results
 
     def fetch_sfr_regdef(self) -> Optional[Path]:
         """Fetch the SFR regdef header from GitLab."""
@@ -369,17 +392,45 @@ class RemoteSourceFetcher:
         """Fetch the HW manual PDF from Bitbucket.
 
         Returns the local path to the downloaded PDF, or None.
+
+        Bitbucket folder names don't always match the GitLab module name
+        (e.g. GitLab ``Canxs`` → Bitbucket ``RC1_IP_CAN``).  If the exact
+        folder is empty/missing, scan the parent directory for folders
+        whose suffix is a prefix of the module name and try those.
         """
-        bb_dir = f"{self.BB_BASE_PATH}/RC1_IP_{self.module}"
-        entries = self._bb_list_dir(bb_dir)
-        pdfs = [
-            e for e in entries
-            if e["name"].lower().endswith(".pdf")
-            and self.module.lower() in e["name"].lower()
-        ]
+        mod_upper = self.module.upper()  # e.g. "CANXS"
+
+        def _find_pdfs(bb_dir: str) -> list[dict]:
+            entries = self._bb_list_dir(bb_dir)
+            return [e for e in entries if e["name"].lower().endswith(".pdf")]
+
+        # 1) Try exact match: RC1_IP_CANXS
+        bb_dir = f"{self.BB_BASE_PATH}/RC1_IP_{mod_upper}"
+        pdfs = _find_pdfs(bb_dir)
+
+        # 2) Fallback: scan parent for folders that share a prefix with the module
+        #    e.g. module=CANXS → finds RC1_IP_CAN (CAN is a prefix of CANXS)
+        if not pdfs:
+            parent_entries = self._bb_list_dir(self.BB_BASE_PATH)
+            candidates = sorted(
+                [e["name"] for e in parent_entries
+                 if e["type"] == "DIRECTORY"
+                 and e["name"].startswith("RC1_IP_")
+                 and mod_upper.startswith(e["name"][7:])  # 7 = len("RC1_IP_")
+                 and e["name"] != f"RC1_IP_{mod_upper}"],
+                key=lambda n: len(n), reverse=True,  # prefer longest match
+            )
+            for folder in candidates:
+                bb_dir = f"{self.BB_BASE_PATH}/{folder}"
+                pdfs = _find_pdfs(bb_dir)
+                if pdfs:
+                    self.logger.info(
+                        "Bitbucket folder fallback: %s → %s", mod_upper, folder,
+                    )
+                    break
 
         if not pdfs:
-            self.logger.warning("No HW PDF found at %s", bb_dir)
+            self.logger.warning("No HW PDF found for module %s", mod_upper)
             return None
 
         # Pick the most recent (by name — they contain dates)
@@ -526,41 +577,51 @@ class ILLDPipeline:
     # -- Step 1: SWA Header -------------------------------------------------
 
     def step_swa(self):
-        """Parse SWA header file and ingest."""
+        """Parse SWA header file(s) and ingest."""
         logger.info("=" * 60)
         logger.info("STEP 1: SWA Header (%s)", self.module)
         logger.info("=" * 60)
 
-        swa_path = None
+        swa_paths: List[Path] = []
 
-        # Remote fetch
+        # Remote fetch — get ALL SWA files
         if self._fetcher:
-            swa_path = self._fetcher.fetch_swa_header()
+            swa_paths = self._fetcher.fetch_all_swa_headers()
         elif self.gitlab_repo:
-            swa_path = (self.gitlab_repo / "lld" / self.module_cap /
-                        "doc" / "arch" / "input" /
-                        f"Ifx{self.module_cap}_{self.module_cap}_swa.h")
-            if not swa_path.exists():
-                swa_path = None
+            input_dir = (self.gitlab_repo / "lld" / self.module_cap /
+                         "doc" / "arch" / "input")
+            if input_dir.exists():
+                swa_paths = sorted(input_dir.glob("*_swa.h"))
 
-        if not swa_path:
+        if not swa_paths:
             logger.warning("SWA file not available — skipping.")
             return
 
         parsers = _import_parsers()
-        logger.info("Parsing: %s", swa_path)
-        swa_data = parsers["swa"].parse(str(swa_path))
-        self.data["swa"] = swa_data
+        merged_swa: dict = {}  # accumulator for intermediary save
 
-        funcs = len(swa_data.get("functions", []))
-        structs = len(swa_data.get("structs", []))
-        enums = len(swa_data.get("enums", []))
-        logger.info("Parsed: %d functions, %d structs, %d enums", funcs, structs, enums)
+        for swa_path in swa_paths:
+            source_file = swa_path.name
+            logger.info("Parsing: %s", swa_path)
+            swa_data = parsers["swa"].parse(str(swa_path))
 
-        if self.kg:
-            self.kg.ingest_swa(swa_data)
-        if self.rag:
-            self.rag.ingest_swa(swa_data)
+            funcs = len(swa_data.get("functions", []))
+            structs = len(swa_data.get("structs", []))
+            enums = len(swa_data.get("enums", []))
+            logger.info("Parsed %s: %d functions, %d structs, %d enums",
+                        source_file, funcs, structs, enums)
+
+            if self.kg:
+                self.kg.ingest_swa(swa_data, source_file=source_file)
+            if self.rag:
+                self.rag.ingest_swa(swa_data, source_file=source_file)
+
+            # Merge for intermediary
+            for key in ("functions", "structs", "enums", "typedefs", "macros"):
+                merged_swa.setdefault(key, []).extend(swa_data.get(key, []))
+
+        self.data["swa"] = merged_swa
+        logger.info("SWA complete: %d file(s) processed", len(swa_paths))
 
     # -- Step 2: SFR regdef -------------------------------------------------
 
@@ -600,37 +661,48 @@ class ILLDPipeline:
     # -- Step 3: C Source Code ----------------------------------------------
 
     def step_source(self):
-        """Parse C source code and ingest."""
+        """Parse C source code file(s) and ingest."""
         logger.info("=" * 60)
         logger.info("STEP 3: C Source Code (%s)", self.module)
         logger.info("=" * 60)
 
-        c_path = None
+        c_paths: List[Path] = []
 
         if self._fetcher:
-            c_path = self._fetcher.fetch_source_code()
+            c_paths = self._fetcher.fetch_all_source_codes()
         elif self.gitlab_repo:
-            c_path = (self.gitlab_repo / "lld" / self.module_cap /
-                      "src" / f"Ifx{self.module_cap}_{self.module_cap}.c")
-            if not c_path.exists():
-                c_path = None
+            src_dir = (self.gitlab_repo / "lld" / self.module_cap / "src")
+            if src_dir.exists():
+                c_paths = sorted(
+                    p for p in src_dir.glob("*.c")
+                    if self.module_cap.lower() in p.name.lower()
+                )
 
-        if not c_path:
+        if not c_paths:
             logger.warning("C source not available — skipping.")
             return
 
         parsers = _import_parsers()
-        logger.info("Parsing: %s", c_path)
-        c_data = parsers["c"].parse(str(c_path))
-        self.data["source"] = c_data
+        merged_source: dict = {"functions": {}, "statistics": {}}  # accumulator
 
-        funcs = len(c_data.get("functions", {}))
-        logger.info("Parsed: %d functions", funcs)
+        for c_path in c_paths:
+            source_file = c_path.name
+            logger.info("Parsing: %s", c_path)
+            c_data = parsers["c"].parse(str(c_path))
 
-        if self.kg:
-            self.kg.ingest_source(c_data)
-        if self.rag:
-            self.rag.ingest_source(c_data)
+            funcs = len(c_data.get("functions", {}))
+            logger.info("Parsed %s: %d functions", source_file, funcs)
+
+            if self.kg:
+                self.kg.ingest_source(c_data, source_file=source_file)
+            if self.rag:
+                self.rag.ingest_source(c_data, source_file=source_file)
+
+            # Merge for intermediary
+            merged_source["functions"].update(c_data.get("functions", {}))
+
+        self.data["source"] = merged_source
+        logger.info("C source complete: %d file(s) processed", len(c_paths))
 
     # -- Step 4: PlantUML ---------------------------------------------------
 
@@ -659,14 +731,15 @@ class ILLDPipeline:
 
         # puml_parser.parse() expects a single file — concatenate all .puml
         # files into one temp file so the analyzer sees everything.
-        # Only include tc* files (test case sequence diagrams), not the
-        # hw_sw_interface / sw_sw_interface / seqdiagram files.
+        # Only include numbered test-case PUMLs (e.g. 01_*.puml, 1_*.puml).
+        # Exclude architecture diagrams: *_hw_sw_interface, *_sw_sw_interface,
+        # *_seqdiagram, and any combined files we create ourselves.
         puml_files = sorted(
             f for f in Path(puml_dir).glob("*.puml")
-            if f.stem.startswith(f"{self.module.lower()}_tc")
+            if f.stem[0].isdigit() and not f.name.startswith("_combined_")
         )
         if not puml_files:
-            logger.warning("No tc*.puml files in %s — skipping.", puml_dir)
+            logger.warning("No numbered test-case .puml files in %s — skipping.", puml_dir)
             return
 
         combined = Path(puml_dir) / f"_combined_{self.module.lower()}.puml"

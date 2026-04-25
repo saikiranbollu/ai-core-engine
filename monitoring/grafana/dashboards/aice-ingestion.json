@@ -1,0 +1,108 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Files Ingested (success vs error)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(aice_ingestion_files_total{status=\"ok\"}[5m])) by (parser_type)",
+          "legendFormat": "{{ parser_type }} ok",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(aice_ingestion_files_total{status=\"error\"}[5m])) by (parser_type)",
+          "legendFormat": "{{ parser_type }} error",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Total Files Ingested",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(aice_ingestion_files_total) by (status)",
+          "legendFormat": "{{ status }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "steps": [{"color": "green", "value": null}] } },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Ingestion Pipeline Duration (p50 / p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(aice_ingestion_duration_seconds_bucket[10m])) by (le, module))",
+          "legendFormat": "{{ module }} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(aice_ingestion_duration_seconds_bucket[10m])) by (le, module))",
+          "legendFormat": "{{ module }} p95",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Ingestion by Parser Type",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(increase(aice_ingestion_files_total[24h])) by (parser_type)",
+          "legendFormat": "{{ parser_type }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "title": "Ingestion Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(rate(aice_ingestion_files_total{status=\"error\"}[5m])) by (parser_type)",
+          "legendFormat": "{{ parser_type }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["aice", "ingestion"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AICE — Ingestion",
+  "uid": "aice-ingestion",
+  "version": 1
+}

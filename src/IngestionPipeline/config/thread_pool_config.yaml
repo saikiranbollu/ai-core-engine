@@ -34,6 +34,6 @@ thread_pool:
   # Parsers – parallel LLM / API calls during document processing
   parsers:
     pdf:
-      max_workers: 6
+      max_workers: 10
     swa:
-      max_workers: 4
+      max_workers: 6

@@ -24,10 +24,21 @@ logger = logging.getLogger(__name__)
 
 # ── Token estimation ──────────────────────────────────────────────────
 
+try:
+    import tiktoken
+    _enc = tiktoken.get_encoding("cl100k_base")
+    _TIKTOKEN_AVAILABLE = True
+except Exception:          # ImportError or model-not-found
+    _enc = None
+    _TIKTOKEN_AVAILABLE = False
+
+
 def estimate_tokens(text: str) -> int:
-    """Fast token estimate: ~3 chars per token (conservative)."""
+    """Count tokens using tiktoken (exact) with len//4 fallback."""
     if not text:
         return 0
+    if _TIKTOKEN_AVAILABLE:
+        return max(1, len(_enc.encode(text)))
     return max(1, len(text) // 4)  # M09 fix: ~4 chars/token standard
 
 

@@ -1,0 +1,130 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Total Error Rate",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(aice_error_total[5m]))",
+          "legendFormat": "errors/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "thresholds": { "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "red", "value": 0.1}] } },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Errors by Component",
+      "type": "piechart",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(increase(aice_error_total[1h])) by (component)",
+          "legendFormat": "{{ component }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "title": "Errors by Type",
+      "type": "piechart",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(increase(aice_error_total[1h])) by (error_type)",
+          "legendFormat": "{{ error_type }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "title": "Error Rate Over Time by Component",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(aice_error_total[5m])) by (component)",
+          "legendFormat": "{{ component }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Error Rate Over Time by Type",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(aice_error_total[5m])) by (error_type)",
+          "legendFormat": "{{ error_type }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Tool Error Rate (top 10 failing tools)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "topk(10, sum(rate(aice_tool_requests_total{status=\"error\"}[5m])) by (tool))",
+          "legendFormat": "{{ tool }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Backend Availability",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 22 },
+      "targets": [
+        {
+          "expr": "aice_backend_up",
+          "legendFormat": "{{ backend }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "thresholds": { "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}] }, "mappings": [{"options": {"0": {"text": "DOWN"},"1": {"text": "UP"}}, "type": "value"}] },
+        "overrides": []
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["aice", "errors"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AICE — Error Rate",
+  "uid": "aice-error-rate",
+  "version": 1
+}

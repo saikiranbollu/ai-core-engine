@@ -297,6 +297,17 @@ Grafana is pre-provisioned with a Prometheus datasource and a 10-panel overview 
 
 ## 7. Health Checks
 
+### APScheduler Periodic Health Checks (Sprint 9)
+
+The Kubernetes entrypoint (`mcp/app.py`) runs an APScheduler `BackgroundScheduler` with two periodic jobs:
+
+| Job | Interval | Description |
+|-----|----------|-------------|
+| `health_check` | 5 minutes | Pings Neo4j, Qdrant, Redis; logs up/down status |
+| `cache_stats` | 30 minutes | Logs LRU and semantic cache hit rates |
+
+The scheduler shuts down gracefully on SIGTERM/SIGINT. If `apscheduler` is not installed, periodic jobs are silently disabled.
+
 ### Docker Compose Health Checks
 
 All 7 services have health checks in `docker-compose.yml`:

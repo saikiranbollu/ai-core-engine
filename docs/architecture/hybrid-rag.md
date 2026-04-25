@@ -69,9 +69,9 @@ Extracts structured signals from the natural language query:
 
 Executes Cypher queries against the knowledge graph:
 
-- Full-text index search across node properties
-- Property filter matching (label, module, workspace)
-- NodeSet-scoped: all queries anchor through `:NodeSet` nodes to enforce module isolation
+- **Consolidated single query**: All labels matched in one Cypher using `any(lbl IN labels(n) WHERE lbl IN $labels)` with `UNWIND` for keywords (Sprint 9: replaced per-label loop that generated 50–200 queries)
+- **Fulltext index fallback**: Uses `CALL db.index.fulltext.queryNodes('aice_search_idx', $query_text)` when the `aice_search_idx` Lucene-backed index exists (13 searchable properties)
+- **NodeSet-scoped**: all queries anchor through `:NodeSet` nodes to enforce module isolation
 
 ### Stage 3: Entity-Targeted Lookup
 
@@ -98,26 +98,35 @@ Combines all result sets using Reciprocal Rank Fusion (see [Section 6](#6-recipr
 
 ### Query Construction
 
-The graph search constructs Cypher queries dynamically based on the query analysis. Two patterns:
+The graph search constructs a single consolidated Cypher query that matches across all relevant labels and keywords simultaneously. Sprint 9 replaced the previous per-label loop (which generated 50–200 individual Cypher queries per search) with two patterns:
 
-**Scoped search (default)** — always starts from a NodeSet anchor:
+**Primary: Consolidated UNWIND query**
 
 ```cypher
 MATCH (ns:NodeSet {module: $module, project: $project})
--[:HAS_MODULE]-> (n)
-WHERE n.name CONTAINS $keyword OR n.description CONTAINS $keyword
+  -[:HAS_MODULE]-> (n)
+WHERE any(lbl IN labels(n) WHERE lbl IN $labels)
+  AND any(kw IN $keywords WHERE
+    toLower(n.name) CONTAINS kw
+    OR toLower(n.description) CONTAINS kw
+    OR toLower(n.function_name) CONTAINS kw)
 RETURN n
 ORDER BY n.name
-LIMIT $limit
+LIMIT $limit * 2
 ```
 
-**Label-filtered search** — when the query analysis infers a specific label:
+**Fallback: Fulltext index query** (when `aice_search_idx` exists)
 
 ```cypher
-MATCH (ns:NodeSet {module: $module})
--[:HAS_MODULE]-> (n:APIFunction)
-WHERE n.function_name CONTAINS $keyword
-RETURN n
+CALL db.index.fulltext.queryNodes('aice_search_idx', $query_text)
+YIELD node AS n, score
+WHERE any(lbl IN labels(n) WHERE lbl IN $labels)
+RETURN n, score
+ORDER BY score DESC
+LIMIT $limit * 2
+```
+
+The fulltext index (`aice_search_idx`) is created by `Neo4jConnection.ensure_fulltext_index()` across 13 searchable properties: `name`, `function_name`, `description`, `param_name`, `requirement_id`, `title`, `api_name`, `type_name`, `macro_name`, `module_name`, `file_name`, `register_name`, `struct_name`.
 ```
 
 ### Database Resolution

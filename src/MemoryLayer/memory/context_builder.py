@@ -1,14 +1,36 @@
 """
-Context Builder — Re-export from HybridRAG querier module.
 
+ContextBuilder Re-Export
+========================
 The authoritative ContextBuilder lives in src/HybridRAG/code/querier/context_builder.py
-(Sprint 8, 10-slot token-budget algorithm). This module re-exports it for architectural
-consistency since ContextBuilder is a Memory Layer component (see ADR-011).
+(Sprint 8, 10-slot token-budget algorithm). This module re-exports it for consumers
+that import from MemoryLayer, preserving the architectural intent that ContextBuilder
+belongs to the Memory Layer conceptually.
 
-The legacy Sprint 2 "librarian" builder is preserved as LegacyContextBuilder for
-backward compatibility with E2E tests.
+The legacy Sprint 2 "librarian" builder is available as LegacyContextBuilder.
+
+Usage:
+    from src.MemoryLayer.memory.context_builder import ContextBuilder  # Sprint 8 authoritative
+    from src.MemoryLayer.memory.context_builder import LegacyContextBuilder  # Sprint 2 legacy
 """
 from __future__ import annotations
+
+# Re-export the authoritative Sprint 8 ContextBuilder
+try:
+    from src.HybridRAG.code.querier.context_builder import (
+        ContextBuilder,
+        ContextBudget,
+        ContextItem,
+        ContextSlot,
+        AssembledContext,
+    )
+except ImportError:
+    # Fallback: if HybridRAG is not on the path, keep the legacy version
+    # as the primary export (this handles standalone MemoryLayer usage)
+    pass
+
+# The legacy builder is defined in this file and renamed for clarity
+# (see the LegacyContextBuilder class below)
 
 # ── Authoritative exports (Sprint 8 slot-based builder) ───────────────
 from src.HybridRAG.code.querier.context_builder import (  # noqa: F401

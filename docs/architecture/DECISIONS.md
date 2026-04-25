@@ -8,27 +8,51 @@
 
 ## Table of Contents
 
-- [ADR-001: Knowledge Graph — Neo4j](#adr-001-knowledge-graph--neo4j)
-- [ADR-002: Vector Store — Qdrant with 384-dim Embeddings](#adr-002-vector-store--qdrant-with-384-dim-embeddings)
-- [ADR-003: Hybrid RAG with Reciprocal Rank Fusion](#adr-003-hybrid-rag-with-reciprocal-rank-fusion)
-- [ADR-004: Deterministic Confidence Scoring (not LLM-based)](#adr-004-deterministic-confidence-scoring-not-llm-based)
-- [ADR-005: Cerbos PDP for RBAC Authorization](#adr-005-cerbos-pdp-for-rbac-authorization)
-- [ADR-006: Session Backend Strategy Pattern (Redis / In-Memory)](#adr-006-session-backend-strategy-pattern-redis--in-memory)
-- [ADR-007: Two-Tier Caching (LRU + Semantic)](#adr-007-two-tier-caching-lru--semantic)
-- [ADR-008: PostgreSQL for Administrative Data](#adr-008-postgresql-for-administrative-data)
-- [ADR-009: RLM as Internal Context Orchestrator](#adr-009-rlm-as-internal-context-orchestrator)
-- [ADR-010: NodeSet Anchor Pattern for Module Isolation](#adr-010-nodeset-anchor-pattern-for-module-isolation)
-- [ADR-011: Token-Budget Context Assembly with 10 Slots](#adr-011-token-budget-context-assembly-with-10-slots)
-- [ADR-012: MCP Protocol with streamable-http Transport](#adr-012-mcp-protocol-with-streamable-http-transport)
-- [ADR-013: Lazy Singleton Service Factories](#adr-013-lazy-singleton-service-factories)
-- [ADR-014: Docker Compose with 5 Services](#adr-014-docker-compose-with-5-services)
-- [ADR-015: Structure-Aware Chunking for AUTOSAR Documents](#adr-015-structure-aware-chunking-for-autosar-documents)
-- [ADR-016: Celery Task Queue — Deferred](#adr-016-celery-task-queue--deferred)
-- [ADR-017: MinIO / S3 Object Storage — Deferred](#adr-017-minio--s3-object-storage--deferred)
-- [ADR-018: Cross-Encoder Reranking — Deferred](#adr-018-cross-encoder-reranking--deferred)
-- [ADR-019: Local On-Premise Deployment](#adr-019-local-on-premise-deployment)
-- [ADR-020: Keycloak OAuth — Deferred](#adr-020-keycloak-oauth--deferred)
-- [ADR-021: Prometheus + Grafana Observability](#adr-021-prometheus--grafana-observability)
+- [Architecture Decision Records (ADRs)](#architecture-decision-records-adrs)
+  - [Table of Contents](#table-of-contents)
+  - [ADR-001: Knowledge Graph — Neo4j](#adr-001-knowledge-graph--neo4j)
+  - [ADR-002: Vector Store — Qdrant with 384-dim Embeddings](#adr-002-vector-store--qdrant-with-384-dim-embeddings)
+  - [ADR-003: Hybrid RAG with Reciprocal Rank Fusion](#adr-003-hybrid-rag-with-reciprocal-rank-fusion)
+  - [ADR-004: Deterministic Confidence Scoring (not LLM-based)](#adr-004-deterministic-confidence-scoring-not-llm-based)
+  - [ADR-005: Cerbos PDP for RBAC Authorization](#adr-005-cerbos-pdp-for-rbac-authorization)
+  - [ADR-006: Session Backend Strategy Pattern (Redis / In-Memory)](#adr-006-session-backend-strategy-pattern-redis--in-memory)
+  - [ADR-007: Two-Tier Caching (LRU + Semantic)](#adr-007-two-tier-caching-lru--semantic)
+  - [ADR-008: PostgreSQL for Administrative Data](#adr-008-postgresql-for-administrative-data)
+  - [ADR-009: RLM as Internal Context Orchestrator](#adr-009-rlm-as-internal-context-orchestrator)
+  - [ADR-010: NodeSet Anchor Pattern for Module Isolation](#adr-010-nodeset-anchor-pattern-for-module-isolation)
+  - [ADR-011: Token-Budget Context Assembly with 10 Slots](#adr-011-token-budget-context-assembly-with-10-slots)
+  - [ADR-012: MCP Protocol with streamable-http Transport](#adr-012-mcp-protocol-with-streamable-http-transport)
+  - [ADR-013: Lazy Singleton Service Factories](#adr-013-lazy-singleton-service-factories)
+  - [ADR-014: Docker Compose with 5 Services](#adr-014-docker-compose-with-5-services)
+  - [ADR-015: Structure-Aware Chunking for AUTOSAR Documents](#adr-015-structure-aware-chunking-for-autosar-documents)
+  - [ADR-016: Celery Task Queue — Deferred](#adr-016-celery-task-queue--deferred)
+  - [ADR-017: MinIO / S3 Object Storage — Deferred](#adr-017-minio--s3-object-storage--deferred)
+  - [ADR-018: Cross-Encoder Reranking — Deferred](#adr-018-cross-encoder-reranking--deferred)
+  - [ADR-019: Local On-Premise Deployment](#adr-019-local-on-premise-deployment)
+  - [ADR-020: Keycloak OAuth — Deferred](#adr-020-keycloak-oauth--deferred)
+  - [ADR-021: Prometheus + Grafana Observability](#adr-021-prometheus--grafana-observability)
+  - [ADR-022: Cross-Encoder Reranking (GAP-A01)](#adr-022-cross-encoder-reranking-gap-a01)
+  - [ADR-023: Query Enhancement Pipeline (GAP-A03)](#adr-023-query-enhancement-pipeline-gap-a03)
+  - [ADR-024: MCP Streaming Transport (GAP-A02)](#adr-024-mcp-streaming-transport-gap-a02)
+  - [ADR-025: Advanced Context Compression (GAP-A04)](#adr-025-advanced-context-compression-gap-a04)
+  - [ADR-026: Batch Graph Queries (GAP-A06)](#adr-026-batch-graph-queries-gap-a06)
+  - [ADR-027: LLM-as-Judge Validation (GAP-A08)](#adr-027-llm-as-judge-validation-gap-a08)
+  - [ADR-028: Dynamic Token Budget (GAP-A09)](#adr-028-dynamic-token-budget-gap-a09)
+  - [ADR-029: Agentic Context Refinement (GAP-A07)](#adr-029-agentic-context-refinement-gap-a07)
+  - [ADR-030: Batch Ingestion Pipeline (GAP-A05)](#adr-030-batch-ingestion-pipeline-gap-a05)
+  - [ADR-031: Citation Verification (GAP-A13)](#adr-031-citation-verification-gap-a13)
+  - [ADR-032: Few-Shot Learning Library (GAP-A14)](#adr-032-few-shot-learning-library-gap-a14)
+  - [ADR-033: OCR for Scanned Documents (GAP-A11)](#adr-033-ocr-for-scanned-documents-gap-a11)
+  - [ADR-034: Multi-Language Code Analysis — DEFERRED (GAP-A10)](#adr-034-multi-language-code-analysis--deferred-gap-a10)
+  - [ADR-035: Keycloak SSO — DEFERRED (GAP-A12)](#adr-035-keycloak-sso--deferred-gap-a12)
+  - [ADR-036: Distributed Tracing — REVISED (GAP-A15)](#adr-036-distributed-tracing--revised-gap-a15)
+  - [ADR-037: Celery Replaced by asyncio.TaskGroup (GAP-A05 revision)](#adr-037-celery-replaced-by-asynciotaskgroup-gap-a05-revision)
+  - [ADR-038: FlashRank Replaces PyTorch (GAP-A01 revision)](#adr-038-flashrank-replaces-pytorch-gap-a01-revision)
+  - [ADR-039: Credential Externalization](#adr-039-credential-externalization)
+  - [ADR-040: Rate Limiting via slowapi](#adr-040-rate-limiting-via-slowapi)
+  - [ADR-041: Domain Assistants — CBMC and FMEA Deferred](#adr-041-domain-assistants--cbmc-and-fmea-deferred)
+  - [ADR-042: MISRA and GEST — Fix Auth and Bugs Only](#adr-042-misra-and-gest--fix-auth-and-bugs-only)
+  - [ADR-043: Multi-Worker Deployment via Gunicorn](#adr-043-multi-worker-deployment-via-gunicorn)
 
 ---
 
@@ -326,3 +350,289 @@
 | **Grafana dashboards** | Query latency percentiles (p50, p95, p99), search stage breakdown (graph vs. vector), cache effectiveness, error rate trends, system health overview. |
 | **Configuration** | Prometheus: `prometheus.yml` with scrape targets (mcp-server:8000, neo4j:2004, redis-exporter:9121). Grafana: port 3000, provisioned datasource pointing to Prometheus. Both added to Docker Compose with named volumes (`prometheus_data`, `grafana_data`). |
 | **Implementation status** | **Implemented (Sprint 10).** `src/Observability/metrics.py` defines 11 Prometheus metric types with graceful `_NoOp` fallback. The MCP server mounts `/metrics` via Starlette alongside FastMCP. `docker-compose.yml` includes Prometheus (v2.53.0, port 9090) and Grafana (v11.1.0, port 3000) services with auto-provisioned datasource and 10-panel overview dashboard. Dependencies: `prometheus_client>=0.21`, `starlette>=0.37`. |
+
+---
+
+## ADR-022: Cross-Encoder Reranking (GAP-A01)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 12 |
+| **Context** | RRF merge is formula-based and fast but misses fine-grained semantic relevance. DocJockey's cross-encoder + LLM-as-Judge achieves 0.90 NDCG@10 vs ~0.72 for bi-encoder baseline. However, ~75% of AICE queries are graph-structural and gain no benefit from cross-encoder reranking. |
+| **Decision** | Add optional cross-encoder reranking (ms-marco-MiniLM-L-12-v2) after RRF merge, guarded by QueryEnhancer's strategy classification. Skip for graph_heavy and exact strategies. |
+| **Rationale** | (1) 20-30% ranking improvement for the ~25% of semantic queries. (2) Guarded skip preserves latency for structural queries. (3) Graceful degradation if model unavailable. |
+| **Implementation** | `CrossEncoderReranker` in `src/HybridRAG/code/querier/reranker.py`. Configurable via RERANKER_ENABLED, RERANKER_MODEL, RERANKER_TOP_K. |
+
+---
+
+## ADR-023: Query Enhancement Pipeline (GAP-A03)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 11 |
+| **Context** | AICE queries go directly to hybrid search without preprocessing. DocJockey applies synonym expansion, intent classification, and search strategy prediction. |
+| **Decision** | Add a deterministic QueryEnhancer stage before hybrid search with: (a) AUTOSAR/MCAL domain synonym expansion, (b) query complexity classification (simple/medium/complex), (c) search strategy prediction (graph/vector/hybrid/exact). All rule-based, zero LLM dependency, sub-millisecond. |
+| **Rationale** | (1) Domain synonyms improve recall for ambiguous queries. (2) Strategy prediction routes queries to optimal search path. (3) Complexity classification drives dynamic token budget (GAP-A09). |
+| **Implementation** | `QueryEnhancer` in `src/HybridRAG/code/querier/query_enhancer.py`. |
+
+---
+
+## ADR-024: MCP Streaming Transport (GAP-A02)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 12 |
+| **Context** | AICE MCP responses are synchronous — DAs must wait for complete tool response. DocJockey delivers 380ms time-to-first-token via SSE streaming. |
+| **Decision** | Add SSE streaming support via StreamingToolWrapper. Long-running tools (search, RLM, ingestion) yield StreamEvent objects. DAs opt-in via `stream=true` parameter. Backward compatible — existing JSON-RPC clients unaffected. |
+| **Rationale** | (1) Progressive results improve DA UX. (2) MCP protocol already supports streamable-http. (3) Metrics (TTFT, completion rate) enable quality tracking. |
+| **Implementation** | `StreamingToolWrapper` in `mcp/core/streaming.py`. |
+
+---
+
+## ADR-025: Advanced Context Compression (GAP-A04)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 13 |
+| **Context** | ContextBuilder uses fixed 10-slot 8K budget. DocJockey achieves 4.2x compression with 88% information retention via query-focused abstractive compression. |
+| **Decision** | Replace fixed budget with 3-stage pipeline: (a) extractive sentence selection (deterministic), (b) query-focused abstractive compression via GPT4IFX (optional), (c) dynamic budget enforcement. Target 3.5-4x compression with >85% retention. |
+| **Rationale** | (1) Extractive stage is fast and deterministic. (2) Abstractive stage uses GPT4IFX (already available). (3) Falls back to extractive-only if LLM unavailable. |
+| **Implementation** | `ContextCompressor` in `src/HybridRAG/code/querier/context_compressor.py`. |
+
+---
+
+## ADR-026: Batch Graph Queries (GAP-A06)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 11 |
+| **Context** | SearchService issues 50-200 individual Cypher queries per hybrid search for relationship enrichment (N+1 problem). This is the #1 documented latency bottleneck (P0). |
+| **Decision** | Replace per-node relationship fetching with batch UNWIND queries. Collect all element IDs, execute 2-3 batch queries (nodes + relationships) instead of 50-200 individual queries. |
+| **Rationale** | (1) Neo4j UNWIND is designed for batch operations. (2) Expected 60-80% reduction in graph query latency. (3) Preserves NodeSet isolation via module filter in WHERE clause. |
+| **Implementation** | `BatchGraphResolver` in `src/HybridRAG/code/querier/batch_graph_resolver.py`. |
+
+---
+
+## ADR-027: LLM-as-Judge Validation (GAP-A08)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 13 |
+| **Context** | Retrieved chunks are not quality-validated before DA consumption. DocJockey's LLM-as-Judge with self-consistency shows 18% improvement in ranking correlation. |
+| **Decision** | Add optional LLM-based relevance validation for top-10 chunks. Single GPT4IFX call scores factual relevance and contextual fit. Only for QUICK/FULL review routes (not AUTO). |
+| **Rationale** | (1) Catches low-relevance chunks missed by RRF and cross-encoder. (2) Only adds ~800ms for non-AUTO paths. (3) Conservative: on parse failure, keeps all chunks. |
+| **Implementation** | `RelevanceJudge` in `src/HybridRAG/code/querier/relevance_judge.py`. |
+
+---
+
+## ADR-028: Dynamic Token Budget (GAP-A09)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 13 |
+| **Context** | Fixed 8K token budget wastes tokens on simple queries and starves complex ones. |
+| **Decision** | Replace fixed budget with complexity-driven allocation: simple=4K, medium=8K, complex=12K. Slot budgets scale proportionally. Driven by QueryEnhancer's complexity classification. |
+| **Rationale** | (1) Simple factual queries need less context. (2) Complex multi-part queries need more. (3) Slot proportions preserved via scaling factor. |
+| **Implementation** | `DynamicTokenBudget` in `src/HybridRAG/code/querier/context_compressor.py`. |
+
+---
+
+## ADR-029: Agentic Context Refinement (GAP-A07)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 14 |
+| **Context** | Complex multi-part queries are under-served by single-pass ContextBuilder. DocJockey's multi-agent swarm reports +40% quality improvement. |
+| **Decision** | Add multi-agent context refinement for complex RLM queries: coordinator plans, specialists (code/register/requirement/safety) analyze gaps, validator checks completeness. Max 3 iterations, 2000 token budget cap. Only for "complex" queries. |
+| **Rationale** | (1) Agents are prompt templates, not autonomous loops — predictable cost. (2) Budget cap prevents runaway. (3) Only activates for complex queries (~10% of traffic). |
+| **Implementation** | `ContextRefiner` in `src/HybridRAG/code/querier/context_refiner.py`. |
+
+---
+
+## ADR-030: Batch Ingestion Pipeline (GAP-A05)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 15 |
+| **Context** | Sequential ingestion is a documented P3 bottleneck. DocJockey uses configurable batch sizes with Airflow orchestration. |
+| **Decision** | Replace sequential ingestion with batch processing: embed (batch=64), Qdrant upsert (batch=100), Neo4j merge (UNWIND, batch=50). Optional Celery worker integration. Progress tracked in ingestion_jobs table. |
+| **Rationale** | (1) 3-5x throughput improvement for bulk onboarding. (2) Celery is optional — synchronous batch still works. (3) Reuses existing PostgreSQL schema for tracking. |
+| **Implementation** | `BatchIngestionPipeline` in `src/IngestionPipeline/batch_ingestion.py`. |
+
+---
+
+## ADR-031: Citation Verification (GAP-A13)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 14 |
+| **Context** | DA output claims are not verified against source context. DocJockey's citation verification reduces hallucinations by 85%. |
+| **Decision** | Add post-generation citation verification: extract claims (GPT4IFX or regex), match against source KG nodes (text overlap + entity matching), flag unverified claims. Integrates with ConfidenceCalculator as additional scoring signal. |
+| **Rationale** | (1) Safety-critical automotive domain demands claim verification. (2) Dual extraction (LLM + regex fallback). (3) Deterministic verification via text overlap. |
+| **Implementation** | `CitationVerifier` in `src/ReviewGate/citation_verifier.py`. New MCP tool: `verify_citations` (Cat 9). |
+
+---
+
+## ADR-032: Few-Shot Learning Library (GAP-A14)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 16 |
+| **Context** | DA prompts lack domain-specific examples. DocJockey uses dynamic example injection for 22% improvement in response consistency. |
+| **Decision** | Maintain a few-shot example library in Qdrant (few_shot_examples collection). Retrieve 2-3 most similar examples via vector search, inject into DA prompts. Populated from APPROVED feedback with quality >= 80. |
+| **Rationale** | (1) Reuses existing Qdrant infrastructure. (2) Quality-gated population prevents bad examples. (3) Task-type filtering ensures relevance. |
+| **Implementation** | `FewShotLibrary` in `src/MemoryLayer/memory/few_shot_library.py`. |
+
+---
+
+## ADR-033: OCR for Scanned Documents (GAP-A11)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 17 |
+| **Context** | Some legacy HW specifications are scanned PDFs. AICE cannot process these without OCR. DocJockey integrates Tesseract OCR. |
+| **Decision** | Add Tesseract OCR as optional ingestion stage. Detect scanned pages (< 10 chars extractable text), route through OCR, rejoin standard chunking pipeline. Uses subprocess calls (no pytesseract dependency). |
+| **Rationale** | (1) Optional dependency — system package only. (2) Page-level processing for memory efficiency. (3) Confidence estimation for quality filtering. |
+| **Implementation** | `OCRProcessor` in `src/IngestionPipeline/parsers/ocr_processor.py`. |
+
+---
+
+## ADR-034: Multi-Language Code Analysis — DEFERRED (GAP-A10)
+
+| Field | Value |
+|-------|-------|
+| **Status** | **Rejected / Deferred Indefinitely** |
+| **Date** | Sprint 11 (decision) |
+| **Context** | DocJockey's code-retrieval service supports 7 languages via Tree-sitter. AICE currently supports C/H only. |
+| **Decision** | **Do not implement multi-language code analysis.** AICE is purpose-built for AURIX TC3xx embedded software, which is exclusively C/H. Adding Python/Rust/JS parsing provides no benefit to the target domain and adds maintenance burden. |
+| **Rationale** | (1) AURIX MCAL drivers are 100% C code. (2) iLLD reference software is 100% C code. (3) AUTOSAR Classic Platform is C only. (4) Test frameworks use C (Unity/CppUTest). (5) Build scripts (Python/Makefiles) are not ingested into the KG. (6) Complexity cost: each new parser requires ontology extensions, KG schema changes, and ingestion pipeline updates. |
+| **Re-evaluation trigger** | Only revisit if AURIX tooling officially adopts Rust for safety-critical components, or if a DA requires analysis of non-C build infrastructure. |
+
+---
+
+## ADR-035: Keycloak SSO — DEFERRED (GAP-A12)
+
+| Field | Value |
+|-------|-------|
+| **Status** | **Deferred** |
+| **Date** | Sprint 11 (decision) |
+| **Context** | AICE uses API-key authentication via Cerbos RBAC. DocJockey has Windows NTLM + OAuth2 enterprise SSO. |
+| **Decision** | Defer Keycloak SSO integration. Current API-key auth is sufficient for programmatic DA access. Enterprise SSO will be addressed when human-facing UIs require it. |
+| **Rationale** | (1) All 21 DAs use programmatic API keys. (2) No human-facing web UI exists yet. (3) Keycloak deployment adds operational complexity. (4) API keys are simpler for CI/CD integration. |
+| **Re-evaluation trigger** | When a human-facing dashboard or web UI is built for AICE, or when enterprise security policy mandates SSO for all internal tools. |
+
+---
+
+## ADR-036: Distributed Tracing — REVISED (GAP-A15)
+
+| Field | Value |
+|-------|-------|
+| **Status** | **Adopted (MCP layer only)** |
+| **Date** | Sprint 11 (original deferral), Sprint 25 (revised) |
+| **Context** | Original decision deferred OpenTelemetry entirely. Review3 found Prometheus metrics (11 types) are completely unwired — zero counters incremented. Without tracing, debugging DA request flows through the 6-stage search pipeline (enhance → search → rerank → compress → judge → refine) is impossible. |
+| **Decision** | Add OpenTelemetry tracing for the MCP tool dispatch layer, search pipeline, and LLM calls only. Export via OTLP to Grafana Tempo (added to docker-compose). Skip auto-instrumentation of FastAPI/httpx. |
+| **Rationale** | (1) MCP tool dispatch + search pipeline are the critical paths that need visibility. (2) Grafana Tempo reuses existing Grafana deployment. (3) Manual spans give better control than auto-instrumentation. (4) Prometheus metrics will also be wired as part of this sprint. |
+| **Implementation** | `src/Observability/tracing.py` (new). Grafana Tempo service in docker-compose. |
+
+---
+
+## ADR-037: Celery Replaced by asyncio.TaskGroup (GAP-A05 revision)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 25 |
+| **Context** | ADR-030 specified optional Celery worker integration for batch ingestion. Review3 found Celery is absent (comments only), and the deployment is single-org (Infineon) on a single node. Celery adds Redis broker management, worker process orchestration, and monitoring overhead disproportionate to current scale. |
+| **Decision** | Replace Celery design with `asyncio.TaskGroup` for concurrent I/O (Neo4j/Qdrant batch writes) and `concurrent.futures.ProcessPoolExecutor` for CPU-bound parsing (C files, tree-sitter). Do not add Celery or celery-batches as dependencies. |
+| **Rationale** | (1) asyncio.TaskGroup is stdlib — zero new dependencies. (2) ProcessPoolExecutor handles CPU-bound parsing without GIL contention. (3) Same task signatures can be wrapped in Celery later if multi-node scaling is needed. (4) Simpler deployment and debugging. |
+| **Re-evaluation trigger** | Multi-node deployment or ingestion throughput exceeding single-process capacity. |
+
+---
+
+## ADR-038: FlashRank Replaces PyTorch (GAP-A01 revision)
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 25 |
+| **Context** | ADR-022 adopted cross-encoder reranking but left PyTorch (2GB) as dependency. Review3 found `flashrank` missing from requirements.txt — reranker always falls back to CrossEncoder, keeping PyTorch mandatory. The original GAP-A01 intent was to eliminate PyTorch via FlashRank (ONNX). |
+| **Decision** | Add `flashrank>=0.2.0` to requirements.txt. Remove `torch>=2.0.0`, `sentence-transformers>=5.0.0`, and the PyTorch `--extra-index-url`. Keep CrossEncoder as degraded fallback. |
+| **Rationale** | (1) FlashRank uses ONNX Runtime — ~50MB vs ~2GB for PyTorch. (2) Docker image size reduced by ~1.8GB. (3) Cold start time reduced by ~15s. (4) ONNX Runtime is already used by other pipeline components. |
+| **Implementation** | `requirements.txt` update. Existing `reranker.py` already supports FlashRank backend. |
+
+---
+
+## ADR-039: Credential Externalization
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 25 |
+| **Context** | Review2 (F-02) and Review3 (C04) found hardcoded passwords in docker-compose.yml (`aice_dev_2026`, `neo4j_aice_2026`, `redis_aice_2026`). Additionally, `mcp/auth/api_keys.yaml` contains plaintext API keys committed to version control. |
+| **Decision** | (1) Extract all credentials to `.env` file with `${VAR:-default}` syntax in docker-compose.yml (already partially done). (2) Add `.env` to `.gitignore`. (3) Provide `.env.example` with placeholder values. (4) Add `api_keys.yaml` to `.gitignore`. (5) Defer Docker Secrets / HashiCorp Vault to multi-node deployment phase. |
+| **Rationale** | (1) `.env` + docker-compose `--env-file` is the simplest credential separation for single-node. (2) Docker Secrets requires Swarm mode. (3) Vault adds operational complexity disproportionate to current deployment. |
+| **Re-evaluation trigger** | Multi-node deployment or enterprise security audit requiring encrypted-at-rest secrets. |
+
+---
+
+## ADR-040: Rate Limiting via slowapi
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 25 |
+| **Context** | Review2 (F-03) and Review3 (C05) found zero rate limiting anywhere in the MCP server. A single client can exhaust backend resources or trigger LLM cost overruns. |
+| **Decision** | Add `slowapi>=0.1.9` middleware with per-API-key rate limits: 60 req/min for search/query tools, 10 req/min for admin tools, 5 req/min for ingestion tools. Rate limit headers (X-RateLimit-*) included in responses. |
+| **Rationale** | (1) slowapi is the standard ASGI rate limiter (wraps limits library). (2) Per-API-key limiting protects against both abuse and accidental loops. (3) Configurable via environment variables. |
+| **Implementation** | New middleware in `mcp/core/rate_limiter.py`. Integrated via Starlette middleware stack. |
+
+---
+
+## ADR-041: Domain Assistants — CBMC and FMEA Deferred
+
+| Field | Value |
+|-------|-------|
+| **Status** | **Deferred** |
+| **Date** | Sprint 25 |
+| **Context** | Review3 found CBMC bridge (C07) always fails due to JSON/text parsing mismatch, and FMEA engine has no MCP tool, no DA class, no output format. Both require external dependencies (CBMC binary, FMEA spreadsheet format decision) not available in current deployment. |
+| **Decision** | Defer full CBMC and FMEA implementation. Fix the CBMC JSON parsing bug (low effort) to unblock future use. Register stub MCP tools that return "Feature not yet available" with appropriate tier entries. Do not invest in FMEA propagation paths, spreadsheet export, or CBMC feedback loop. |
+| **Rationale** | (1) CBMC binary not available in deployment environment. (2) FMEA output format and workflow not yet specified. (3) MISRA remediation and GEST (unit test generation) are higher priority — fix auth blockers and engine bugs for those. (4) Stub tools prevent authorization gaps when full implementation is added later. |
+| **Re-evaluation trigger** | CBMC binary available in CI/CD environment, or FMEA workflow requirements defined by safety team. |
+
+---
+
+## ADR-042: MISRA and GEST — Fix Auth and Bugs Only
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 25 |
+| **Context** | MISRA remediation engine and GEST (unit test generation) both have MCP tools registered but permanently denied by authorization (missing from tool_tiers.py). MISRA compliance matrix hardcodes 10 rules (should be 175+). GEST compile-and-fix loop is dead code. |
+| **Decision** | (1) Add `remediate_misra_violation` and `generate_unit_tests` to tool_tiers.py as DEVELOPER tier. (2) Fix MISRA compliance matrix to query KG for rule count. (3) Do NOT implement GEST compile loop (requires compiler decision). (4) Do NOT implement Polarion ALM export. |
+| **Rationale** | (1) Auth fix is 2 lines — unblocks both tools immediately. (2) KG-based rule count is accurate and self-maintaining. (3) Compile loop requires target compiler (Tasking/GCC/GHS) — premature to implement. (4) No Polarion instance available. |
+| **Re-evaluation trigger** | Target compiler selected for CI/CD environment. Polarion integration spec provided. |
+
+---
+
+## ADR-043: Multi-Worker Deployment via Gunicorn
+
+| Field | Value |
+|-------|-------|
+| **Status** | Adopted |
+| **Date** | Sprint 25 |
+| **Context** | Review2 (F-04) and Review3 (C06) found the MCP server runs as a single Python process. No Gunicorn or equivalent ASGI server wrapper. Under load, a single process cannot utilize multiple CPU cores. |
+| **Decision** | Change Dockerfile CMD to `gunicorn mcp.app:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000`. Add `gunicorn>=22.0` to requirements.txt. Worker count configurable via `WEB_CONCURRENCY` env var. |
+| **Rationale** | (1) Gunicorn + UvicornWorker is the standard production deployment for async Python ASGI apps. (2) 4 workers matches typical container CPU allocation. (3) Configurable via environment for different deployment sizes. |
+| **Implementation** | Dockerfile CMD change + requirements.txt update. |

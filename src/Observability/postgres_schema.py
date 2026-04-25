@@ -274,6 +274,12 @@ class PostgresClient:
             return
         try:
             with self._conn.cursor() as cur:
+                # H09 fix: ensure response_archive row exists (FK constraint)
+                cur.execute(
+                    "INSERT INTO response_archive (response_id) "
+                    "VALUES (%s) ON CONFLICT (response_id) DO NOTHING",
+                    (response_id,)
+                )
                 cur.execute(
                     "INSERT INTO review_evidence (review_id, response_id, decision, "
                     "reviewer_id, issues_found, rationale, checklist) "

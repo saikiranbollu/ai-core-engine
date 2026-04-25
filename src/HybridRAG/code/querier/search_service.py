@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .context_builder import (
     AssembledContext, ContextBuilder, ContextBudget, ContextItem, ContextSlot,
 )
+from .context_compressor import ContextCompressor
+from .context_refiner import ContextRefiner
 from .kg_node_utils import (
     LABEL_DISPLAY_PROPS, LABEL_ID_PROPS, LABEL_NAME_PROPS, COMPACT_PROPS,
     Source, classify_source, extract_keywords, extract_named_entities,
@@ -35,6 +37,9 @@ from .kg_node_utils import (
     node_display_name, node_unique_id, normalise_scores, score_node,
     serialize_node,
 )
+from .query_enhancer import QueryEnhancer
+from .relevance_judge import RelevanceJudge
+from .reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +77,28 @@ class SearchService:
         self._collection_cache_ttl: float = float(os.environ.get("COLLECTION_CACHE_TTL", "300"))  # 5 min
         self._collection_cache_lock = threading.Lock()
 
+        # ── GAP pipeline components ─────────────────────────────────
+        self._enhancer = QueryEnhancer()
+        self._compressor = ContextCompressor()
+        self._judge = RelevanceJudge()
+        self._refiner = ContextRefiner()
+        self._reranker = CrossEncoderReranker()
+        self._batch_resolver = None
+
     @property
     def available(self) -> bool:
         return self._neo4j is not None
+
+    def set_llm_fn(self, llm_fn):
+        """Wire an LLM callable into all pipeline components that need it."""
+        if self._compressor and hasattr(self._compressor, '_abstractive'):
+            self._compressor._abstractive._llm_fn = llm_fn
+            self._compressor._abstractive._enabled = True
+        if self._judge and hasattr(self._judge, '_custom_backend'):
+            self._judge._custom_backend._llm_fn = llm_fn
+        if self._refiner:
+            self._refiner._llm_fn = llm_fn
+            self._refiner._search_fn = self._search_fn if hasattr(self, '_search_fn') else None
 
     def _get_context_builder(self) -> ContextBuilder:
         """Lazy-init the ContextBuilder."""
@@ -134,6 +158,7 @@ class SearchService:
         offset: int = 0,
         workspace_id: str = "illd",
         alpha: float = 0.6,
+        skip_judge: bool = False,
     ) -> Dict[str, Any]:
         """
         Combined graph + vector search.
@@ -263,11 +288,80 @@ class SearchService:
                             break
                 merged.sort(key=lambda r: r.get("score", 0), reverse=True)
 
+        # ── Stage 5: GAP pipeline (compress → judge → refine) ────────
+        pipeline_stats: Dict[str, Any] = {}
+        complexity = "medium"
+
+        # Query enhancement (for complexity detection)
+        if hasattr(self, '_enhancer') and self._enhancer is not None:
+            try:
+                enhanced = self._enhancer.enhance(query)
+                complexity = enhanced.complexity.value if hasattr(enhanced.complexity, 'value') else str(enhanced.complexity)
+            except Exception:
+                logger.debug("Query enhancer failed, using default complexity", exc_info=True)
+
+        # 5a. Compress
+        if hasattr(self, '_compressor') and self._compressor is not None and getattr(self._compressor, 'available', False):
+            try:
+                comp_result = self._compressor.compress(merged, query, complexity=complexity)
+                merged = comp_result.compressed_items
+                pipeline_stats["compression"] = {
+                    "compression_ratio": comp_result.compression_ratio,
+                    "original_tokens": comp_result.original_tokens,
+                    "compressed_tokens": comp_result.compressed_tokens,
+                    "stages_applied": comp_result.stages_applied,
+                    "items_before": comp_result.items_before,
+                    "items_after": comp_result.items_after,
+                }
+            except Exception:
+                logger.debug("Compressor failed, skipping", exc_info=True)
+
+        # 5b. Judge
+        if (not skip_judge
+                and hasattr(self, '_judge') and self._judge is not None
+                and getattr(self._judge, 'available', False)):
+            try:
+                judge_result = self._judge.judge(query, merged)
+                merged = judge_result.results
+                pipeline_stats["relevance_judging"] = {
+                    "judged": judge_result.judged,
+                    "original_count": judge_result.original_count,
+                    "kept_count": judge_result.kept_count,
+                    "dropped_count": judge_result.dropped_count,
+                    "backend": judge_result.backend,
+                }
+            except Exception:
+                logger.debug("Judge failed, skipping", exc_info=True)
+        elif skip_judge:
+            pipeline_stats["relevance_judging"] = {
+                "judged": False,
+                "skip_reason": "skip_judge enabled",
+            }
+
+        # 5c. Refine (only for complex queries)
+        if (hasattr(self, '_refiner') and self._refiner is not None
+                and getattr(self._refiner, 'available', False)
+                and complexity == "complex"):
+            try:
+                ref_result = self._refiner.refine(query, merged, complexity=complexity)
+                merged = ref_result.refined_items
+                pipeline_stats["refinement"] = {
+                    "iterations": ref_result.iterations,
+                    "agents_used": ref_result.agents_used,
+                    "gaps_found": ref_result.gaps_found,
+                    "gaps_resolved": ref_result.gaps_resolved,
+                    "completeness_score": ref_result.completeness_score,
+                    "crag_corrections": ref_result.crag_corrections,
+                    "self_rag_retrievals": ref_result.self_rag_retrievals,
+                }
+            except Exception:
+                logger.debug("Refiner failed, skipping", exc_info=True)
+
         # Paginate
         total = len(merged)
         page = merged[offset:offset + max_results]
 
-        return {
+        result = {
             "results": page,
             "total_count": total,
             "has_more": (offset + max_results) < total,
@@ -276,6 +370,8 @@ class SearchService:
             "named_entities": named_ents,
             "is_aggregation": is_agg,
         }
+        result.update(pipeline_stats)
+        return result
 
     async def hybrid_search_async(
         self,
@@ -425,78 +521,119 @@ class SearchService:
 
         try:
             with self._neo4j.session(database=db) as session:
-                # ── Single consolidated query using UNWIND ──────────
-                # Instead of N×M individual queries (labels × keywords),
-                # run one query per label with all keywords at once.
-                for label in labels:
+                # ── Consolidated query: single Cypher for all labels ────
+                # Instead of N queries (one per label), run a single query
+                # that matches any node whose labels overlap with the
+                # inferred set. This reduces 50-200 queries to 1.
+                try:
+                    module_clause = (
+                        "AND (n.module IS NULL OR n.module = $module) "
+                        if module else ""
+                    )
+                    cypher = (
+                        "UNWIND $keywords AS kw "
+                        "MATCH (n) "
+                        "WHERE any(lbl IN labels(n) WHERE lbl IN $labels) "
+                        f"{module_clause}"
+                        "AND ("
+                        "  toLower(coalesce(n.name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.function_name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.description, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.param_name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.requirement_id, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.title, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.api_name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.type_name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.macro_name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.module_name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.file_name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.register_name, '')) CONTAINS kw OR "
+                        "  toLower(coalesce(n.struct_name, '')) CONTAINS kw"
+                        ") "
+                        "RETURN DISTINCT n, labels(n) AS node_labels, kw "
+                        "LIMIT $limit"
+                    )
+                    params = {
+                        "keywords": [k.lower() for k in keywords],
+                        "labels": list(labels),
+                        "limit": max_results * 2,  # Over-fetch for dedup
+                    }
+                    if module:
+                        params["module"] = module
+
+                    records = session.run(cypher, params)
+                    for record in records:
+                        node = record["n"]
+                        props = dict(node.items())
+                        node_type = record["node_labels"][0] if record["node_labels"] else labels[0]
+                        kw = record["kw"]
+
+                        name = node_display_name(node_type, props)
+                        nid = node_unique_id(node_type, props)
+                        if nid in seen_ids:
+                            continue
+                        seen_ids.add(nid)
+
+                        desc = str(props.get("description", ""))
+                        sc = score_node(kw, name, desc)
+
+                        result = {
+                            "node_id": nid,
+                            "node_type": node_type,
+                            "source": "neo4j",
+                            "score": sc,
+                            "properties": props,
+                            "content": serialize_node(node_type, props),
+                        }
+
+                        if include_relationships:
+                            result["relationships"] = self._get_node_relationships(
+                                session, node.element_id, limit=5
+                            )
+
+                        results.append(result)
+                except Exception as exc:
+                    logger.warning("Consolidated graph search failed: %s", exc)
+
+                # ── Fulltext index fallback (if available) ────────────
+                # If a fulltext index 'aice_search_idx' exists, use it
+                # for a secondary pass to catch matches the CONTAINS
+                # scan might miss (handles stemming, fuzzy matching).
+                if len(results) < max_results:
                     try:
-                        module_clause = (
-                            "WHERE (n.module IS NULL OR n.module = $module) AND ("
-                            if module else "WHERE ("
-                        )
-                        cypher = (
-                            "UNWIND $keywords AS kw "
-                            f"MATCH (n:{label}) "
-                            f"{module_clause}"
-                            "  toLower(coalesce(n.name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.function_name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.description, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.param_name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.requirement_id, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.title, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.api_name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.type_name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.macro_name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.module_name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.file_name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.register_name, '')) CONTAINS kw OR "
-                            "  toLower(coalesce(n.struct_name, '')) CONTAINS kw"
-                            ") "
-                            "RETURN DISTINCT n, labels(n) AS node_labels, kw "
+                        ft_cypher = (
+                            "CALL db.index.fulltext.queryNodes("
+                            "  'aice_search_idx', $query_text"
+                            ") YIELD node, score "
+                            "WHERE any(lbl IN labels(node) WHERE lbl IN $labels) "
+                            "RETURN node, labels(node) AS node_labels, score "
+                            "ORDER BY score DESC "
                             "LIMIT $limit"
                         )
-                        params = {
-                            "keywords": [k.lower() for k in keywords],
-                            "limit": max_results,
+                        ft_params = {
+                            "query_text": " ".join(keywords),
+                            "labels": list(labels),
+                            "limit": max_results - len(results),
                         }
-                        if module:
-                            params["module"] = module
-                        records = session.run(cypher, params)
-                        for record in records:
-                            node = record["n"]
+                        for record in session.run(ft_cypher, ft_params):
+                            node = record["node"]
                             props = dict(node.items())
-                            node_type = record["node_labels"][0] if record["node_labels"] else label
-                            kw = record["kw"]
-
-                            name = node_display_name(node_type, props)
+                            node_type = record["node_labels"][0] if record["node_labels"] else labels[0]
                             nid = node_unique_id(node_type, props)
                             if nid in seen_ids:
                                 continue
                             seen_ids.add(nid)
-
-                            desc = str(props.get("description", ""))
-                            sc = score_node(kw, name, desc)
-
-                            result = {
+                            results.append({
                                 "node_id": nid,
                                 "node_type": node_type,
                                 "source": "neo4j",
-                                "score": sc,
+                                "score": record["score"],
                                 "properties": props,
                                 "content": serialize_node(node_type, props),
-                            }
-
-                            if include_relationships:
-                                result["relationships"] = self._get_node_relationships(
-                                    session, node.element_id, limit=5
-                                )
-
-                            results.append(result)
-                    except Exception as exc:
-                        graph_errors += 1
-                        logger.warning("Graph search failed for %s: %s", label, exc)
-                        if graph_errors >= 3:
-                            break
+                            })
+                    except Exception:
+                        # Fulltext index may not exist — silently skip
+                        pass
 
                 # ── 1-hop neighbor expansion for top results ──────────
                 if results:

@@ -105,8 +105,8 @@ class TestToolTiers:
 
     def test_all_56_tools_covered(self):
         from mcp.core.tool_tiers import TOOL_TIERS
-        # 13 categories + 4 sandbox + 2 RLM = 56 tools
-        assert len(TOOL_TIERS) == 56
+        # 13 categories + 4 sandbox + 2 RLM + 1 GAP v2 tool = 58 tools
+        assert len(TOOL_TIERS) == 58
 
     def test_sandbox_and_rlm_tools_present(self):
         from mcp.core.tool_tiers import TOOL_TIERS

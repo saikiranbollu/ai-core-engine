@@ -26,15 +26,21 @@ RUN apt-get update && \
 # Copy Cerbos binary from stage 1
 COPY --from=cerbos /cerbos /usr/local/bin/cerbos
 
-# Install Python dependencies
+# Install Python dependencies (CPU-only PyTorch via extra index)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+    -r requirements.txt && \
+    pip install --no-cache-dir gunicorn uvicorn[standard]
 
 # Pre-download the sentence-transformers embedding model into the image
 # so the first search_database call doesn't block on a network download.
 ENV HF_HOME=/app/.cache \
     SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+# Pre-download LLMLingua model into the image to avoid first-request runtime fetch.
+ENV LLMLINGUA_MODEL=microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank
+RUN python -c "import os; from llmlingua import PromptCompressor; PromptCompressor(model_name=os.getenv('LLMLINGUA_MODEL', 'microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank'), use_llmlingua2=True, device_map='cpu')"
 
 # Copy application code (renamed to avoid shadowing the pip 'mcp' package)
 COPY mcp/ ./aice_mcp/
@@ -64,10 +70,12 @@ ENV CERBOS_BIN=/usr/local/bin/cerbos \
     FASTMCP_STREAMABLE_HTTP_PATH=/mcp \
     API_KEY_REGISTRY_PATH=/app/aice_mcp/auth/api_keys.yaml \
     REDIS_URL=redis://:password@redis:6379/0 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    WEB_CONCURRENCY=4
 
 # Expose MCP + Cerbos ports
 EXPOSE 8000 3592 3593
 
 # Entrypoint: app.py starts both Cerbos PDP and MCP server
 CMD ["python", "aice_mcp/app.py"]
+# For multi-worker HTTP deployment, set WEB_CONCURRENCY=4 and MCP_TRANSPORT=streamable-http

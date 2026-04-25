@@ -90,7 +90,7 @@ ENABLE_METRICS=true docker compose --profile monitoring up -d
 
 | Service | Image | Ports | Key Configuration |
 |---------|-------|-------|-------------------|
-| **neo4j** | `neo4j:5.26.0-community` | 7474 (browser), 7687 (bolt) | APOC + GDS plugins, 512m heap, 512m pagecache |
+| **neo4j** | `neo4j:5.26.0-community` | 7474 (browser), 7687 (bolt) | APOC + GDS plugins, 512m initial / 1g max heap, 512m pagecache |
 | **qdrant** | `qdrant/qdrant:v1.12.1` | 6333 (REST), 6334 (gRPC) | Default configuration |
 | **redis** | `redis:7-alpine` | 6379 | 256mb maxmemory, allkeys-lru eviction, AOF persistence |
 | **postgres** | `postgres:16-alpine` | 5432 | DB=`aice_meta`, user=`aice` |
@@ -116,7 +116,7 @@ All services have Docker health checks:
 ```yaml
 neo4j:
   healthcheck:
-    test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "$$NEO4J_AUTH", "RETURN 1"]
+    test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-aice_dev_2026}", "RETURN 1"]
     interval: 30s
     timeout: 10s
     retries: 5
@@ -161,7 +161,7 @@ environment:
   - NEO4J_AUTH=neo4j/password
   - NEO4J_PLUGINS=["apoc", "graph-data-science"]
   - NEO4J_server_memory_heap_initial__size=512m
-  - NEO4J_server_memory_heap_max__size=512m
+  - NEO4J_server_memory_heap_max__size=1g
   - NEO4J_server_memory_pagecache_size=512m
 ```
 

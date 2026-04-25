@@ -101,7 +101,70 @@ def main() -> None:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGCHLD, _on_sigchld)
 
-    # ── 4. Start MCP server ──
+    # ── 4. Start APScheduler for periodic background jobs ──
+    scheduler = None
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        scheduler = BackgroundScheduler(daemon=True)
+
+        def _health_check_job():
+            """Periodic health check for backend services."""
+            try:
+                from core.mcp_server import _get_neo4j, _get_qdrant, _get_redis
+                checks = {}
+                try:
+                    neo4j = _get_neo4j()
+                    checks["neo4j"] = "up" if neo4j else "down"
+                except Exception:
+                    checks["neo4j"] = "down"
+                try:
+                    qdrant = _get_qdrant()
+                    checks["qdrant"] = "up" if qdrant else "down"
+                except Exception:
+                    checks["qdrant"] = "down"
+                try:
+                    r = _get_redis()
+                    checks["redis"] = "up" if r and r.ping() else "down"
+                except Exception:
+                    checks["redis"] = "down"
+                logger.info("[Scheduler] Health check: %s", checks)
+            except Exception as e:
+                logger.warning("[Scheduler] Health check failed: %s", e)
+
+        def _cache_stats_job():
+            """Log cache hit rates periodically."""
+            try:
+                from src.Configuration.cache_service import CacheService
+                svc = CacheService()
+                logger.info("[Scheduler] Cache stats: %s", svc.stats())
+            except Exception as e:
+                logger.debug("[Scheduler] Cache stats failed: %s", e)
+
+        scheduler.add_job(_health_check_job, IntervalTrigger(minutes=5),
+                          id="health_check", replace_existing=True)
+        scheduler.add_job(_cache_stats_job, IntervalTrigger(minutes=30),
+                          id="cache_stats", replace_existing=True)
+        scheduler.start()
+        logger.info("[Scheduler] APScheduler started with 2 periodic jobs")
+
+        # Update shutdown handler to also stop scheduler
+        _orig_shutdown = _shutdown
+        def _shutdown_with_scheduler(signum, frame):
+            if scheduler and scheduler.running:
+                scheduler.shutdown(wait=False)
+                logger.info("[Scheduler] APScheduler stopped")
+            _orig_shutdown(signum, frame)
+        signal.signal(signal.SIGTERM, _shutdown_with_scheduler)
+        signal.signal(signal.SIGINT, _shutdown_with_scheduler)
+
+    except ImportError:
+        logger.info("[Scheduler] apscheduler not installed — periodic jobs disabled")
+    except Exception as e:
+        logger.warning("[Scheduler] Failed to start: %s", e)
+
+    # ── 5. Start MCP server ──
     logger.info("Starting MCP server")
     try:
         from core.mcp_server import main as mcp_main

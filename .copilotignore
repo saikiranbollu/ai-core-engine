@@ -1,0 +1,74 @@
+# Keep Copilot context focused on source and active docs.
+# Exclude large/generated folders and files that add noise.
+
+# Python environments and caches
+.venv/
+env/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage and local build outputs
+.coverage
+htmlcov/
+build/
+dist/
+
+# Logs and temp artifacts
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# JS dependencies (if present)
+node_modules/
+
+# Large archived documentation/media sets
+/docs/archive/
+/docs/archive2/
+/tmp/_images/
+/tmp/design-doc-user-docs/
+/tmp/s2scopilot-user-docs/
+/tmp/spaces/
+
+# Notebook checkpoints
+**/.ipynb_checkpoints/
+archive/
+files/
+*.tar.gz
+*.zip
+
+Sample*
+archive*
+*.pptx
+tmp*
+gaps*
+
+temp/
+data/
+src/HybridRAG/jama-req/
+src/HybridRAG/swa/
+src/HybridRAG/swud/
+src/HybridRAG/testspec/
+
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+
+.temp_explore/
+.temp_intermediary/
+
+ai_governance_files/
+gaps/
+archive*/
+*.pptx
+*.docx
+*.xlsx
+tmp*/

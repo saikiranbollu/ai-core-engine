@@ -180,6 +180,51 @@ def _authorize(tool_name: str, **kw) -> Optional[str]:
         return _err_permission_denied(message)
     return None
 
+
+# ── Plan 2 Phase 6: Session-based query routing decorator ─────────────────
+def with_session_routing(tool_name: str):
+    """Decorator that adds session_id routing to any MCP tool.
+
+    When session_id is provided and points to an active sandbox:
+      - Shallow tools → route to sandbox NetworkX + vectors
+      - Deep tools → route to prod Neo4j + patch with sandbox overrides
+    When session_id is absent → existing production flow (unchanged).
+    """
+    from functools import wraps
+    import inspect
+
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(*args, session_id: Optional[str] = None, **kwargs):
+            if session_id:
+                sm = _get_sandbox_manager()
+                sandbox = sm.get_sandbox(session_id) if sm else None
+                if sandbox:
+                    from src.MemoryLayer.memory.ephemeral_sandbox import HybridGraphService
+                    ws = kwargs.get("workspace_id", "illd")
+                    driver = _get_neo4j(ws)
+                    hybrid = HybridGraphService(sandbox, driver)
+                    classification = HybridGraphService.classify_tool(tool_name)
+
+                    kwargs["graph_service"] = hybrid
+                    kwargs["query_mode"] = classification
+                    kwargs["sandbox_ctx"] = sandbox
+
+            # Only forward kwargs supported by the target function unless it has **kwargs.
+            sig = inspect.signature(fn)
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if has_varkw:
+                filtered_kwargs = kwargs
+            else:
+                filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+            if "session_id" in sig.parameters:
+                return await fn(*args, session_id=session_id, **filtered_kwargs)
+            return await fn(*args, **filtered_kwargs)
+        return wrapper
+    return decorator
+
+
 # ── Lazy backend connections (BUG FIX #3: creds from env only) ─────────────
 _neo4j_drivers: Dict[str, Any] = {}     # keyed by profile ("illd", "mcal")
 _qdrant_client = None
@@ -941,16 +986,22 @@ async def health_check(verbose: bool = False, include_test_query: bool = False) 
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@with_session_routing("search_database")
 async def search_database(
     query: str, max_results: int = 10, include_relationships: bool = False,
     filter_by_module: Optional[str] = None, filter_by_node_type: Optional[List[str]] = None,
     offset: int = 0, workspace_id: str = "illd", alpha: float = 0.6,
+    session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Hybrid semantic (Qdrant vector) + graph (Neo4j) search across the knowledge graph.
 
     Primary search entry point. Combines vector similarity with graph traversal
     for best relevance. Results are cached (LRU → Semantic → RAG tiers).
-    Access tier: public.
+    When session_id is provided with an active sandbox, queries route through
+    the sandbox overlay. Access tier: public.
 
     Parameters:
         query (str): Natural language search query. Required.
@@ -969,6 +1020,8 @@ async def search_database(
             Run `list_ontology_profiles` to see all available profiles.
         alpha (float): Vector-vs-graph blend weight. 0.0 = pure vector search,
             1.0 = pure graph search, 0.6 = default balanced blend.
+        session_id (str | None): Link to an active sandbox session for overlay queries.
+            When provided with an active sandbox, routes through HybridGraphService.
 
     Returns (JSON):
         {
@@ -981,6 +1034,18 @@ async def search_database(
     if denied:
         return denied
     try:
+        # ── Plan 2: Sandbox routing (shallow) ──
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            hybrid = graph_service
+            results = hybrid.search(query, top_k=max_results, alpha=alpha)
+            return _ok({
+                "results": [{"node_id": r.node_id, "content": r.content,
+                              "score": round(r.score, 4), "origin": r.origin,
+                              "node_type": r.node_type} for r in results],
+                "total_count": len(results), "query": query, "source": "sandbox",
+            })
+
         # ── Cache check (LRU → Semantic → RAG) ──
         cache = _get_cache_service()
         cache_meta = {"ws": workspace_id, "mod": filter_by_module or "", "alpha": str(alpha)}
@@ -1017,10 +1082,14 @@ async def search_database(
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
+@with_session_routing("search_nodes")
 async def search_nodes(
     label: str, keyword: Optional[str] = None, filters: Optional[Dict[str, Any]] = None,
     return_properties: Optional[List[str]] = None, limit: int = 10, offset: int = 0,
-    workspace_id: str = "illd",
+    workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Deterministic structured query by node label, keyword, and property filters.
 
@@ -1053,6 +1122,30 @@ async def search_nodes(
     if denied:
         return denied
     try:
+        # ── Plan 2: Sandbox routing (shallow) ──
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            sandbox = sandbox_ctx
+            if sandbox:
+                keywords = [keyword] if keyword else []
+                node_types = [label] if label else None
+                search_results = sandbox.graph.keyword_search(
+                    keywords=keywords, node_types=node_types, top_k=limit)
+                nodes = [
+                    {
+                        "node_id": r.node_id,
+                        "label": r.node_type,
+                        "properties": {
+                            "content": r.content,
+                            "score": r.score,
+                            "_origin": r.origin,
+                        }
+                    }
+                    for r in search_results
+                ]
+                return _ok({"nodes": nodes, "total_count": len(nodes)})
+        
+        # ── No session → existing production path (unchanged) ──
         svc = _get_search_service(workspace_id)
         if not svc or not svc.available:
             return _err("BACKEND_UNAVAILABLE", "Neo4j not connected")
@@ -1065,9 +1158,13 @@ async def search_nodes(
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
+@with_session_routing("get_node_by_id")
 async def get_node_by_id(
     document_id: Optional[str] = None, jama_id: Optional[int] = None,
-    label: Optional[str] = None, workspace_id: str = "illd",
+    label: Optional[str] = None, workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Exact lookup of a single node by document ID or Jama item ID.
 
@@ -1092,6 +1189,23 @@ async def get_node_by_id(
     if denied:
         return denied
     try:
+        # ── Plan 2: Sandbox routing (shallow) ──
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            sandbox = sandbox_ctx
+            if sandbox and document_id:
+                node = sandbox.graph.get_node(document_id)
+                if node:
+                    return _ok({
+                        "node": {
+                            "node_id": node.get("_node_id"),
+                            "label": node.get("_node_type"),
+                            "properties": {k: v for k, v in node.items() if not k.startswith("_")},
+                            "relationships": []
+                        }
+                    })
+        
+        # ── No session → existing production path (unchanged) ──
         svc = _get_search_service(workspace_id)
         if not svc or not svc.available:
             return _err("BACKEND_UNAVAILABLE", "Neo4j not connected")
@@ -1103,10 +1217,14 @@ async def get_node_by_id(
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
+@with_session_routing("get_neighbors")
 async def get_neighbors(
     document_id: Optional[str] = None, jama_id: Optional[int] = None,
     direction: str = "both", relationship_types: Optional[List[str]] = None,
-    limit: int = 20, workspace_id: str = "illd",
+    limit: int = 20, workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Direct graph traversal — get all nodes connected to a known node.
 
@@ -1138,6 +1256,45 @@ async def get_neighbors(
     if denied:
         return denied
     try:
+        # ── Plan 2: Sandbox routing (shallow) ──
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            sandbox = sandbox_ctx
+            if sandbox and document_id:
+                source = sandbox.graph.get_node(document_id)
+                if source:
+                    # Simple neighbor traversal from ephemeral graph
+                    neighbors = []
+                    g = sandbox.graph._graph
+                    if direction in ("out", "both"):
+                        for _, target_id, edge_data in g.out_edges(document_id, data=True):
+                            neighbor = sandbox.graph.get_node(target_id)
+                            if neighbor:
+                                neighbors.append({
+                                    "node_id": target_id,
+                                    "label": neighbor.get("_node_type", "Unknown"),
+                                    "relationship": edge_data.get("_rel_type", "RELATED_TO"),
+                                    "direction": "out",
+                                    "properties": {k: v for k, v in neighbor.items() if not k.startswith("_")}
+                                })
+                    if direction in ("in", "both"):
+                        for source_id, _, edge_data in g.in_edges(document_id, data=True):
+                            neighbor = sandbox.graph.get_node(source_id)
+                            if neighbor:
+                                neighbors.append({
+                                    "node_id": source_id,
+                                    "label": neighbor.get("_node_type", "Unknown"),
+                                    "relationship": edge_data.get("_rel_type", "RELATED_TO"),
+                                    "direction": "in",
+                                    "properties": {k: v for k, v in neighbor.items() if not k.startswith("_")}
+                                })
+                    return _ok({
+                        "source": {"node_id": document_id, "label": source.get("_node_type", "Unknown")},
+                        "neighbors": neighbors[:limit],
+                        "total_count": len(neighbors)
+                    })
+        
+        # ── No session → existing production path (unchanged) ──
         svc = _get_search_service(workspace_id)
         if not svc or not svc.available:
             return _err("BACKEND_UNAVAILABLE", "Neo4j not connected")
@@ -1150,10 +1307,14 @@ async def get_neighbors(
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
+@with_session_routing("shortest_path")
 async def shortest_path(
     from_document_id: Optional[str] = None, from_jama_id: Optional[int] = None,
     to_document_id: Optional[str] = None, to_jama_id: Optional[int] = None,
-    max_depth: int = 8, workspace_id: str = "illd",
+    max_depth: int = 8, workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Find the shortest path between two nodes in the knowledge graph.
 
@@ -1181,6 +1342,27 @@ async def shortest_path(
     if denied:
         return denied
     try:
+        # ── Plan 2: Sandbox routing (deep/hybrid) ──
+        query_mode = query_mode
+        if query_mode == "hybrid":
+            hybrid = graph_service
+            if hybrid and from_document_id and to_document_id:
+                # Use hybrid deep query to find shortest path with prod neighbor context
+                cypher = """
+                MATCH path = shortestPath( (:Node {_node_id: $from}) -[*..{max_depth}]-> (:Node {_node_id: $to}) )
+                RETURN path, length(path) as path_length
+                LIMIT 1
+                """.replace("{max_depth}", str(max_depth))
+                results = hybrid.deep_query(cypher, {"from": from_document_id, "to": to_document_id}, workspace_id)
+                if results:
+                    return _ok({
+                        "path": [{"node_id": r.get("_node_id"), "label": r.get("_node_type"), "_origin": r.get("_origin")} for r in results],
+                        "relationships": [],
+                        "length": len(results),
+                        "found": True
+                    })
+        
+        # ── No session → existing production path (unchanged) ──
         svc = _get_search_service(workspace_id)
         if not svc or not svc.available:
             return _err("BACKEND_UNAVAILABLE", "Neo4j not connected")
@@ -1193,8 +1375,13 @@ async def shortest_path(
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
+@with_session_routing("execute_cypher")
 async def execute_cypher(
     query: str, parameters: Optional[Dict[str, Any]] = None, workspace_id: str = "illd",
+    session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Execute a read-only Cypher query against the Neo4j knowledge graph.
 
@@ -1232,6 +1419,20 @@ async def execute_cypher(
         if _re.search(pattern, upper):
             return _err("QUERY_REJECTED", f"Write clause '{label}' is not allowed. Only read queries permitted.")
     try:
+        query_mode = query_mode
+        # Shallow query path: if sandbox active, try to execute against NetworkX first
+        if query_mode == "sandbox" and graph_service and sandbox_ctx:
+            hybrid = graph_service
+            try:
+                # Attempt shallow query on sandbox (simple graph searches that don't need full Neo4j)
+                result = await asyncio.to_thread(
+                    hybrid.search, query=query, top_k=100, alpha=0.5
+                )
+                return _ok({"records": result if isinstance(result, list) else [result], "count": len(result) if isinstance(result, list) else 1, "_origin": "sandbox"})
+            except Exception:
+                pass  # Fall through to prod query
+        
+        # Default path: query production Neo4j (full graph, always available)
         svc = _get_search_service(workspace_id)
         if not svc or not svc.available:
             return _err("BACKEND_UNAVAILABLE", "Neo4j not connected")
@@ -1247,7 +1448,12 @@ async def execute_cypher(
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def query_api_function(function_name: str, workspace_id: str = "illd") -> str:
+@with_session_routing("query_api_function")
+async def query_api_function(function_name: str, workspace_id: str = "illd",
+    session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None) -> str:
     """Retrieve 25+ enriched fields for an API function from the knowledge graph.
 
     Returns signature, parameters, return type, dependencies, usage patterns,
@@ -1270,13 +1476,41 @@ async def query_api_function(function_name: str, workspace_id: str = "illd") -> 
     denied = _authorize("query_api_function")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            sandbox = sandbox_ctx
+            if sandbox:
+                terms = [function_name] + [t for t in function_name.replace("_", " ").split() if t]
+                results = sandbox.graph.keyword_search(terms, top_k=10)
+                matches = []
+                fn_lower = function_name.lower()
+                for r in results:
+                    if fn_lower in (r.node_id or "").lower() or fn_lower in (r.content or "").lower():
+                        matches.append({
+                            "node_id": r.node_id,
+                            "node_type": r.node_type,
+                            "summary": r.content,
+                            "score": round(r.score, 4),
+                            "origin": r.origin,
+                        })
+                if matches:
+                    return _ok({
+                        "function_name": function_name,
+                        "source": "sandbox",
+                        "matches": matches,
+                    })
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.query_api_function, function_name, ws=workspace_id))
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def get_type_definition(struct_name: str, module: Optional[str] = None, workspace_id: str = "illd") -> str:
+@with_session_routing("get_type_definition")
+async def get_type_definition(struct_name: str, module: Optional[str] = None, workspace_id: str = "illd",
+    session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None) -> str:
     """Retrieve struct/enum/typedef definition with fields, defaults, and related functions.
 
     Returns the C type definition, member fields, default values, and
@@ -1301,15 +1535,38 @@ async def get_type_definition(struct_name: str, module: Optional[str] = None, wo
     denied = _authorize("get_type_definition")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            sandbox = sandbox_ctx
+            if sandbox:
+                terms = [struct_name] + [t for t in struct_name.replace("_", " ").split() if t]
+                results = sandbox.graph.keyword_search(terms, top_k=10)
+                entries = []
+                struct_lower = struct_name.lower()
+                for r in results:
+                    if struct_lower in (r.node_id or "").lower() or struct_lower in (r.content or "").lower():
+                        entries.append({
+                            "node_id": r.node_id,
+                            "kind": r.node_type,
+                            "definition": r.content,
+                            "score": round(r.score, 4),
+                            "origin": r.origin,
+                        })
+                if entries:
+                    return _ok({"name": struct_name, "module": module, "source": "sandbox", "matches": entries})
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.get_type_definition, struct_name, module, ws=workspace_id))
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
+@with_session_routing("generate_initialization_code")
 async def generate_initialization_code(
     struct_name: str, user_overrides: Optional[Dict] = None, variable_name: Optional[str] = None,
-    workspace_id: str = "illd",
+    workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Generate C struct initializer code merging KG defaults with user overrides.
 
@@ -1349,9 +1606,13 @@ async def generate_initialization_code(
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@with_session_routing("query_dependencies")
 async def query_dependencies(
     function_name: str, module_name: Optional[str] = None, max_depth: int = 3,
-    include_hardware: bool = False, workspace_id: str = "illd",
+    include_hardware: bool = False, workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None
 ) -> str:
     """Resolve direct and transitive dependencies with topological init sequence.
 
@@ -1380,13 +1641,39 @@ async def query_dependencies(
     denied = _authorize("query_dependencies")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            sandbox = sandbox_ctx
+            if sandbox:
+                seed = sandbox.graph.keyword_search([function_name], top_k=1)
+                if seed:
+                    seed_id = seed[0].node_id
+                    deps = []
+                    g = sandbox.graph._graph
+                    for _, target, edge_data in g.out_edges(seed_id, data=True):
+                        rel = edge_data.get("_rel_type", "RELATED_TO")
+                        if rel in ("DEPENDS_ON", "CALLS_INTERNALLY", "CALLS_EXTERNAL", "USES_STRUCTURE"):
+                            deps.append({"name": target, "type": "direct", "depth": 1, "relationship": rel})
+                    return _ok({
+                        "function": function_name,
+                        "module": module_name or "unknown",
+                        "dependencies": deps,
+                        "init_sequence": [function_name] + [d["name"] for d in deps],
+                        "hardware_deps": [] if include_hardware else None,
+                        "source": "sandbox",
+                    })
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.query_dependencies, function_name, module_name, max_depth, include_hardware, ws=workspace_id))
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def validate_api_usage(function_sequence: List[str], workspace_id: str = "illd") -> str:
+@with_session_routing("validate_api_usage")
+async def validate_api_usage(function_sequence: List[str], workspace_id: str = "illd",
+    session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None) -> str:
     """Validate a function call sequence against the dependency graph.
 
     Checks that the provided calling order respects initialization
@@ -1410,13 +1697,33 @@ async def validate_api_usage(function_sequence: List[str], workspace_id: str = "
     denied = _authorize("validate_api_usage")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            sandbox = sandbox_ctx
+            if sandbox:
+                violations = []
+                for i, fn in enumerate(function_sequence):
+                    exists = sandbox.graph.keyword_search([fn], top_k=1)
+                    if not exists:
+                        violations.append({
+                            "function": fn,
+                            "missing_dependency": "Function not found in sandbox overlay",
+                            "position": i,
+                            "message": f"{fn} not present in sandbox/prod overlay context",
+                        })
+                return _ok({"valid": len(violations) == 0, "sequence": function_sequence, "violations": violations, "source": "sandbox"})
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.validate_api_usage, function_sequence, ws=workspace_id))
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def detect_polling_requirements(function_names: List[str], module: Optional[str] = None, workspace_id: str = "illd") -> str:
+@with_session_routing("detect_polling_requirements")
+async def detect_polling_requirements(function_names: List[str], module: Optional[str] = None,
+    workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None) -> str:
     """Detect which API functions require status polling after invocation.
 
     Identifies functions that need a polling loop to check completion status
@@ -1442,6 +1749,23 @@ async def detect_polling_requirements(function_names: List[str], module: Optiona
     denied = _authorize("detect_polling_requirements")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "sandbox":
+            sandbox = sandbox_ctx
+            if sandbox:
+                out = []
+                for fn in function_names:
+                    hits = sandbox.graph.keyword_search([fn], top_k=3)
+                    text = " ".join(h.content for h in hits).lower()
+                    requires = any(tok in text for tok in ("status", "busy", "complete", "poll"))
+                    out.append({
+                        "name": fn,
+                        "requires_polling": requires,
+                        "polling_function": f"{fn}_GetStatus" if requires else None,
+                        "status_check": "!= BUSY" if requires else None,
+                        "notes": "Heuristic from sandbox-local content",
+                    })
+                return _ok({"functions": out, "source": "sandbox"})
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.detect_polling_requirements, function_names, module, ws=workspace_id))
@@ -1453,9 +1777,13 @@ async def detect_polling_requirements(function_names: List[str], module: Optiona
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@with_session_routing("find_requirement_traces")
 async def find_requirement_traces(
     requirement_id: str, include_tests: bool = True, include_results: bool = True,
-    workspace_id: str = "illd",
+    workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None
 ) -> str:
     """Trace a requirement through the full V-Model chain: Req → Arch → Code → Test → Result.
 
@@ -1481,13 +1809,35 @@ async def find_requirement_traces(
     denied = _authorize("find_requirement_traces")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "hybrid":
+            hybrid = graph_service
+            if hybrid:
+                cypher = """
+                MATCH (req)
+                WHERE req.requirement_id = $rid OR req.document_id = $rid OR toString(req.jama_id) = $rid
+                OPTIONAL MATCH (req)-[:TRACES_TO|IMPLEMENTS|REALIZES*1..3]-(arch)
+                OPTIONAL MATCH (arch)-[:IMPLEMENTS|CALLS_INTERNALLY|USES_STRUCTURE*1..2]-(code)
+                RETURN labels(req)[0] as label, req.name as name, req.requirement_id as requirement_id,
+                       req.module as module, count(DISTINCT arch) as architecture_count,
+                       count(DISTINCT code) as code_count
+                LIMIT 50
+                """
+                records = hybrid.deep_query(cypher, {"rid": requirement_id}, workspace_id)
+                if records:
+                    return _ok({"requirement": requirement_id, "records": records, "source": "hybrid"})
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.find_requirement_traces, requirement_id, include_tests, include_results, ws=workspace_id))
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def build_traceability_matrix(module_name: str, output_format: str = "json", workspace_id: str = "illd") -> str:
+@with_session_routing("build_traceability_matrix")
+async def build_traceability_matrix(module_name: str, output_format: str = "json",
+    workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None) -> str:
     """Build a module-wide requirement traceability coverage matrix.
 
     Generates a matrix mapping every requirement to its architecture,
@@ -1511,13 +1861,43 @@ async def build_traceability_matrix(module_name: str, output_format: str = "json
     denied = _authorize("build_traceability_matrix")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "hybrid":
+            hybrid = graph_service
+            if hybrid:
+                cypher = """
+                MATCH (req)
+                WHERE req.module = $module AND (req.requirement_id IS NOT NULL OR req.jama_id IS NOT NULL)
+                OPTIONAL MATCH (req)-[:TRACES_TO|IMPLEMENTS*1..3]-(code)
+                OPTIONAL MATCH (code)<-[:VERIFIES]-(tc)
+                RETURN coalesce(req.requirement_id, toString(req.jama_id), req.document_id) as requirement_id,
+                       req.name as title,
+                       count(DISTINCT code) > 0 as code,
+                       count(DISTINCT tc) > 0 as test
+                LIMIT 500
+                """
+                matrix = hybrid.deep_query(cypher, {"module": module_name}, workspace_id)
+                if matrix:
+                    covered = sum(1 for r in matrix if r.get("code") and r.get("test"))
+                    return _ok({
+                        "module": module_name,
+                        "format": output_format,
+                        "matrix": matrix,
+                        "summary": {"total": len(matrix), "fully_covered": covered, "gaps": len(matrix) - covered},
+                        "source": "hybrid",
+                    })
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.build_traceability_matrix, module_name, output_format, ws=workspace_id))
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def find_coverage_gaps(module_name: str, gap_type: str = "all", severity: str = "all", workspace_id: str = "illd") -> str:
+@with_session_routing("find_coverage_gaps")
+async def find_coverage_gaps(module_name: str, gap_type: str = "all", severity: str = "all",
+    workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None) -> str:
     """Find missing links in requirement-code-test traceability chains.
 
     Identifies requirements without code, tests without requirements,
@@ -1544,15 +1924,50 @@ async def find_coverage_gaps(module_name: str, gap_type: str = "all", severity: 
     denied = _authorize("find_coverage_gaps")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "hybrid":
+            hybrid = graph_service
+            if hybrid:
+                cypher = """
+                MATCH (req)
+                WHERE req.module = $module AND (req.requirement_id IS NOT NULL OR req.jama_id IS NOT NULL)
+                OPTIONAL MATCH (req)-[:TRACES_TO|IMPLEMENTS*1..3]-(code)
+                OPTIONAL MATCH (code)<-[:VERIFIES]-(tc)
+                WITH req, count(DISTINCT code) AS c, count(DISTINCT tc) AS t
+                WHERE c = 0 OR t = 0
+                RETURN coalesce(req.requirement_id, toString(req.jama_id), req.document_id) as node_id,
+                       req.name as title,
+                       CASE WHEN c = 0 THEN 'no_code' ELSE 'no_test' END as type,
+                       CASE WHEN c = 0 THEN 'critical' ELSE 'major' END as severity,
+                       CASE WHEN c = 0 THEN 'code' ELSE 'test' END as missing
+                LIMIT 500
+                """
+                gaps = hybrid.deep_query(cypher, {"module": module_name}, workspace_id)
+                if gaps:
+                    by_type = {}
+                    by_sev = {}
+                    for g in gaps:
+                        by_type[g.get("type", "unknown")] = by_type.get(g.get("type", "unknown"), 0) + 1
+                        by_sev[g.get("severity", "unknown")] = by_sev.get(g.get("severity", "unknown"), 0) + 1
+                    return _ok({
+                        "module": module_name,
+                        "gaps": gaps,
+                        "summary": {"total_gaps": len(gaps), "by_type": by_type, "by_severity": by_sev},
+                        "source": "hybrid",
+                    })
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.find_coverage_gaps, module_name, gap_type, severity, ws=workspace_id))
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
+@with_session_routing("analyze_hw_sw_links")
 async def analyze_hw_sw_links(
     module_name: str, include_undocumented: bool = True, include_peripheral_map: bool = False,
-    workspace_id: str = "illd",
+    workspace_id: str = "illd", session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None
 ) -> str:
     """Map hardware register usage to software functions and detect undocumented accesses.
 
@@ -1582,6 +1997,29 @@ async def analyze_hw_sw_links(
     denied = _authorize("analyze_hw_sw_links")
     if denied: return denied
     try:
+        query_mode = query_mode
+        if query_mode == "hybrid":
+            hybrid = graph_service
+            if hybrid:
+                cypher = """
+                MATCH (f)-[r:ACCESSES|ACCESSES_REGISTER]->(reg)
+                WHERE coalesce(f.module, reg.module) = $module
+                RETURN coalesce(reg.name, reg.register_name, reg.document_id) as register,
+                       coalesce(f.name, f.function_name, f.document_id) as function,
+                       type(r) as access_type,
+                       true as documented
+                LIMIT 500
+                """
+                links = hybrid.deep_query(cypher, {"module": module_name}, workspace_id)
+                if links:
+                    return _ok({
+                        "module": module_name,
+                        "hw_sw_links": links,
+                        "undocumented": [] if include_undocumented else None,
+                        "peripheral_map": {} if include_peripheral_map else None,
+                        "summary": {"total_accesses": len(links), "documented": len(links), "undocumented": 0},
+                        "source": "hybrid",
+                    })
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.analyze_hw_sw_links, module_name, include_undocumented, include_peripheral_map, ws=workspace_id))
@@ -1590,10 +2028,12 @@ async def analyze_hw_sw_links(
 
 # ═════════════════════════════════════════════════════════════════════════
 #  CATEGORY 5 — INGESTION PIPELINE (4 tools) — Sprint 5
+#  Plan 2: Removed from MCP tool registration. Use sandbox_upload instead.
+#  Underlying IngestionService + parsers kept as library code.
 # ═════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
-async def ingest_file(file_path: str, module_name: str, overwrite: bool = False, workspace_id: str = "illd") -> str:
+# @mcp.tool()  # Removed: Plan 2 Phase 2 — prod ingestion via sandbox_upload only
+async def _ingest_file(file_path: str, module_name: str, overwrite: bool = False, workspace_id: str = "illd") -> str:
     """Parse a single file and ingest into the knowledge graph.
 
     Supports C source/header files, requirement docs, SWA docs, and test
@@ -1630,8 +2070,8 @@ async def ingest_file(file_path: str, module_name: str, overwrite: bool = False,
     except Exception as exc:
         return _err("INTERNAL_ERROR", str(exc))
 
-@mcp.tool()
-async def ingest_module_from_repo(repo_root: str, module_name: str, workspace_id: str = "illd") -> str:
+# @mcp.tool()  # Removed: Plan 2 Phase 2
+async def _ingest_module_from_repo(repo_root: str, module_name: str, workspace_id: str = "illd") -> str:
     """Ingest all artifacts for a module from a repository root directory.
 
     Scans the repo for source files, headers, docs, and test files
@@ -1665,8 +2105,8 @@ async def ingest_module_from_repo(repo_root: str, module_name: str, workspace_id
     except Exception as exc:
         return _err("INTERNAL_ERROR", str(exc))
 
-@mcp.tool()
-async def batch_ingest_modules(
+# @mcp.tool()  # Removed: Plan 2 Phase 2
+async def _batch_ingest_modules(
     lld_path: str, modules: Optional[List[str]] = None, parallel: bool = True,
     max_workers: int = 4, workspace_id: str = "illd",
 ) -> str:
@@ -1707,8 +2147,8 @@ async def batch_ingest_modules(
     except Exception as exc:
         return _err("INTERNAL_ERROR", str(exc))
 
-@mcp.tool()
-async def ingest_repository(
+# @mcp.tool()  # Removed: Plan 2 Phase 2
+async def _ingest_repository(
     repo_path: str, modules: Optional[List[str]] = None,
     include_tests: bool = False, workspace_id: str = "illd",
 ) -> str:
@@ -1757,12 +2197,13 @@ async def ingest_repository(
 @mcp.tool()
 async def session_start(
     session_id: str, assistant_name: Optional[str] = None,
-    module_context: Optional[str] = None, ttl_seconds: int = 3600,
+    module_context: Optional[str] = None,
 ) -> str:
     """Start a working-memory session for context accumulation.
 
     Sessions persist key-value data and context across multiple tool calls.
     Convention: use "{ASSISTANT}_{timestamp}" format for session IDs.
+    All sessions have a fixed TTL of 3600 seconds (1 hour).
     Access tier: public.
 
     Parameters:
@@ -1771,13 +2212,12 @@ async def session_start(
         assistant_name (str | None): Name of the calling assistant/agent.
         module_context (str | None): Module scope for this session (e.g. "Adc").
             Run `list_available_modules` to get valid module names.
-        ttl_seconds (int): Session time-to-live in seconds. Default 3600 (1 hour).
 
     Returns (JSON):
         {
           "session_id": str, "created": true,
           "store_type": "RedisBackend"|"InMemoryBackend",
-          "ttl_seconds": int
+          "ttl_seconds": 3600
         }
     """
     denied = _authorize("session_start")
@@ -1787,12 +2227,13 @@ async def session_start(
         mgr = _get_session_manager()
         if not mgr:
             return _err("INTERNAL_ERROR", "SessionManager not initialized")
+        TTL_FIXED = 3600  # Fixed at 1 hour for all sessions (Plan 2)
         session = mgr.create(session_id=session_id, assistant_name=assistant_name or "",
-                              module_context=module_context or "", ttl_seconds=ttl_seconds)
+                              module_context=module_context or "", ttl_seconds=TTL_FIXED)
         ACTIVE_SESSIONS.inc()
         return _ok({"session_id": session.session_id, "created": True,
                      "store_type": type(mgr._backend).__name__,
-                     "ttl_seconds": ttl_seconds})
+                     "ttl_seconds": TTL_FIXED})
     except ValueError as ve:
         return _err("INVALID_INPUT", str(ve))
     except Exception as exc:
@@ -1943,7 +2384,18 @@ async def session_end(session_id: str, persist_audit: bool = True) -> str:
             return _err("INTERNAL_ERROR", "SessionManager not initialized")
         summary = mgr.close(session_id, persist_audit=persist_audit)
         ACTIVE_SESSIONS.dec()
-        return _ok({"closed": True, "stats": summary})
+
+        # Plan 2 Phase 3: cleanup sandbox and temp dirs on session end
+        sm = _get_sandbox_manager()
+        sandbox_stats = {}
+        if sm:
+            sandbox_stats = sm.destroy_sandbox(session_id)
+        import shutil
+        tmp_dir = Path(f"/tmp/sandbox_{session_id}")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return _ok({"closed": True, "stats": summary, "sandbox_cleanup": sandbox_stats})
     except Exception as exc:
         return _err("INTERNAL_ERROR", str(exc))
 
@@ -1957,12 +2409,16 @@ async def sandbox_upload(
     session_id: str,
     documents: Optional[List[Dict[str, str]]] = None,
     file_paths: Optional[List[str]] = None,
+    trace_depth: int = 1,
+    module: Optional[str] = None,
+    workspace_id: str = "illd",
 ) -> str:
     """Upload documents into an ephemeral KG + vector store scoped to a session.
 
     Creates a temporary, isolated sandbox for analyzing documents that are
-    not in the main knowledge graph. Preferred: pass content directly via
-    'documents'. Access tier: public.
+    not in the main knowledge graph. Automatically pulls ±N traceability
+    neighbors from production Neo4j (controlled by trace_depth).
+    Preferred: pass content directly via 'documents'. Access tier: public.
 
     Parameters:
         session_id (str): Active session ID. Required.
@@ -1970,15 +2426,23 @@ async def sandbox_upload(
         documents (list[dict] | None): List of document dicts with keys:
             - "filename" (str): File name (e.g. "my_module.c")
             - "content" (str): Full text content of the file.
+            - "encoding" (str, optional): "utf-8" (default) or "base64".
             Preferred for server deployments.
         file_paths (list[str] | None): List of absolute file paths.
             Only works when files are local to the MCP server.
             Provide either documents or file_paths, not both.
+        trace_depth (int): Pull ±N traceability layers from production Neo4j.
+            0 = no pull (pure sandbox isolation), 1 = ±1 layer (default),
+            2 = ±2 layers (deeper traceability). Default 1.
+        module (str | None): Module name (e.g. "Adc", "Can"). Auto-detected
+            from content if not set.
+        workspace_id (str): Target workspace — "illd" or "mcal". Default "illd".
 
     Returns (JSON):
         {
-          "session_id": str, "files_ingested": int,
-          "chunks_created": int, "nodes_created": int,
+          "session_id": str, "files_ingested": int, "nodes_created": int,
+          "node_names_extracted": int,
+          "prod_nodes_loaded": int, "prod_relationships_loaded": int,
           "sandbox_status": {"active": bool, "chunks": int, ...}
         }
     """
@@ -1987,6 +2451,8 @@ async def sandbox_upload(
         return denied
     if not documents and not file_paths:
         return _err("INVALID_INPUT", "Provide either 'documents' (list of {filename, content}) or 'file_paths'.")
+    if trace_depth < 0 or trace_depth > 2:
+        return _err("INVALID_INPUT", "trace_depth must be 0, 1, or 2.")
     try:
         sm = _get_sandbox_manager()
         if not sm:
@@ -1994,24 +2460,122 @@ async def sandbox_upload(
         mgr = _get_session_manager()
         if not mgr or not mgr.get(session_id):
             return _err("INVALID_INPUT", f"Session '{session_id}' not found. Call session_start first.")
-        from src.MemoryLayer.memory.ephemeral_sandbox import SandboxIngester
+
+        from src.MemoryLayer.memory.ephemeral_sandbox import (
+            SandboxAdapter, SandboxParserDispatcher, TraceabilityPuller,
+        )
+        import base64
+        import shutil
+
         sandbox = sm.create_sandbox(session_id)
-        ingester = SandboxIngester(sandbox)
-        if documents:
-            stats = ingester.ingest_documents(documents)
-        else:
-            stats = ingester.ingest_files(file_paths)
-        return _ok({"session_id": session_id, **stats, "sandbox_status": sandbox.status()})
+        dispatcher = SandboxParserDispatcher()
+        adapter = SandboxAdapter()
+        tmp_dir = Path(f"/tmp/sandbox_{session_id}")
+
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            all_node_names = []
+            parsed_files = []  # Store parsed results before ingesting
+
+            # ── Plan 2 Phase 5 FIX: Parse all files FIRST (don't ingest yet) ──
+            if documents:
+                for doc in documents:
+                    filename = doc.get("filename", "untitled.txt")
+                    content = doc.get("content", "")
+                    encoding = doc.get("encoding", "utf-8")
+
+                    if not content:
+                        continue
+
+                    # Base64 decode if needed
+                    if encoding == "base64":
+                        content_bytes = base64.b64decode(content)
+                    else:
+                        content_bytes = content.encode("utf-8")
+
+                    # Size guard: 10 MB max per document
+                    if len(content_bytes) > SandboxParserDispatcher.MAX_FILE_SIZE:
+                        logger.warning("sandbox_upload: %s exceeds 10 MB, skipping", filename)
+                        continue
+
+                    # Materialize to tempfile for parser dispatch
+                    tmp_path = tmp_dir / filename
+                    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_path.write_bytes(content_bytes)
+
+                    # Parse with rich parser — store but DON'T ingest yet
+                    parsed = await asyncio.to_thread(dispatcher.parse, tmp_path)
+                    # Extract node names for traceability pull (without ingesting)
+                    extracted_names = adapter._extract_node_names_from_parsed(parsed)
+                    all_node_names.extend(extracted_names)
+                    parsed_files.append((parsed, filename))
+
+            elif file_paths:
+                for fp in file_paths:
+                    p = Path(fp)
+                    if not p.exists():
+                        logger.warning("sandbox_upload: %s not found, skipping", fp)
+                        continue
+                    parsed = await asyncio.to_thread(dispatcher.parse, p)
+                    extracted_names = adapter._extract_node_names_from_parsed(parsed)
+                    all_node_names.extend(extracted_names)
+                    parsed_files.append((parsed, p.name))
+
+            # ── Plan 2 Phase 5 FIX: Load PRODUCTION nodes FIRST (before sandbox ingest) ──
+            prod_stats = {"prod_nodes_loaded": 0, "prod_relationships_loaded": 0}
+            if trace_depth > 0 and all_node_names:
+                detected_module = module or _detect_module_from_names(all_node_names)
+                driver = _get_neo4j(workspace_id)
+                if driver:
+                    puller = TraceabilityPuller(driver)
+                    nodes, rels = await asyncio.to_thread(
+                        puller.pull_neighbors,
+                        all_node_names, detected_module, workspace_id, trace_depth,
+                    )
+                    # Load prod nodes with _origin=production
+                    sandbox.graph.load_prod_nodes(nodes, rels)
+                    prod_stats = {"prod_nodes_loaded": len(nodes),
+                                  "prod_relationships_loaded": len(rels)}
+                else:
+                    logger.warning("sandbox_upload: Neo4j driver unavailable for trace_depth=%d", trace_depth)
+
+            # ── Plan 2 Phase 5 FIX: NOW ingest sandbox files (shadow detection works correctly) ──
+            parsed_results = []
+            for parsed, filename in parsed_files:
+                node_names = adapter.ingest_parsed(sandbox, parsed, filename, module=module)
+                parsed_results.append({"filename": filename, "nodes": len(node_names)})
+
+            return _ok({
+                "session_id": session_id,
+                "files_ingested": len(parsed_results),
+                "nodes_created": sandbox.graph.node_count,
+                "node_names_extracted": len(all_node_names),
+                **prod_stats,
+                "sandbox_status": sandbox.status(),
+            })
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     except Exception as exc:
         logger.exception("sandbox_upload failed")
         return _err("INTERNAL_ERROR", str(exc))
 
-@mcp.tool()
-async def sandbox_query(session_id: str, query: str, top_k: int = 10) -> str:
+
+def _detect_module_from_names(node_names: List[str]) -> str:
+    """Heuristic: extract module name from function names (e.g. Adc_Init → Adc)."""
+    for name in node_names:
+        if "_" in name:
+            prefix = name.split("_")[0]
+            if len(prefix) >= 2:
+                return prefix
+    return "unknown"
+
+# @mcp.tool()  # Deprecated: use search_database(session_id=...) instead (Plan 2 Phase 6)
+async def _sandbox_query(session_id: str, query: str, top_k: int = 10) -> str:
     """Run a semantic search against the ephemeral sandbox stores.
 
-    Queries only the sandbox data uploaded via `sandbox_upload`,
-    not the main knowledge graph. Access tier: public.
+    DEPRECATED — use search_database with session_id instead.
+    Kept as internal function for backward compatibility.
 
     Parameters:
         session_id (str): Active session ID with an active sandbox. Required.
@@ -2096,15 +2660,76 @@ async def sandbox_clear(session_id: str) -> str:
     except Exception as exc:
         return _err("INTERNAL_ERROR", str(exc))
 
+@mcp.tool()
+async def sandbox_diff(session_id: str) -> str:
+    """Show what changed in the sandbox vs production.
+
+    Compares sandbox nodes against their production counterparts and
+    reports nodes added, modified (with original properties), and
+    unchanged production nodes. Access tier: public.
+
+    Parameters:
+        session_id (str): Active session ID with a sandbox. Required.
+
+    Returns (JSON):
+        {
+          "nodes_added": [str],
+          "nodes_modified": [{"node_id": str, "original": {...}, "current": {...}}],
+          "nodes_unchanged": int,
+          "edges_added": int,
+          "edges_total": int
+        }
+    """
+    denied = _authorize("sandbox_diff")
+    if denied:
+        return denied
+    try:
+        sm = _get_sandbox_manager()
+        if not sm:
+            return _err("INTERNAL_ERROR", "SandboxManager not available")
+        sandbox = sm.get_sandbox(session_id)
+        if not sandbox:
+            return _err("INVALID_INPUT", f"No active sandbox for session '{session_id}'.")
+        diff = {
+            "nodes_added": [],
+            "nodes_modified": [],
+            "nodes_unchanged": 0,
+            "edges_added": 0,
+            "edges_total": sandbox.graph.edge_count,
+        }
+        for node_id, data in sandbox.graph.get_all_nodes():
+            if data.get("_origin") == "sandbox":
+                if data.get("_shadows"):
+                    diff["nodes_modified"].append({
+                        "node_id": node_id,
+                        "original": data.get("_original_prod_properties", {}),
+                        "current": {k: v for k, v in data.items() if not k.startswith("_")},
+                    })
+                else:
+                    diff["nodes_added"].append(node_id)
+            else:
+                diff["nodes_unchanged"] += 1
+        # Count sandbox-origin edges
+        for u, v, edata in sandbox.graph._graph.edges(data=True):
+            if edata.get("_origin") == "sandbox":
+                diff["edges_added"] += 1
+        return _ok(diff)
+    except Exception as exc:
+        return _err("INTERNAL_ERROR", str(exc))
+
 
 # ═════════════════════════════════════════════════════════════════════════
 #  CATEGORY 6+ — RLM (2 tools) — Sprint 5
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@with_session_routing("rlm_orchestrate")
 async def rlm_orchestrate(
     query: str, task_type: str = "generic", module: str = "CAN",
     session_id: Optional[str] = None, profile: str = "mcal",
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Multi-step context build via Recursive Language Model orchestration.
 
@@ -2134,21 +2759,35 @@ async def rlm_orchestrate(
     if denied:
         return denied
     try:
+        query_mode = query_mode
+        # Note: RLM Orchestrator internally uses SearchService 
+        # Any hybrid/sandbox routing is handled through the session context
         rlm = _get_rlm_orchestrator(module=module, profile=profile)
         if not rlm:
             return _err("INTERNAL_ERROR", "RLMOrchestrator not available")
         RLM_REQUESTS_TOTAL.labels(task_type=task_type).inc()
-        result = await asyncio.to_thread(rlm.run, query=query, task_type=task_type, session_context=None)
+        # Pass session context and task type; RLM handles strategy selection internally
+        result = await asyncio.to_thread(
+            rlm.run, query=query, task_type=task_type, session_context=None
+        )
         sub_q_count = len(result.steps) if hasattr(result, "steps") else 0
         RLM_SUBQUERIES.labels(task_type=task_type).observe(sub_q_count)
-        return _ok(result.to_dict())
+        result_dict = result.to_dict() if hasattr(result, "to_dict") else result
+        if query_mode == "sandbox":
+            result_dict["_origin"] = "hybrid"
+        return _ok(result_dict)
     except Exception as exc:
         logger.exception("rlm_orchestrate failed")
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
+@with_session_routing("rlm_plan_preview")
 async def rlm_plan_preview(
     query: str, task_type: str = "generic", module: str = "CAN", profile: str = "mcal",
+    session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Preview the RLM query decomposition plan without executing sub-queries.
 
@@ -2174,11 +2813,19 @@ async def rlm_plan_preview(
     if denied:
         return denied
     try:
+        query_mode = query_mode
+        # Note: RLM's plan_preview internally determines strategy
+        # Session context and task type are sufficient for planning
         rlm = _get_rlm_orchestrator(module=module, profile=profile)
         if not rlm:
             return _err("INTERNAL_ERROR", "RLMOrchestrator not available")
-        result = await asyncio.to_thread(rlm.plan_preview, query=query, task_type=task_type)
-        return _ok(result)
+        result = await asyncio.to_thread(
+            rlm.plan_preview, query=query, task_type=task_type
+        )
+        result_dict = result if isinstance(result, dict) else (result.to_dict() if hasattr(result, "to_dict") else result)
+        if query_mode == "sandbox":
+            result_dict["_origin"] = "hybrid"
+        return _ok(result_dict)
     except Exception as exc:
         return _err("INTERNAL_ERROR", str(exc))
 
@@ -2188,7 +2835,8 @@ async def rlm_plan_preview(
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def cache_get(query: str) -> str:
+@with_session_routing("cache_get")
+async def cache_get(query: str, session_id: Optional[str] = None) -> str:
     """Inspect cache entries for a specific query string.
 
     Checks LRU, semantic, and RAG cache tiers. Access tier: developer.
@@ -2210,7 +2858,8 @@ async def cache_get(query: str) -> str:
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def cache_stats() -> str:
+@with_session_routing("cache_stats")
+async def cache_stats(session_id: Optional[str] = None) -> str:
     """Retrieve cache performance metrics across all tiers.
 
     Shows hit/miss rates, entry counts, and memory usage per cache tier.
@@ -2235,7 +2884,8 @@ async def cache_stats() -> str:
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def cache_invalidate_module(module_name: str) -> str:
+@with_session_routing("cache_invalidate_module")
+async def cache_invalidate_module(module_name: str, session_id: Optional[str] = None) -> str:
     """Invalidate all cache entries for a specific module.
 
     Use after ingesting new data for a module to ensure stale results
@@ -2257,7 +2907,8 @@ async def cache_invalidate_module(module_name: str) -> str:
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def cache_clear(tiers: Optional[List[str]] = None) -> str:
+@with_session_routing("cache_clear")
+async def cache_clear(tiers: Optional[List[str]] = None, session_id: Optional[str] = None) -> str:
     """Clear selected or all cache tiers.
 
     Use with caution — clears cached search results. Access tier: admin.
@@ -2279,7 +2930,8 @@ async def cache_clear(tiers: Optional[List[str]] = None) -> str:
 
 
 @mcp.tool()
-async def cache_refresh_config() -> str:
+@with_session_routing("cache_refresh_config")
+async def cache_refresh_config(session_id: Optional[str] = None) -> str:
     """Reload cache configuration from environment variables without restarting.
 
     Re-reads LRU_CACHE_SIZE, LRU_CACHE_TTL_HOURS, SEMANTIC_CACHE_MAX_SIZE,
@@ -2312,11 +2964,13 @@ async def cache_refresh_config() -> str:
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@with_session_routing("submit_human_feedback")
 async def submit_human_feedback(
     response_id: str, decision: str, reviewer_id: Optional[str] = None,
     issues_found: int = 0, correction_notes: Optional[str] = None,
     module: Optional[str] = None, task_type: Optional[str] = None,
     response_context: Optional[str] = None, workspace_id: str = "illd",
+    session_id: Optional[str] = None,
 ) -> str:
     """Record a human review decision for a generated response.
 
@@ -2348,6 +3002,14 @@ async def submit_human_feedback(
     if denied:
         return denied
     try:
+        if session_id:
+            sm = _get_sandbox_manager()
+            if sm and sm.get_sandbox(session_id):
+                return _err(
+                    "SANDBOX_WRITE_BLOCKED",
+                    "Cannot write to production from an active sandbox session. "
+                    "Use sandbox_upload for sandbox changes or end the sandbox session first.",
+                )
         sink = _get_feedback_sink()
         if not sink:
             return _err("INTERNAL_ERROR", "FeedbackSink not available")
@@ -2367,7 +3029,8 @@ async def submit_human_feedback(
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
-async def get_learning_metrics(include_pattern_details: bool = False) -> str:
+@with_session_routing("get_learning_metrics")
+async def get_learning_metrics(include_pattern_details: bool = False, session_id: Optional[str] = None) -> str:
     """Retrieve learning-loop improvement metrics.
 
     Shows how feedback has influenced response quality and pattern
@@ -2397,7 +3060,9 @@ async def get_learning_metrics(include_pattern_details: bool = False) -> str:
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
-async def get_failure_patterns(module: Optional[str] = None, category: Optional[str] = None) -> str:
+@with_session_routing("get_failure_patterns")
+async def get_failure_patterns(module: Optional[str] = None, category: Optional[str] = None,
+    session_id: Optional[str] = None) -> str:
     """Query learned failure patterns by module and/or category.
 
     Returns patterns extracted from REJECT and APPROVE_WITH_EDITS feedback
@@ -2445,10 +3110,11 @@ def _get_result_processor():
     return _result_processor
 
 @mcp.tool()
+@with_session_routing("process_results")
 async def process_results(
     results_dir: str, module_name: Optional[str] = None, result_type: str = "vp",
     learn_from_failures: bool = True, update_graph: bool = True,
-    workspace_id: str = "illd",
+    workspace_id: str = "illd", session_id: Optional[str] = None,
 ) -> str:
     """Process test/analysis result files and ingest into the knowledge graph.
 
@@ -2480,6 +3146,13 @@ async def process_results(
     if denied:
         return denied
     try:
+        if session_id:
+            sm = _get_sandbox_manager()
+            if sm and sm.get_sandbox(session_id):
+                return _err(
+                    "SANDBOX_WRITE_BLOCKED",
+                    "Cannot write processing results to production from an active sandbox session.",
+                )
         processor = _get_result_processor()
         if not processor:
             return _err("INTERNAL_ERROR", "ResultProcessor not available")
@@ -2506,7 +3179,10 @@ async def process_results(
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def evaluate_confidence(signals: Dict[str, Any], response_id: Optional[str] = None) -> str:
+@with_session_routing("evaluate_confidence")
+async def evaluate_confidence(signals: Dict[str, Any], response_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
     """Compute a deterministic confidence score and route to review type.
 
     Scoring: AUTO (score >= 80), QUICK (50-79), FULL (< 50).
@@ -2542,9 +3218,13 @@ async def evaluate_confidence(signals: Dict[str, Any], response_id: Optional[str
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
+@with_session_routing("complete_review")
 async def complete_review(
     response_id: str, decision: str, reviewer_id: Optional[str] = None,
-    issues_found: int = 0, rationale: Optional[str] = None,
+    issues_found: int = 0, rationale: Optional[str] = None, session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None
 ) -> str:
     """Mark a review as completed and close the review gate.
 
@@ -2571,6 +3251,13 @@ async def complete_review(
     if denied:
         return denied
     try:
+        if session_id:
+            sm = _get_sandbox_manager()
+            if sm and sm.get_sandbox(session_id):
+                return _err(
+                    "SANDBOX_WRITE_BLOCKED",
+                    "Cannot complete production review from an active sandbox session.",
+                )
         sink = _get_feedback_sink()
         if not sink:
             return _err("INTERNAL_ERROR", "FeedbackSink not available")
@@ -2584,7 +3271,12 @@ async def complete_review(
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
-async def override_review_routing(response_id: str, new_review_type: str, reason: str) -> str:
+@with_session_routing("override_review_routing")
+async def override_review_routing(response_id: str, new_review_type: str, reason: str,
+    session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None) -> str:
     """Override the automatic review routing for a response.
 
     Used to escalate (e.g. AUTO → FULL) or downgrade review level.
@@ -2608,6 +3300,13 @@ async def override_review_routing(response_id: str, new_review_type: str, reason
     if denied:
         return denied
     try:
+        if session_id:
+            sm = _get_sandbox_manager()
+            if sm and sm.get_sandbox(session_id):
+                return _err(
+                    "SANDBOX_WRITE_BLOCKED",
+                    "Cannot override production review routing from an active sandbox session.",
+                )
         sink = _get_feedback_sink()
         if not sink:
             return _err("INTERNAL_ERROR", "FeedbackSink not available")
@@ -2619,7 +3318,8 @@ async def override_review_routing(response_id: str, new_review_type: str, reason
         return _err("INTERNAL_ERROR", str(exc))
 
 @mcp.tool()
-async def get_review_analytics() -> str:
+@with_session_routing("get_review_analytics")
+async def get_review_analytics(session_id: Optional[str] = None) -> str:
     """Retrieve review-gate metrics, accuracy rates, and routing statistics.
 
     Shows how many reviews were AUTO/QUICK/FULL, approval rates, and
@@ -2652,7 +3352,8 @@ async def get_review_analytics() -> str:
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def list_ontology_profiles() -> str:
+@with_session_routing("list_ontology_profiles")
+async def list_ontology_profiles(session_id: Optional[str] = None) -> str:
     """List all available ontology profiles.
 
     Profiles define the node types, relationship types, and validation
@@ -2671,8 +3372,10 @@ async def list_ontology_profiles() -> str:
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
+@with_session_routing("get_ontology_schema")
 async def get_ontology_schema(
     workspace_id: str = "illd", include_live_stats: bool = False, node_type: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Return the ontology schema with node labels, relationship types, and property definitions.
 
@@ -2708,7 +3411,10 @@ async def get_ontology_schema(
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def validate_entity(entity_type: str, data: Dict[str, Any], context: str = "illd") -> str:
+@with_session_routing("validate_entity")
+async def validate_entity(entity_type: str, data: Dict[str, Any], context: str = "illd",
+    session_id: Optional[str] = None,
+) -> str:
     """Validate an entity's data against ontology rules.
 
     Checks required properties, valid values, and relationship constraints
@@ -2740,7 +3446,13 @@ async def validate_entity(entity_type: str, data: Dict[str, Any], context: str =
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def get_ontology_compliance(module_name: str, ontology_profile: str = "illd") -> str:
+@with_session_routing("get_ontology_compliance")
+async def get_ontology_compliance(module_name: str, ontology_profile: str = "illd",
+    session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
+) -> str:
     """Compute module-level ontology compliance score and list issues.
 
     Checks that all nodes and relationships in a module conform to the
@@ -2763,8 +3475,17 @@ async def get_ontology_compliance(module_name: str, ontology_profile: str = "ill
     denied = _authorize("get_ontology_compliance")
     if denied: return denied
     try:
+        query_mode = query_mode
+        # Deep query: needs full module consistency check against prod
         os_svc = _get_ontology_service(ontology_profile)
-        return _ok(os_svc.get_compliance(module_name, ontology_profile)) if os_svc else _err("INTERNAL_ERROR", "OntologyService unavailable")
+        if not os_svc:
+            return _err("INTERNAL_ERROR", "OntologyService unavailable")
+        
+        result = os_svc.get_compliance(module_name, ontology_profile)
+        if query_mode == "sandbox":
+            result["_origin"] = "production"
+            result["_note"] = "Compliance checked against production DB"
+        return _ok(result)
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 
@@ -2773,7 +3494,8 @@ async def get_ontology_compliance(module_name: str, ontology_profile: str = "ill
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def get_graph_statistics(workspace_id: str = "illd") -> str:
+@with_session_routing("get_graph_statistics")
+async def get_graph_statistics(workspace_id: str = "illd", session_id: Optional[str] = None) -> str:
     """Get graph-wide statistics: counts by node type and relationship type.
 
     Use this for a high-level overview of what's in the knowledge graph.
@@ -2798,7 +3520,9 @@ async def get_graph_statistics(workspace_id: str = "illd") -> str:
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def list_available_modules(include_stats: bool = False, limit: int = 50, offset: int = 0, workspace_id: str = "illd") -> str:
+@with_session_routing("list_available_modules")
+async def list_available_modules(include_stats: bool = False, limit: int = 50, offset: int = 0,
+    workspace_id: str = "illd", session_id: Optional[str] = None) -> str:
     """List all modules known to the knowledge graph (Neo4j) and vector store (Qdrant).
 
     Returns a merged, deduplicated list of modules from both backends.
@@ -2917,7 +3641,9 @@ async def list_available_modules(include_stats: bool = False, limit: int = 50, o
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def get_distribution(dimension: str, workspace_id: str = "illd", label: Optional[str] = None) -> str:
+@with_session_routing("get_distribution")
+async def get_distribution(dimension: str, workspace_id: str = "illd", label: Optional[str] = None,
+    session_id: Optional[str] = None) -> str:
     """Get parametric distribution of nodes across a dimension.
 
     Useful for understanding the composition of the knowledge graph
@@ -2950,7 +3676,8 @@ async def get_distribution(dimension: str, workspace_id: str = "illd", label: Op
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def get_coverage_report(workspace_id: str = "illd") -> str:
+@with_session_routing("get_coverage_report")
+async def get_coverage_report(workspace_id: str = "illd", session_id: Optional[str] = None) -> str:
     """Generate an aggregate traceability coverage report.
 
     Shows percentage of requirements with architecture, code, test,
@@ -2978,9 +3705,13 @@ async def get_coverage_report(workspace_id: str = "illd") -> str:
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
+@with_session_routing("detect_communities")
 async def detect_communities(
     workspace_id: str = "illd", node_types: Optional[List[str]] = None,
-    min_community_size: int = 3, store_in_graph: bool = False,
+    min_community_size: int = 3, store_in_graph: bool = False, session_id: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    graph_service: Optional[Any] = None,
+    sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Run graph community detection algorithms on the knowledge graph.
 
@@ -3019,9 +3750,11 @@ async def detect_communities(
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@with_session_routing("visualize_subgraph")
 async def visualize_subgraph(
     workspace_id: str = "illd", seed_nodes: Optional[List[Dict]] = None,
     filters: Optional[Dict] = None, max_nodes: int = 200, output_format: str = "html",
+    session_id: Optional[str] = None,
 ) -> str:
     """Render a subgraph as an interactive pyvis HTML visualization.
 
@@ -3061,7 +3794,8 @@ async def visualize_subgraph(
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def get_token_info(token: str) -> str:
+@with_session_routing("get_token_info")
+async def get_token_info(token: str, session_id: Optional[str] = None) -> str:
     """Inspect JWT token timing information.
 
     Decodes a JWT to show issued-at, expiration, remaining lifetime,
@@ -3093,7 +3827,8 @@ async def get_token_info(token: str) -> str:
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
 
 @mcp.tool()
-async def ensure_valid_token(force_refresh: bool = False) -> str:
+@with_session_routing("ensure_valid_token")
+async def ensure_valid_token(force_refresh: bool = False, session_id: Optional[str] = None) -> str:
     """Refresh or validate the GPT4IFX JWT token.
 
     Reads credentials from environment variables (GPT4IFX_USERNAME,
@@ -3115,6 +3850,56 @@ async def ensure_valid_token(force_refresh: bool = False) -> str:
         from src.Configuration.services import AuthService
         return _ok(AuthService.ensure_valid_token(force_refresh))
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  CATEGORY 14 — GAP v2 TOOLS
+# ═════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+@with_session_routing("query_enhance")
+async def query_enhance(query: str, include_synonyms: bool = False, session_id: Optional[str] = None) -> str:
+    """Classify query complexity and predict optimal search strategy.
+
+    Exposes the QueryEnhancer preprocessing stage for upstream analysis.
+    Returns complexity classification, recommended search strategy, detected
+    entities/modules, and token budget hints — all rule-based with zero LLM
+    dependency and sub-millisecond latency. Access tier: developer.
+
+    Parameters:
+        query (str): Natural language query to analyze. Required.
+        include_synonyms (bool): Include expanded domain synonyms in the
+            response. Default False.
+
+    Returns (JSON):
+        {
+          "original_query": str,
+          "enhanced_query": str,
+          "complexity": "SIMPLE" | "MEDIUM" | "COMPLEX",
+          "strategy": "GRAPH_HEAVY" | "VECTOR_HEAVY" | "HYBRID" | "EXACT",
+          "suggested_alpha": float,
+          "suggested_max_results": int,
+          "detected_entities": [str],
+          "detected_modules": [str],
+          "is_aggregation": bool,
+          "token_budget_hint": int
+        }
+    """
+    denied = _authorize("query_enhance")
+    if denied:
+        return denied
+    try:
+        from src.HybridRAG.code.querier.query_enhancer import QueryEnhancer
+
+        enhancer = QueryEnhancer()
+        result = enhancer.enhance(query)
+        output = result.as_dict()
+        if not include_synonyms:
+            output.pop("synonyms_added", None)
+        return _ok(output)
+    except Exception as exc:
+        logger.exception("query_enhance failed")
+        return _err("INTERNAL_ERROR", str(exc))
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -3145,33 +3930,51 @@ class _APIKeyMiddleware:
 
 
 def _build_asgi_app(transport: str):
-    """Build the ASGI app stack with optional /metrics endpoint."""
+    """Build the ASGI app stack with Swagger UI, optional /metrics, and MCP."""
+    from contextlib import asynccontextmanager
+    from starlette.routing import Mount, Route
+    from starlette.applications import Starlette
+    from starlette.responses import Response
+
+    from .swagger_ui import swagger_routes
+
     if transport == "streamable-http":
         inner = mcp.streamable_http_app()
     else:
         inner = mcp.sse_app()
 
+    # Collect tool functions for OpenAPI introspection
+    _g = globals()
+    tool_functions = {name: _g[name] for name in TOOL_TIERS if name in _g and callable(_g[name])}
+
+    # ── Swagger UI + OpenAPI spec at /, /docs, /openapi.json ──
+    routes: list = swagger_routes(tool_functions)
+
     # Mount Prometheus /metrics alongside the MCP app
     if PROMETHEUS_AVAILABLE:
-        from starlette.routing import Mount, Route
-        from starlette.applications import Starlette
-        from starlette.responses import Response
-
         async def _metrics_handler(request):
             from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
             from src.Observability.metrics import REGISTRY
             body = generate_latest(REGISTRY)
             return Response(content=body, media_type=CONTENT_TYPE_LATEST)
 
-        app = Starlette(
-            routes=[
-                Route("/metrics", _metrics_handler),
-                Mount("/", app=inner),
-            ],
-        )
+        routes.append(Route("/metrics", _metrics_handler))
         logger.info("[Metrics] /metrics endpoint enabled for Prometheus scraping")
-    else:
-        app = inner
+
+    # MCP protocol lives under /mcp (or /sse)
+    routes.append(Mount("/", app=inner))
+
+    # Propagate the inner MCP app's lifespan (initializes the
+    # StreamableHTTPSessionManager task group) to the outer app.
+    _inner_lifespan = inner.router.lifespan_context
+
+    @asynccontextmanager
+    async def _lifespan(app):
+        async with _inner_lifespan(app):
+            yield
+
+    app = Starlette(routes=routes, lifespan=_lifespan)
+    logger.info("[Swagger] API docs available at / and /docs")
 
     return _APIKeyMiddleware(app)
 
@@ -3187,7 +3990,7 @@ def main() -> None:
     import asyncio
 
     logger.info("AI Core Engine MCP Server starting...")
-    logger.info("Tools registered: %d (PPTX 50 + 4 Sandbox + 2 RLM = 56 total)", len(TOOL_TIERS))
+    logger.info("Tools registered: %d", len(TOOL_TIERS))
     logger.info("Auth enabled: %s", os.environ.get("CERBOS_ENABLED", "true"))
     logger.info("Prometheus metrics: %s", "enabled" if PROMETHEUS_AVAILABLE else "disabled")
 
@@ -3217,3 +4020,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

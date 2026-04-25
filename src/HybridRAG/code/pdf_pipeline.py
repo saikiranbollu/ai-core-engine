@@ -92,6 +92,35 @@ _token_val: str | None = None
 _token_lock = _thr.Lock()
 _token_generation = 0          # bumped on each refresh so threads detect staleness
 
+# ── Shared httpx client (thread-safe connection pool) ─────────────────
+_shared_http_client = None
+_shared_http_lock = _thr.Lock()
+
+
+def _get_shared_http_client():
+    """Return a shared httpx.Client — thread-safe, reuses connection pool.
+
+    httpx.Client is thread-safe for concurrent requests.  Sharing a single
+    client across worker threads avoids creating (and tearing down) a new
+    TCP+TLS connection pool per thread, cutting ~100-200 ms of overhead per
+    batch and letting keep-alive work across threads.
+    """
+    global _shared_http_client
+    if _shared_http_client is not None:
+        return _shared_http_client
+    with _shared_http_lock:
+        if _shared_http_client is not None:
+            return _shared_http_client
+        import httpx
+        ca_bundle = SCRIPT_DIR / "ca-bundle.crt"
+        if ca_bundle.exists():
+            _shared_http_client = httpx.Client(
+                verify=str(ca_bundle), timeout=httpx.Timeout(API_TIMEOUT),
+            )
+        else:
+            _shared_http_client = httpx.Client(timeout=httpx.Timeout(API_TIMEOUT))
+        return _shared_http_client
+
 
 def _get_shared_token() -> tuple[str, int]:
     """Return (token, generation).  Refreshes only if no token is cached."""
@@ -159,13 +188,14 @@ def _init_llm_client(model: str = DEFAULT_MODEL, token: str | None = None):
 
     If *token* is provided it is used directly; otherwise the shared
     thread-safe token cache is consulted.
+
+    Sprint 9: Uses the shared httpx.Client (thread-safe connection pool)
+    instead of creating a new client per call.
     """
     try:
         from openai import OpenAI
-        import httpx
     except ImportError:
-        logger.error("openai and httpx are required for PDF→MD.  "
-                      "pip install openai httpx")
+        logger.error("openai is required for PDF→MD.  pip install openai")
         raise
 
     if token is None:
@@ -175,14 +205,11 @@ def _init_llm_client(model: str = DEFAULT_MODEL, token: str | None = None):
     if ca_bundle.exists():
         os.environ["SSL_CERT_FILE"] = str(ca_bundle)
         os.environ["REQUESTS_CA_BUNDLE"] = str(ca_bundle)
-        http_client = httpx.Client(verify=str(ca_bundle), timeout=httpx.Timeout(API_TIMEOUT))
-    else:
-        http_client = httpx.Client(timeout=httpx.Timeout(API_TIMEOUT))
 
     return OpenAI(
         api_key=token,
         base_url=API_BASE_URL,
-        http_client=http_client,
+        http_client=_get_shared_http_client(),
         timeout=API_TIMEOUT,
     )
 

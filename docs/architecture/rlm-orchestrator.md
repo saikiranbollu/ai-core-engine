@@ -199,6 +199,15 @@ Each sub-query is executed via `SearchService.search()` with:
 - Node type filters from the plan
 - An 8K token budget per step
 
+### Progress Reporting (Sprint 9)
+
+The `run()` method accepts an optional `on_progress` callback `(step_index, total_steps, message) → None` that is invoked:
+- After planning: reports number of planned sub-queries
+- After each sub-query completion: reports step N/total
+- After synthesis: reports completion
+
+The `rlm_orchestrate` MCP tool passes a logger-based callback that writes progress to stderr, providing visibility into multi-step execution.
+
 ### Step 3: Build Per-Step Context
 
 Each sub-query result is assembled into a context chunk using `ContextBuilder` with the step's 8K budget.

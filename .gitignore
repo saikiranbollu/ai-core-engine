@@ -59,3 +59,11 @@ src/HybridRAG/testspec/
 
 .temp_explore/
 .temp_intermediary/
+
+ai_governance_files/
+gaps/
+archive*/
+*.pptx
+*.docx
+*.xlsx
+tmp*/

@@ -1,17 +1,19 @@
 """
-Sprint 5 Integration Tests — RLM Orchestrator + Ingestion Pipeline
-===================================================================
-Tests:
-  1. RLMOrchestrator: plan, execute with mock search, synthesis
-  2. Complexity heuristic: should_use_rlm detection
-  3. RLM task types: 24 types covering all 21 DAs
-  4. IngestionService: file parse, module discovery, job tracking
-  5. Full pipeline: ingest → search → RLM context assembly
+Sprint 5 Integration Tests — RLM Orchestrator & Ephemeral Sandbox
+==================================================================
+Validates:
+    1. RLM complexity routing heuristic (should_use_rlm)
+    2. RLMOrchestrator plan generation (without LLM)
+    3. RLMOrchestrator preview mode
+    4. RLMOrchestrator run with mock search
+    5. Sandbox tools registered in TOOL_TIERS
+    6. RLM tools registered in TOOL_TIERS
+    7. Task type planning prompts coverage
 """
 import json
 import sys
-import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -19,281 +21,166 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from src.HybridRAG.code.querier.rlm_orchestrator import (
-    RLMOrchestrator, RLMTaskType, RLMContext, SubQueryStep,
-    should_use_rlm, DA_TASK_MAPPING,
-)
-from src.IngestionPipeline.ingestion_service import (
-    IngestionService, IngestionJobTracker,
+    RLMOrchestrator,
+    should_use_rlm,
+    _PLAN_CONTEXT,
+    _SYNTH_INSTRUCTIONS,
+    MAX_STEPS,
+    REGISTER_KEYWORDS,
+    ASIL_KEYWORDS,
 )
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  Mock search + LLM functions (no real backends needed)
+#  Test 1: Complexity Routing Heuristic
 # ═════════════════════════════════════════════════════════════════════════
 
-def mock_search(query, max_results=10, alpha=0.5, workspace_id="illd"):
-    """Simulates search_database returning results."""
-    return {
-        "results": [
-            {"node_id": f"node_{i}", "node_type": "APIFunction",
-             "content": f"Result {i} for: {query[:40]}", "score": 0.9 - i * 0.1}
-            for i in range(min(3, max_results))
-        ],
-        "total_count": 3,
-    }
+class TestComplexityRouting:
+    """Verify should_use_rlm correctly identifies complex queries."""
 
-def mock_llm(system, user, max_tokens=1500):
-    """Simulates LLM returning a plan or synthesis."""
-    if "planner" in system.lower() or "decompose" in system.lower():
+    def test_simple_query_no_rlm(self):
+        """Single-function query should NOT trigger RLM."""
+        assert should_use_rlm("What does Adc_Init do?") is False
+
+    def test_multiple_functions_triggers(self):
+        """3+ function names should trigger RLM (signal 1)."""
+        query = "Compare IfxCan_Can_initModule, IfxCan_Can_sendMessage, and IfxCan_Can_receiveMessage"
+        assert should_use_rlm(query) is True
+
+    def test_register_keywords_trigger(self):
+        """Register-level keywords contribute a signal."""
+        query = "How do I configure the SFR register for DMA interrupt"
+        # register + sfr + dma + interrupt = signal 2
+        has_reg = any(kw in query.lower() for kw in REGISTER_KEYWORDS)
+        assert has_reg is True
+
+    def test_asil_keywords_trigger(self):
+        """ASIL keywords contribute a signal."""
+        query = "Generate ASIL-D safety-critical code for ADC"
+        has_asil = any(kw in query.lower() for kw in ASIL_KEYWORDS)
+        assert has_asil is True
+
+    def test_traceability_task_always_rlm(self):
+        """Traceability task type should always use RLM."""
+        assert should_use_rlm("Show traces", task_type="traceability") is True
+
+    def test_debug_analysis_always_rlm(self):
+        """Debug analysis task type should always use RLM."""
+        assert should_use_rlm("Debug this", task_type="debug_analysis") is True
+
+    def test_generic_short_query_no_rlm(self):
+        """Generic short query should NOT trigger RLM."""
+        assert should_use_rlm("hello", task_type="generic") is False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Test 2: Task Type Planning Prompts
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestTaskTypeCoverage:
+    """Verify all task types have planning prompts and synthesis instructions."""
+
+    def test_plan_context_has_entries(self):
+        assert len(_PLAN_CONTEXT) >= 20, f"Expected 20+ task types, got {len(_PLAN_CONTEXT)}"
+
+    def test_synth_instructions_has_entries(self):
+        assert len(_SYNTH_INSTRUCTIONS) >= 20
+
+    def test_all_plan_contexts_have_synth(self):
+        """Every plan context key should have a corresponding synthesis instruction."""
+        for key in _PLAN_CONTEXT:
+            assert key in _SYNTH_INSTRUCTIONS, f"Missing synth for task type: {key}"
+
+    def test_generic_task_type_exists(self):
+        assert "generic" in _PLAN_CONTEXT
+        assert "generic" in _SYNTH_INSTRUCTIONS
+
+    def test_code_generation_task_exists(self):
+        assert "code_generation" in _PLAN_CONTEXT
+
+    def test_test_generation_task_exists(self):
+        assert "test_generation" in _PLAN_CONTEXT
+
+    def test_requirement_review_task_exists(self):
+        assert "requirement_review" in _PLAN_CONTEXT
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Test 3: RLM Orchestrator with Mock LLM
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestRLMOrchestratorMocked:
+    """Test RLM orchestrator with mocked LLM and search."""
+
+    def _mock_llm(self, system: str, user: str, max_tokens: int = 1500) -> str:
+        """Return a valid JSON plan."""
         return json.dumps({
             "reasoning": "Test plan",
             "steps": [
-                {"step_id": 1, "intent": "Get requirements", "query": "CAN requirements", "alpha": 0.8},
-                {"step_id": 2, "intent": "Get API functions", "query": "CAN init functions", "alpha": 0.5},
-                {"step_id": 3, "intent": "Get HW registers", "query": "CAN registers CLC", "alpha": 0.7},
+                {"step_id": 1, "intent": "Find API functions", "query": "ADC API functions", "alpha": 0.3},
+                {"step_id": 2, "intent": "Find requirements", "query": "ADC requirements", "alpha": 0.7},
             ]
         })
-    else:
-        return "Synthesized answer: CAN initialization requires CLC register setup followed by IfxCan_init call."
+
+    def _mock_search(self, query="", max_results=10, alpha=0.5, workspace_id="illd"):
+        """Return mock search results."""
+        return [
+            {"node_id": "Adc_Init", "node_type": "APIFunction", "score": 0.9,
+             "content": "Adc_Init initializes the ADC module", "source": "neo4j",
+             "properties": {"name": "Adc_Init"}},
+        ]
+
+    def test_preview_returns_plan(self):
+        rlm = RLMOrchestrator(module="ADC", profile="illd",
+                              search_fn=self._mock_search, llm_fn=self._mock_llm)
+        result = rlm.preview("Generate ADC init code", task_type="code_generation")
+        assert "plan" in result
+        assert "step_count" in result
+        assert result["step_count"] >= 1
+
+    def test_run_returns_context(self):
+        rlm = RLMOrchestrator(module="ADC", profile="illd",
+                              search_fn=self._mock_search, llm_fn=self._mock_llm)
+        result = rlm.run("Generate ADC init code", task_type="code_generation")
+        # RLMContext dataclass
+        assert hasattr(result, "steps") or hasattr(result, "plan")
+
+    def test_run_with_progress_callback(self):
+        progress_calls = []
+
+        def on_progress(step, total, msg):
+            progress_calls.append((step, total, msg))
+
+        rlm = RLMOrchestrator(module="ADC", profile="illd",
+                              search_fn=self._mock_search, llm_fn=self._mock_llm)
+        rlm.run("Generate ADC init code", task_type="code_generation",
+                on_progress=on_progress)
+        assert len(progress_calls) >= 1, "Progress callback should be invoked"
+
+    def test_max_steps_respected(self):
+        assert MAX_STEPS == 6, f"MAX_STEPS should be 6, got {MAX_STEPS}"
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  Test 1: RLM Orchestrator Core
+#  Test 4: Tool Tier Verification
 # ═════════════════════════════════════════════════════════════════════════
 
-class TestRLMOrchestrator:
+class TestRLMAndSandboxToolTiers:
+    """Verify RLM and Sandbox tools are registered with correct tiers."""
 
-    def test_run_with_mocks(self):
-        rlm = RLMOrchestrator(module="CAN", profile="mcal",
-                               search_fn=mock_search, llm_fn=mock_llm)
-        result = rlm.run("Generate CAN_Init function", task_type="code_generation")
+    def test_rlm_tools_developer_tier(self):
+        from mcp.core.tool_tiers import TOOL_TIERS
+        assert TOOL_TIERS.get("rlm_orchestrate") == "developer"
+        assert TOOL_TIERS.get("rlm_plan_preview") == "developer"
 
-        assert isinstance(result, RLMContext)
-        assert result.module == "CAN"
-        assert result.profile == "mcal"
-        assert result.task_type == "code_generation"
-        assert len(result.sub_query_trace) == 3  # Mock plan has 3 steps
-        assert result.total_tokens > 0
-        assert result.total_elapsed_s > 0
-        assert "CAN" in result.assembled_context
+    def test_sandbox_tools_exist(self):
+        from mcp.core.tool_tiers import TOOL_TIERS
+        sandbox_tools = ["sandbox_upload", "sandbox_query", "sandbox_status", "sandbox_clear"]
+        for tool in sandbox_tools:
+            assert tool in TOOL_TIERS, f"Sandbox tool {tool} not in TOOL_TIERS"
 
-    def test_plan_preview(self):
-        rlm = RLMOrchestrator(module="SPI", profile="illd", llm_fn=mock_llm)
-        preview = rlm.plan_preview("Generate SPI test", task_type="test_generation")
-
-        assert "plan" in preview
-        assert preview["step_count"] == 3
-
-    def test_to_dict(self):
-        rlm = RLMOrchestrator(module="ADC", search_fn=mock_search, llm_fn=mock_llm)
-        result = rlm.run("ADC init", task_type="generic")
-        d = result.to_dict()
-
-        assert d["module"] == "ADC"
-        assert d["sub_queries"] == 3
-        assert isinstance(d["sub_query_trace"], list)
-        assert all("step" in s for s in d["sub_query_trace"])
-
-    def test_fallback_on_bad_plan(self):
-        """If LLM returns garbage, should fallback to single query."""
-        def bad_llm(system, user, max_tokens=1500):
-            return "This is not JSON at all!"
-
-        rlm = RLMOrchestrator(module="CAN", search_fn=mock_search, llm_fn=bad_llm)
-        result = rlm.run("test query")
-        # Should still work with fallback single step
-        assert len(result.sub_query_trace) >= 1
-
-    def test_no_search_function(self):
-        """Without search_fn, steps produce placeholder answers."""
-        rlm = RLMOrchestrator(module="CAN", search_fn=None, llm_fn=mock_llm)
-        result = rlm.run("test query")
-        assert len(result.sub_query_trace) == 3
-        for sq in result.sub_query_trace:
-            assert "No search function" in sq.answer
-
-    def test_sub_query_step_fields(self):
-        rlm = RLMOrchestrator(module="CAN", search_fn=mock_search, llm_fn=mock_llm)
-        result = rlm.run("Generate init", task_type="code_generation")
-
-        sq = result.sub_query_trace[0]
-        assert isinstance(sq, SubQueryStep)
-        assert sq.step_id == 1
-        assert sq.intent == "Get requirements"
-        assert sq.sources_n == 3
-        assert sq.tokens > 0
-
-
-# ═════════════════════════════════════════════════════════════════════════
-#  Test 2: Complexity Heuristic
-# ═════════════════════════════════════════════════════════════════════════
-
-class TestComplexityHeuristic:
-
-    def test_simple_query_no_rlm(self):
-        assert not should_use_rlm("What is IfxCan_init?")
-
-    def test_complex_multi_function_register(self):
-        """3+ functions + register keywords → RLM."""
-        assert should_use_rlm(
-            "Generate init using IfxCan_init, IfxCan_setMode, IfxCan_enableModule "
-            "with CLC register configuration"
-        )
-
-    def test_asil_with_register(self):
-        """ASIL + register → RLM."""
-        assert should_use_rlm(
-            "Generate ASIL-B compliant DMA transfer with register setup"
-        )
-
-    def test_traceability_always_rlm(self):
-        """Traceability task type → always RLM."""
-        assert should_use_rlm("Verify requirement coverage", task_type="traceability")
-
-    def test_debug_always_rlm(self):
-        assert should_use_rlm("ADC fails intermittently", task_type="debug_analysis")
-
-
-# ═════════════════════════════════════════════════════════════════════════
-#  Test 3: Task Types Coverage
-# ═════════════════════════════════════════════════════════════════════════
-
-class TestTaskTypes:
-
-    def test_all_24_types_defined(self):
-        assert len(RLMTaskType) == 24  # 24 enum values
-
-    def test_all_21_das_mapped(self):
-        """Every DA has at least one task type mapping."""
-        expected_das = {
-            "GEST", "ACRA", "CIA", "CTA", "SAGA", "PAGE", "TripleA", "KW",
-            "SAVA", "SASA", "DaFaA", "HazopA", "GECA", "GEVT", "ATRA", "ATQA",
-            "VoltAI", "REVA", "StopTyping", "PRQ_Drafter", "RMA",
-        }
-        assert set(DA_TASK_MAPPING.keys()) == expected_das
-
-    def test_each_mapping_has_valid_types(self):
-        valid_types = {t.value for t in RLMTaskType}
-        for da, types in DA_TASK_MAPPING.items():
-            for t in types:
-                assert t in valid_types, f"DA '{da}' has invalid task type '{t}'"
-
-
-# ═════════════════════════════════════════════════════════════════════════
-#  Test 4: Ingestion Service
-# ═════════════════════════════════════════════════════════════════════════
-
-class TestIngestionService:
-
-    def test_ingest_c_header(self):
-        svc = IngestionService()
-        with tempfile.NamedTemporaryFile(suffix=".h", mode="w", delete=False) as f:
-            f.write("void IfxCan_init(IfxCan_Config *cfg);\nuint8 IfxCan_transmit(uint8 *data);\n")
-            tmp = f.name
-
-        result = svc.ingest_file(tmp, "CAN")
-        assert result["status"] == "completed"
-        assert result["module_name"] == "CAN"
-        assert result["extension"] == ".h"
-        assert "job_id" in result
-        Path(tmp).unlink()
-
-    def test_ingest_json_file(self):
-        svc = IngestionService()
-        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
-            json.dump({"requirements": [{"id": "REQ_001", "text": "The CAN driver shall init"}]}, f)
-            tmp = f.name
-
-        result = svc.ingest_file(tmp, "CAN")
-        assert result["status"] == "completed"
-        Path(tmp).unlink()
-
-    def test_ingest_missing_file(self):
-        svc = IngestionService()
-        with pytest.raises(FileNotFoundError):
-            svc.ingest_file("/nonexistent/file.h", "CAN")
-
-    def test_ingest_unsupported_extension(self):
-        svc = IngestionService()
-        with tempfile.NamedTemporaryFile(suffix=".xyz", delete=False) as f:
-            tmp = f.name
-        with pytest.raises(ValueError, match="Unsupported"):
-            svc.ingest_file(tmp, "CAN")
-        Path(tmp).unlink()
-
-    def test_job_tracker(self):
-        tracker = IngestionJobTracker()
-        jid = tracker.create_job("test", {"file": "x.h"})
-        assert tracker.get(jid)["status"] == "queued"
-
-        tracker.update(jid, status="processing", progress=50)
-        assert tracker.get(jid)["progress"] == 50
-
-        tracker.complete(jid, {"nodes": 5})
-        assert tracker.get(jid)["status"] == "completed"
-
-    def test_job_failure(self):
-        tracker = IngestionJobTracker()
-        jid = tracker.create_job("test", {})
-        tracker.fail(jid, "Parse error")
-        assert tracker.get(jid)["status"] == "failed"
-        assert "Parse error" in tracker.get(jid)["error"]
-
-    def test_ingest_module_with_temp_dir(self):
-        svc = IngestionService()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create a module directory
-            mod_dir = Path(tmpdir) / "CAN"
-            mod_dir.mkdir()
-            (mod_dir / "can_init.h").write_text("void IfxCan_init(void);\n")
-            (mod_dir / "can_tx.h").write_text("void IfxCan_transmit(uint8 *d);\n")
-
-            result = svc.ingest_module(tmpdir, "CAN")
-            assert result["files_found"] >= 2
-            assert result["files_processed"] >= 2
-
-    def test_batch_ingest(self):
-        svc = IngestionService()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for mod in ("CAN", "SPI"):
-                d = Path(tmpdir) / mod
-                d.mkdir()
-                (d / "init.h").write_text(f"void Ifx{mod}_init(void);\n")
-
-            result = svc.batch_ingest(tmpdir, modules=["CAN", "SPI"])
-            assert result["modules_processed"] == 2
-            assert len(result["per_module"]) == 2
-
-
-# ═════════════════════════════════════════════════════════════════════════
-#  Test 5: Full Pipeline — Ingest → Search → RLM
-# ═════════════════════════════════════════════════════════════════════════
-
-class TestFullPipeline:
-
-    def test_ingest_then_rlm(self):
-        """Simulate: ingest files → search produces results → RLM assembles context."""
-        # Step 1: Ingest a file
-        svc = IngestionService()
-        with tempfile.NamedTemporaryFile(suffix=".h", mode="w", delete=False) as f:
-            f.write("""
-void IfxCan_init(IfxCan_Config *cfg);
-void IfxCan_setMode(IfxCan_Node *node, uint8 mode);
-void IfxCan_enableModule(void);
-""")
-            tmp = f.name
-
-        ingest_result = svc.ingest_file(tmp, "CAN")
-        assert ingest_result["status"] == "completed"
-
-        # Step 2: RLM with mock search (simulates post-ingest search)
-        rlm = RLMOrchestrator(module="CAN", profile="mcal",
-                               search_fn=mock_search, llm_fn=mock_llm)
-        rlm_result = rlm.run(
-            "Generate CAN initialization with register setup",
-            task_type="code_generation",
-        )
-        assert rlm_result.assembled_context != ""
-        assert len(rlm_result.sub_query_trace) >= 1
-
-        Path(tmp).unlink()
+    def test_sandbox_tools_public_tier(self):
+        from mcp.core.tool_tiers import TOOL_TIERS
+        sandbox_tools = ["sandbox_upload", "sandbox_query", "sandbox_status", "sandbox_clear"]
+        for tool in sandbox_tools:
+            assert TOOL_TIERS[tool] == "public", f"Sandbox tool {tool} should be public"

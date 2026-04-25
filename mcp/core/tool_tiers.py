@@ -25,17 +25,21 @@ TOOL_TIERS: Dict[str, str] = {
     # Cat 4: Traceability
     "find_requirement_traces": PUBLIC, "build_traceability_matrix": PUBLIC,
     "find_coverage_gaps": PUBLIC, "analyze_hw_sw_links": PUBLIC,
-    # Cat 5: Ingestion Pipeline
-    "ingest_file": ADMIN, "ingest_module_from_repo": ADMIN,
-    "batch_ingest_modules": ADMIN, "ingest_repository": ADMIN,
+    # Cat 5: Ingestion Pipeline — Removed from MCP (Plan 2 Phase 2)
+    # Use sandbox_upload for all file ingestion via MCP.
+    # Underlying IngestionService preserved as library code.
+    # "ingest_file": ADMIN, "ingest_module_from_repo": ADMIN,
+    # "batch_ingest_modules": ADMIN, "ingest_repository": ADMIN,
     # Cat 6: Memory & Context
     "session_start": PUBLIC, "session_store": PUBLIC, "session_retrieve": PUBLIC,
     "build_context": PUBLIC, "session_end": PUBLIC,
     # Cat 6+: Ephemeral Sandbox
-    "sandbox_upload": PUBLIC, "sandbox_query": PUBLIC,
+    "sandbox_upload": PUBLIC,
+    # "sandbox_query": PUBLIC,  # Deprecated: use search_database(session_id=...) instead
     "sandbox_status": PUBLIC, "sandbox_clear": PUBLIC,
+    "sandbox_diff": PUBLIC,
     # Cat 6+: RLM
-    "rlm_orchestrate": PUBLIC, "rlm_plan_preview": PUBLIC,
+    "rlm_orchestrate": DEVELOPER, "rlm_plan_preview": PUBLIC,
     # Cat 7: Cache
     "cache_get": DEVELOPER, "cache_stats": DEVELOPER,
     "cache_invalidate_module": ADMIN, "cache_clear": ADMIN, "cache_refresh_config": ADMIN,
@@ -56,6 +60,8 @@ TOOL_TIERS: Dict[str, str] = {
     "visualize_subgraph": DEVELOPER,
     # Cat 13: Authentication
     "get_token_info": DEVELOPER, "ensure_valid_token": ADMIN,
+    # Cat 14: GAP v2 Tools (Sprint 25 — C01 fix)
+    "query_enhance": DEVELOPER,
 }
 
 # Tier hierarchy — higher tiers include all lower tiers

@@ -14,6 +14,7 @@ Shared by SearchService (hybrid_search) and RLMOrchestrator (sub-query assembly)
 """
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -27,7 +28,7 @@ def estimate_tokens(text: str) -> int:
     """Fast token estimate: ~3 chars per token (conservative)."""
     if not text:
         return 0
-    return max(1, len(text) // 3)
+    return max(1, len(text) // 4)  # M09 fix: ~4 chars/token standard
 
 
 # ── Slot categories ──────────────────────────────────────────────────
@@ -141,11 +142,13 @@ class ContextBuilder:
         max_tokens: Optional[int] = None,
     ) -> AssembledContext:
         total_budget = max_tokens or self.budget.total_budget
+        # Deep-copy slot budgets so repeated calls don't permanently mutate them
+        slot_budgets = copy.deepcopy(self.budget.slot_budgets)
         if max_tokens:
             scale = max_tokens / 8000
-            for slot in self.budget.slot_budgets:
-                self.budget.slot_budgets[slot] = int(
-                    self.budget.slot_budgets[slot] * scale
+            for slot in slot_budgets:
+                slot_budgets[slot] = int(
+                    slot_budgets[slot] * scale
                 )
 
         # Group by slot, sort by relevance descending
@@ -161,7 +164,7 @@ class ContextBuilder:
         dropped = 0
 
         for slot, items in by_slot.items():
-            slot_budget = self.budget.slot_budgets.get(slot, 0)
+            slot_budget = slot_budgets.get(slot, 0)
             slot_used = 0
             for item in items:
                 if slot_used + item.tokens <= slot_budget:
@@ -172,12 +175,24 @@ class ContextBuilder:
             usage[slot] = slot_used
 
         # Redistribute unused budget to hungry slots
-        self.budget.redistribute_unused(usage)
+        # Operate on the local copy, not self.budget
+        unused_total = 0
+        hungry: List[str] = []
+        for slot, budget in slot_budgets.items():
+            used = usage.get(slot, 0)
+            if used < budget * 0.3:
+                unused_total += budget - used
+            elif used >= budget * 0.9:
+                hungry.append(slot)
+        if hungry and unused_total > 0:
+            per_slot = unused_total // len(hungry)
+            for slot in hungry:
+                slot_budgets[slot] += per_slot
 
         # Second pass: fill redistributed budget
         for slot, items in by_slot.items():
             already = {id(i) for i in selected}
-            new_budget = self.budget.slot_budgets.get(slot, 0)
+            new_budget = slot_budgets.get(slot, 0)
             slot_used = usage.get(slot, 0)
             for item in items:
                 if id(item) in already:

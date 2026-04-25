@@ -1,0 +1,117 @@
+# AICE Test Environment — OpenShift Routes
+# ==========================================
+# Exposes test MCP server and Neo4j externally with TLS.
+
+# --- MCP Server Route (edge TLS) ---
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: test-mcp
+  namespace: mcswai
+  labels:
+    app: aice-mcp-server
+    env: test
+spec:
+  host: test-mcp-mcswai.eu-de-7.icp.infineon.com
+  to:
+    kind: Service
+    name: test-mcp
+    weight: 100
+  port:
+    targetPort: mcp-http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+
+# --- Neo4j Browser UI Route (edge TLS, port 7474) ---
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: test-neo4j-ui-route
+  namespace: mcswai
+  labels:
+    app: test-neo4j
+    env: test
+spec:
+  host: neo4j-ui-mcswai-test.icp.infineon.com
+  to:
+    kind: Service
+    name: test-neo4j
+    weight: 100
+  port:
+    targetPort: 7474
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+
+# --- Neo4j Bolt Edge Route (edge TLS, port 7687) ---
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: test-neo4j-bolt-edge-route
+  namespace: mcswai
+  labels:
+    app: test-neo4j
+    env: test
+spec:
+  host: bolt-edge-neo4j-mcswai-test.icp.infineon.com
+  to:
+    kind: Service
+    name: test-neo4j
+    weight: 100
+  port:
+    targetPort: 7687
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+
+# --- Neo4j Bolt Passthrough Route (passthrough TLS, port 7687) ---
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: test-neo4j-bolt-passthrough-route
+  namespace: mcswai
+  labels:
+    app: test-neo4j
+    env: test
+spec:
+  host: bolt-passthrough-neo4j-mcswai-test.icp.infineon.com
+  to:
+    kind: Service
+    name: test-neo4j
+    weight: 100
+  port:
+    targetPort: 7687
+  tls:
+    termination: passthrough
+  wildcardPolicy: None
+
+# --- Qdrant REST Route (edge TLS, port 6333) ---
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: test-qdrant-route
+  namespace: mcswai
+  labels:
+    app: test-qdrant
+    env: test
+spec:
+  host: qdrant-mcswai-test.icp.infineon.com
+  to:
+    kind: Service
+    name: test-qdrant
+    weight: 100
+  port:
+    targetPort: 6333
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

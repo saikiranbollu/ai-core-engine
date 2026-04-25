@@ -1,0 +1,194 @@
+# AICE Test Environment — Neo4j Constraint/Index Init Job
+# =========================================================
+# Creates uniqueness constraints and indexes for all ontology
+# node types (MCAL_ and ILLD_ prefixed) plus shared types.
+# All statements are idempotent (IF NOT EXISTS).
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-init-neo4j
+  namespace: mcswai
+  labels:
+    app: aice-mcp-server
+    env: test
+    component: init
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: test-init-neo4j
+        env: test
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init-neo4j
+          image: neo4j:4.4.48
+          env:
+            # Use same password as production Neo4j
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: test-aice-db-secrets
+                  key: neo4j-password
+            # Select ontology profile: mcal | illd | both
+            - name: ONTOLOGY_PROFILE
+              value: "both"
+          command:
+            - /bin/bash
+            - "-c"
+            - |
+              set -e
+              NEO4J_URI="bolt://test-neo4j:7687"
+              NEO4J_USER="neo4j"
+              NEO4J_PASS="$NEO4J_PASSWORD"
+
+              # Wait for Neo4j to be ready
+              echo "Waiting for Neo4j..."
+              for i in $(seq 1 60); do
+                if cypher-shell -a "$NEO4J_URI" -u "$NEO4J_USER" -p "$NEO4J_PASS" "RETURN 1" 2>/dev/null; then
+                  echo "Neo4j is ready"
+                  break
+                fi
+                sleep 5
+              done
+
+              run_cypher() {
+                cypher-shell -a "$NEO4J_URI" -u "$NEO4J_USER" -p "$NEO4J_PASS" "$1"
+              }
+
+              PROFILE="${ONTOLOGY_PROFILE:-both}"
+              echo "Ontology profile: $PROFILE"
+
+              if [ "$PROFILE" = "mcal" ] || [ "$PROFILE" = "both" ]; then
+              echo "Creating MCAL profile constraints and indexes..."
+
+              # MCAL node types — uniqueness constraints on primary keys
+              MCAL_TYPES=(
+                "StakeholderRequirement:requirement_id"
+                "ProductRequirement:requirement_id"
+                "VerificationStep:requirement_id"
+                "VerificationReport:requirement_id"
+                "ArchitecturalAssumption:requirement_id"
+                "TextItem:requirement_id"
+                "DocumentReference:requirement_id"
+                "Stakeholder:name"
+                "RequirementGroup:name"
+                "GlossaryTerm:name"
+                "SoftwareRelease:name"
+                "VerificationDomain:name"
+                "Folder:name"
+                "Set:name"
+                "Component:name"
+                "MCALModule:name"
+                "SWA_DataType:name"
+                "SWA_Macro:name"
+                "SWA_Function:name"
+                "SWA_EnumLiteral:name"
+                "SWA_DesignDecision:name"
+                "SWA_ErrorCode:name"
+                "SWA_ConfigParameter:name"
+                "SWA_PropertyVariable:name"
+                "SWA_ArchitecturalDecision:name"
+                "SWA_HwPeripheral:name"
+                "SWA_SwDependency:name"
+                "SWA_ConfigContainer:name"
+                "SWA_ConfigParam:name"
+                "SWA_SourceFile:name"
+                "SWA_CallSequence:name"
+                "SWA_MemorySection:name"
+                "SWA_SafetyMeasure:name"
+                "SWA_SafetyAoU:name"
+                "SWA_ThreatAnalysis:name"
+                "SWA_SecurityMeasure:name"
+                "SWA_SecurityAoU:name"
+                "SWUD_DesignDecision:name"
+                "SWUD_DerivedConfigParam:name"
+                "SWUD_ConfigStructure:name"
+                "SWUD_CodeGenMacro:name"
+                "SWUD_TypeDefinition:name"
+                "SWUD_Function:name"
+                "SWUD_DataVariable:name"
+                "SWUD_CriticalSection:name"
+                "SWUD_MemorySection:name"
+                "TS_FunctionalTestCase:name"
+                "TS_ConfigTestCase:name"
+                "TS_StaticInterfaceTestCase:name"
+                "TS_WCETTestCase:name"
+                "TS_TestSpecDocument:name"
+                "SRC_SourceFile:name"
+                "SRC_Function:name"
+                "SRC_DataType:name"
+                "SRC_Macro:name"
+                "SRC_GlobalVariable:name"
+                "SRC_LocalVariable:name"
+                "SFR_File:name"
+                "SFR_Register:name"
+                "SFR_BitField:name"
+                "SFR_BaseAddress:name"
+              )
+
+              for entry in "${MCAL_TYPES[@]}"; do
+                label="${entry%%:*}"
+                prop="${entry##*:}"
+                run_cypher "CREATE INDEX IF NOT EXISTS FOR (n:\`${label}\`) ON (n.\`${prop}\`)" || true
+              done
+              fi
+
+              if [ "$PROFILE" = "illd" ] || [ "$PROFILE" = "both" ]; then
+              echo "Creating ILLD profile constraints and indexes..."
+
+              # ILLD node types
+              ILLD_TYPES=(
+                "Requirement:requirement_id"
+                "HardwareRegister:id"
+                "RegisterField:id"
+                "Register:id"
+                "BitField:id"
+                "SoftwareArchitecture:id"
+                "Function:name"
+                "Struct:name"
+                "StructMember:name"
+                "Enum:name"
+                "Typedef:name"
+                "PrimitiveType:name"
+                "EnumValue:name"
+                "Parameter:name"
+                "ReturnType:name"
+                "SequenceDiagram:name"
+                "TestSpecification:name"
+                "TestCode:name"
+                "TestResult:name"
+                "Module:name"
+                "Operation:name"
+                "AccessMode:name"
+                "MemoryLocation:name"
+                "Interrupt:name"
+                "Error:name"
+                "Condition:name"
+                "Event:name"
+                "Mechanism:name"
+              )
+
+              for entry in "${ILLD_TYPES[@]}"; do
+                label="${entry%%:*}"
+                prop="${entry##*:}"
+                run_cypher "CREATE INDEX IF NOT EXISTS FOR (n:\`${label}\`) ON (n.\`${prop}\`)" || true
+              done
+              fi
+
+              # Shared indexes (always created)
+              echo "Creating shared indexes..."
+              run_cypher "CREATE INDEX IF NOT EXISTS FOR (n:NodeSet) ON (n.name)" || true
+              run_cypher "CREATE INDEX IF NOT EXISTS FOR (n:ApprovedPattern) ON (n.pattern_id)" || true
+
+              echo "Neo4j init complete"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"

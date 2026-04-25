@@ -68,21 +68,21 @@ except ImportError:
     ILLDNode = None
     ILLDEdge = None
 
-# SWA parser import (IngestionPipeline/Parsers)
+# SWA parser import (IngestionPipeline/parsers)
 try:
-    from src.IngestionPipeline.Parsers.swa_parsers import parse_swa_directory
+    from src.IngestionPipeline.parsers.swa_parsers import parse_swa_directory
 except ImportError:
     parse_swa_directory = None
 
-# SWUD parser import (IngestionPipeline/Parsers)
+# SWUD parser import (IngestionPipeline/parsers)
 try:
-    from src.IngestionPipeline.Parsers.swud_parsers import parse_swud_directory
+    from src.IngestionPipeline.parsers.swud_parsers import parse_swud_directory
 except ImportError:
     parse_swud_directory = None
 
-# TestSpec parser import (IngestionPipeline/Parsers)
+# TestSpec parser import (IngestionPipeline/parsers)
 try:
-    from src.IngestionPipeline.Parsers.testspec_parsers import parse_testspec_workbook
+    from src.IngestionPipeline.parsers.testspec_parsers import parse_testspec_workbook
 except ImportError:
     parse_testspec_workbook = None
 
@@ -3130,6 +3130,23 @@ class SWUDKnowledgeGraphBuilder:
     def _create_belongs_to_module(self, parsed: dict):
         """SWUD_BELONGS_TO_MODULE: any SWUD node → MCALModule."""
         module = self.module.upper()
+
+        # Clean up stale cross-module edges: when a SWUD node's module
+        # property was overwritten (e.g. ADC created Dma_Init, then DMA
+        # set module="DMA"), the old BELONGS_TO edge to the wrong module
+        # remains.  Remove edges where the node.module differs from the
+        # linked MCALModule.
+        for node_type in parsed:
+            uid_prop = self._UID_MAP.get(node_type)
+            if not uid_prop:
+                continue
+            cleanup = (
+                f"MATCH (n:{node_type} {{module: $module}})"
+                f"-[r:SWUD_BELONGS_TO_MODULE]->(m:MCALModule) "
+                f"WHERE m.module_name <> $module DELETE r"
+            )
+            self._write_tx(cleanup, {"module": module})
+
         for node_type in parsed:
             uid_prop = self._UID_MAP.get(node_type)
             if not uid_prop:
@@ -4987,7 +5004,7 @@ class SourceCodeKnowledgeGraphBuilder:
     _RE_GLOBAL_VAR = re.compile(
         r'^[ \t]*'
         r'((?:(?:static|extern|const|volatile)\s+)*)'  # qualifiers
-        r'([\w][\w\s]*?\*?)\s+'                         # type (e.g. uint32, const Adc_ConfigType *)
+        r'([\w][\w\s]*?\*?(?:\s*const)?)\s+'             # type (e.g. uint32, Adc_ConfigType * const)
         r'([A-Za-z_]\w*)\s*'                            # name
         r'(\[[^\]]*\])?\s*'                              # optional array bounds
         r'(?:=\s*([^;]{0,200}))?\s*;',                  # optional initialiser
@@ -5029,12 +5046,37 @@ class SourceCodeKnowledgeGraphBuilder:
         source_dir: Path,
         dry_run: bool = False,
         temp_dir: Optional[Path] = None,
+        sfr_include_dir: Optional[Path] = None,
+        cfgmcal_dir: Optional[Path] = None,
+        sum_mode: bool = False,
+        sum_configs: Optional[list] = None,
+        force_fetch: bool = False,
     ):
         self.neo4j_cfg = neo4j_cfg
         self.module = module.upper()
         self.source_dir = Path(source_dir)
         self.dry_run = dry_run
+        self.cfgmcal_dir = Path(cfgmcal_dir) if cfgmcal_dir else None
         self.temp_dir = temp_dir or (HYBRIDRAG_DIR / "temp" / f"src_{self.module.lower()}")
+        self.sfr_include_dir = Path(sfr_include_dir) if sfr_include_dir else None
+        # Sum mode: use real headers from Bitbucket instead of stubs
+        self.sum_mode = sum_mode
+        self.sum_configs = sum_configs
+        self.force_fetch = force_fetch
+        # Per-config state (set during Sum mode iteration)
+        self._sum_include_paths: Optional[list] = None
+        self._skip_default_stubs: bool = False
+        self._current_config: Optional[str] = None
+        self._initializer_map = None  # ConfigStructResolver for Phase 4
+        # Auto-detect SFR include directory from infra_sfr repo if not provided
+        if self.sfr_include_dir is None:
+            sfr_base = HYBRIDRAG_DIR / "temp" / "temporary_data" / "aurix3g_sw_mcal_tc4xx_infra_sfr"
+            if sfr_base.is_dir():
+                # Pick the first device directory (e.g. TC44xA)
+                for child in sorted(sfr_base.iterdir()):
+                    if child.is_dir() and child.name.startswith("TC"):
+                        self.sfr_include_dir = child
+                        break
         self.stats: dict = Counter()
         self._driver = None
 
@@ -5047,6 +5089,7 @@ class SourceCodeKnowledgeGraphBuilder:
         self._local_variables: list[dict] = []
         self._call_edges: list[dict] = []
         self._register_accesses: list[dict] = []
+        self._global_ref_edges: list[dict] = []
 
     # -- Connection ---------------------------------------------------------
 
@@ -5123,8 +5166,14 @@ class SourceCodeKnowledgeGraphBuilder:
         t0 = time.time()
 
         logger.info("=" * 60)
-        logger.info("Source Code KG Builder ΓÇô module: %s", self.module)
+        logger.info("Source Code KG Builder \u2013 module: %s", self.module)
         logger.info("Source directory: %s", self.source_dir)
+        if self.sum_mode:
+            logger.info("Sum mode: ENABLED (ground-truth AST with real headers)")
+            if self.sum_configs:
+                logger.info("Sum configs: %s", self.sum_configs)
+        if self.cfgmcal_dir:
+            logger.info("CfgMcal directory: %s", self.cfgmcal_dir)
         logger.info("Temp directory : %s", self.temp_dir)
         logger.info("Dry run: %s", self.dry_run)
         logger.info("=" * 60)
@@ -5140,16 +5189,30 @@ class SourceCodeKnowledgeGraphBuilder:
 
         # Step 1: Discover and parse all C files
         logger.info("Step 1/5: Discovering and parsing C filesΓÇª")
-        c_files = self._discover_c_files()
-        if not c_files:
-            logger.warning("No .c/.h files found in %s", self.source_dir)
-            return
+        if self.sum_mode:
+            self._prepare_and_parse_sum_mode()
+        else:
+            c_files = self._discover_c_files()
+            if not c_files:
+                logger.warning("No .c/.h files found in %s", self.source_dir)
+                return
 
-        logger.info("  Found %d C/H files to parse", len(c_files))
-        self._parse_all_files(c_files)
+            logger.info("  Found %d C/H files to parse", len(c_files))
+            self._parse_all_files(c_files)
+
+        # Deduplicate collected data when multiple Sum configs were parsed.
+        # Each config re-parses the same ssc/ and Plugins/ files, producing
+        # duplicate entries.  Keep only the last occurrence (by unique ID)
+        # so that config-specific CfgMcal data wins over earlier configs.
+        if self.sum_mode:
+            self._deduplicate_collected_data()
 
         # Step 2: Save intermediate data to temp/
-        logger.info("Step 2/5: Saving intermediate data to %s ΓÇª", self.temp_dir)
+        # First, inject any globals referenced by Phase 4 struct chains
+        # that the regex-based global extractor didn't detect (e.g.
+        # pointer-array variables in CfgMcal that don't match _RE_GLOBAL_VAR).
+        self._inject_resolver_globals()
+        logger.info("Step 2/5: Saving intermediate data to %s ΓǪ", self.temp_dir)
         self._save_intermediate()
 
         if self.dry_run:
@@ -5180,7 +5243,14 @@ class SourceCodeKnowledgeGraphBuilder:
     # ======================================================================
 
     def _discover_c_files(self) -> list[Path]:
-        """Find all .c and .h files under ssc/ and Plugins/."""
+        """Find all .c and .h files under ssc/ and Plugins/.
+
+        When *cfgmcal_dir* is set, files from that directory **replace**
+        the corresponding Tresos template files under
+        ``Plugins/<mod>/generate/template/``.  This gives us real
+        generated C code with concrete values instead of ``[!...!]``
+        Tresos directives.
+        """
         patterns = ["**/*.c", "**/*.h"]
         files = []
         for pat in patterns:
@@ -5191,6 +5261,32 @@ class SourceCodeKnowledgeGraphBuilder:
             if ".git" not in f.parts
             and "META-INF" not in f.parts
         ]
+
+        # Replace Tresos template files with CfgMcal generated files
+        if self.cfgmcal_dir and self.cfgmcal_dir.is_dir():
+            cfg_files = list(self.cfgmcal_dir.glob("**/*.c")) + list(self.cfgmcal_dir.glob("**/*.h"))
+            # Build a set of filenames from CfgMcal (e.g. Adc_Data.c)
+            cfg_names = {f.name for f in cfg_files}
+            # Filter: only CfgMcal files whose name matches this module
+            mod_prefix = self.module.capitalize()  # e.g. "Adc"
+            cfg_files = [f for f in cfg_files if f.name.startswith(mod_prefix)]
+            cfg_names = {f.name for f in cfg_files}
+            if cfg_names:
+                # Remove template files that have a generated replacement
+                before = len(files)
+                files = [
+                    f for f in files
+                    if not ("template" in f.parts and f.name in cfg_names)
+                ]
+                replaced = before - len(files)
+                # Add the generated files
+                files.extend(cfg_files)
+                logger.info(
+                    "CfgMcal: replaced %d template files with %d generated "
+                    "files from %s",
+                    replaced, len(cfg_files), self.cfgmcal_dir,
+                )
+
         files.sort()
         return files
 
@@ -5199,8 +5295,17 @@ class SourceCodeKnowledgeGraphBuilder:
         # Import the C parser ΓÇö try from IngestionPipeline first
         c_parser = self._get_c_parser()
 
+        # Generate module-specific header stubs (only in legacy mode)
+        if not self.sum_mode:
+            self._generated_stubs_dir = self._generate_module_stubs()
+
         for fpath in c_files:
-            rel_path = fpath.relative_to(self.source_dir).as_posix()
+            # Compute relative path — CfgMcal files live outside source_dir
+            try:
+                rel_path = fpath.relative_to(self.source_dir).as_posix()
+            except ValueError:
+                # File is from cfgmcal_dir — use "CfgMcal/<filename>" as id
+                rel_path = f"CfgMcal/{fpath.name}"
             logger.info("  Parsing: %s", rel_path)
 
             try:
@@ -5210,7 +5315,12 @@ class SourceCodeKnowledgeGraphBuilder:
                 continue
 
             # Determine subtree
-            subtree = "ssc" if rel_path.lower().startswith("ssc") else "plugins"
+            if rel_path.lower().startswith("ssc"):
+                subtree = "ssc"
+            elif rel_path.lower().startswith("cfgmcal"):
+                subtree = "cfgmcal"
+            else:
+                subtree = "plugins"
             is_header = fpath.suffix.lower() == ".h"
 
             # ΓöÇΓöÇ File node ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -5235,7 +5345,7 @@ class SourceCodeKnowledgeGraphBuilder:
     def _get_c_parser(self):
         """Import the C parser module."""
         try:
-            sys.path.insert(0, str(ROOT_DIR / "IngestionPipeline" / "Parsers"))
+            sys.path.insert(0, str(ROOT_DIR / "src" / "IngestionPipeline" / "Parsers"))
             import c_parser  # type: ignore[import-not-found]
             return c_parser
         except ImportError:
@@ -5244,6 +5354,240 @@ class SourceCodeKnowledgeGraphBuilder:
                 "falling back to regex-only extraction"
             )
             return None
+
+    def _generate_module_stubs(self) -> Optional[Path]:
+        """Generate module-specific header stubs for clang parsing."""
+        try:
+            from auto_stub_generator import AutoStubGenerator  # type: ignore[import-not-found]
+        except ImportError:
+            logger.debug("auto_stub_generator not available — using existing stubs")
+            return None
+
+        output_dir = self.temp_dir / "generated_stubs"
+        try:
+            gen = AutoStubGenerator(
+                module=self.module,
+                source_dir=self.source_dir,
+                output_dir=output_dir,
+            )
+            return gen.generate()
+        except Exception as exc:
+            logger.warning("Stub generation failed: %s — using existing stubs", exc)
+            return None
+
+    # ================================================================
+    # SUM MODE — ground-truth AST parsing with real production headers
+    # ================================================================
+
+    def _prepare_and_parse_sum_mode(self):
+        """Fetch dependencies + Sum configs, then parse each config.
+
+        This method replaces the legacy discover+parse flow when
+        ``sum_mode`` is enabled.  It:
+        1. Downloads real cross-module headers from Bitbucket (once).
+        2. Downloads Sum config directories (CfgMcal, MemMap, SchM).
+        3. For each config: discovers C files, builds include paths,
+           and parses with ``skip_default_stubs=True``.
+        """
+        import sys as _sys
+        if str(SCRIPT_DIR) not in _sys.path:
+            _sys.path.insert(0, str(SCRIPT_DIR))
+        from dependency_fetcher import DependencyFetcher, SumConfigFetcher
+        from config_struct_resolver import ConfigStructResolver
+
+        # 1. Fetch shared dependency headers
+        deps_dir = self.temp_dir / "dependencies"
+        dep_fetcher = DependencyFetcher(deps_dir, force=self.force_fetch)
+        deps_dir = dep_fetcher.fetch_all()
+
+        # 2. Fetch Sum configs
+        sum_dir = self.temp_dir / "sum_configs"
+        sum_fetcher = SumConfigFetcher(
+            sum_dir, self.module, force=self.force_fetch,
+        )
+        config_paths = sum_fetcher.fetch_configs(self.sum_configs)
+
+        if not config_paths:
+            logger.error("No Sum configs found — cannot proceed")
+            return
+
+        # 3. Parse each config
+        for config_name, config_path in config_paths.items():
+            logger.info("=" * 50)
+            logger.info("  Sum config: %s", config_name)
+            logger.info("=" * 50)
+
+            # Build include paths for this config
+            self._sum_include_paths = self._build_sum_include_paths(
+                config_path, deps_dir, config_name,
+            )
+            self._skip_default_stubs = True
+            self._current_config = config_name
+
+            # Build initializer map from config files for Phase 4
+            cfg_src = config_path / "CfgMcal" / "src"
+            config_c_files = []
+            if cfg_src.is_dir():
+                config_c_files = sorted(cfg_src.glob("*.c"))
+            if config_c_files:
+                resolver = ConfigStructResolver()
+                # header_dirs: module ssc/inc for struct field definitions
+                hdr_dirs = [
+                    d for d in [self.source_dir / "ssc" / "inc"]
+                    if d.is_dir()
+                ]
+                resolver.build_map(
+                    config_c_files, self._sum_include_paths,
+                    header_dirs=hdr_dirs,
+                )
+                self._initializer_map = resolver
+                logger.info("  Phase 4 resolver: %s", resolver.stats)
+            else:
+                self._initializer_map = None
+
+            # Discover C files (module ssc/ + config CfgMcal/src)
+            c_files = self._discover_c_files_sum(config_path)
+            if not c_files:
+                logger.warning("  No C/H files found for %s", config_name)
+                continue
+            logger.info("  Found %d C/H files for %s", len(c_files), config_name)
+
+            # Parse
+            self._parse_all_files(c_files)
+
+        # Reset per-config state
+        self._sum_include_paths = None
+        self._skip_default_stubs = False
+        self._current_config = None
+        self._initializer_map = None
+
+    def _discover_c_files_sum(self, config_path: Path) -> list[Path]:
+        """Discover C files: module ssc/ + Plugins/ + Sum config CfgMcal/src.
+
+        Like ``_discover_c_files`` but uses the Sum config's CfgMcal as
+        the source of generated code (replacing Tresos templates).
+        """
+        patterns = ["**/*.c", "**/*.h"]
+        files = []
+        for pat in patterns:
+            files.extend(self.source_dir.glob(pat))
+        files = [
+            f for f in files
+            if ".git" not in f.parts and "META-INF" not in f.parts
+        ]
+
+        # Replace Tresos templates with Sum config CfgMcal/src files
+        cfg_src = config_path / "CfgMcal" / "src"
+        if cfg_src.is_dir():
+            cfg_files = (
+                list(cfg_src.glob("**/*.c")) + list(cfg_src.glob("**/*.h"))
+            )
+            mod_prefix = self.module.capitalize()  # e.g. "Adc"
+            cfg_files = [f for f in cfg_files if f.name.startswith(mod_prefix)]
+            cfg_names = {f.name for f in cfg_files}
+            if cfg_names:
+                before = len(files)
+                files = [
+                    f for f in files
+                    if not ("template" in f.parts and f.name in cfg_names)
+                ]
+                replaced = before - len(files)
+                files.extend(cfg_files)
+                logger.info(
+                    "  Sum CfgMcal: replaced %d template files with %d "
+                    "generated files from %s",
+                    replaced, len(cfg_files), cfg_src,
+                )
+
+        files.sort()
+        return files
+
+    def _build_sum_include_paths(
+        self,
+        config_path: Path,
+        deps_dir: Path,
+        config_name: str,
+    ) -> list[str]:
+        """Build the include path list for a Sum config.
+
+        Order matters — higher priority directories come first:
+        1. Sum config CfgMcal/inc (config-specific #defines)
+        2. Sum config MemMap_GenFiles
+        3. Sum config SchM_GenFiles
+        4. Cross-module dependency headers (real, from Bitbucket)
+        5. SFR device headers (matched to the config's device)
+        6. Module source headers (ssc/inc, ssc/src)
+        """
+        paths: list[str] = []
+
+        # 1. Config-specific generated headers
+        cfg_inc = config_path / "CfgMcal" / "inc"
+        if cfg_inc.is_dir():
+            paths.append(str(cfg_inc))
+
+        # 2. MemMap
+        memmap = config_path / "MemMap_GenFiles"
+        if memmap.is_dir():
+            paths.append(str(memmap))
+
+        # 3. SchM
+        schm = config_path / "SchM_GenFiles"
+        if schm.is_dir():
+            paths.append(str(schm))
+
+        # 4. Cross-module dependency headers
+        if deps_dir.is_dir():
+            paths.append(str(deps_dir))
+
+        # 5. SFR headers — try to match device from config name
+        sfr_dir = self._find_sfr_device_for_config(config_name)
+        if sfr_dir and sfr_dir.is_dir():
+            paths.append(str(sfr_dir))
+
+        # 6. Module source headers
+        for sub in ("ssc/inc", "ssc/src", "ssc"):
+            inc_dir = self.source_dir / sub
+            if inc_dir.is_dir():
+                paths.append(str(inc_dir))
+
+        logger.info("  Include paths for %s:", config_name)
+        for p in paths:
+            logger.info("    %s", p)
+
+        return paths
+
+    def _find_sfr_device_for_config(self, config_name: str) -> Optional[Path]:
+        """Find the SFR device directory matching a config's device variant.
+
+        Extracts the device code from the config name (e.g.
+        ``AS460_TC499N_STD_Host_Config1`` -> ``TC499N``), then searches
+        the infra_sfr directory for a matching folder (e.g. ``TC49xN``).
+        """
+        import re as _re
+        m = _re.search(r'(TC\d[\dA-Za-z]+?)_', config_name)
+        if not m:
+            return self.sfr_include_dir
+
+        device_code = m.group(1)  # e.g. "TC499N"
+        prefix = device_code[:4]  # e.g. "TC49"
+
+        sfr_base = (
+            HYBRIDRAG_DIR / "temp" / "temporary_data"
+            / "aurix3g_sw_mcal_tc4xx_infra_sfr"
+        )
+        if not sfr_base.is_dir():
+            return self.sfr_include_dir
+
+        for child in sorted(sfr_base.iterdir()):
+            if child.is_dir() and child.name.startswith(prefix):
+                logger.info(
+                    "  SFR device: %s -> %s (matched from %s)",
+                    device_code, child.name, config_name,
+                )
+                return child
+
+        # No match — fall back to auto-detected default
+        return self.sfr_include_dir
 
     # ΓöÇΓöÇ File extraction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
@@ -5300,13 +5644,44 @@ class SourceCodeKnowledgeGraphBuilder:
         """Extract function definitions, call graphs, and register accesses."""
         lines = raw_content.split("\n")
 
-        # Use C parser (regex backend) for call graph + register analysis
+        # Use C parser for call graph, register accesses, and global refs
+        # Prefer clang backend for semantic SFR + global detection; fall back to regex
         parser_result = None
         if c_parser:
+            # In Sum mode, use pre-built include paths from the active config
+            if getattr(self, '_sum_include_paths', None) is not None:
+                include_paths = list(self._sum_include_paths)
+            else:
+                include_paths = []
+                # Generated module-specific stubs (highest priority after common stubs)
+                if getattr(self, '_generated_stubs_dir', None) and self._generated_stubs_dir.is_dir():
+                    include_paths.append(str(self._generated_stubs_dir))
+                if self.sfr_include_dir and self.sfr_include_dir.is_dir():
+                    include_paths.append(str(self.sfr_include_dir))
+                # CfgMcal generated headers (inc/) — concrete #define values
+                if self.cfgmcal_dir and self.cfgmcal_dir.is_dir():
+                    cfg_inc = self.cfgmcal_dir / "inc"
+                    if cfg_inc.is_dir():
+                        include_paths.append(str(cfg_inc))
+                # Add the module's own include directories (ssc/inc, ssc/src)
+                for sub in ("ssc/inc", "ssc/src", "ssc"):
+                    inc_dir = self.source_dir / sub
+                    if inc_dir.is_dir():
+                        include_paths.append(str(inc_dir))
+            skip_stubs = getattr(self, '_skip_default_stubs', False)
             try:
-                parser_result = c_parser.parse(str(fpath), method="regex")
+                parser_result = c_parser.parse(
+                    str(fpath), method="clang", include_paths=include_paths,
+                    skip_default_stubs=skip_stubs,
+                    initializer_map=getattr(self, '_initializer_map', None),
+                )
+                logger.debug("Clang parse OK for %s", rel_path)
             except Exception as exc:
-                logger.debug("C parser failed for %s: %s", rel_path, exc)
+                logger.debug("Clang parse failed for %s: %s — falling back to regex", rel_path, exc)
+                try:
+                    parser_result = c_parser.parse(str(fpath), method="regex")
+                except Exception as exc2:
+                    logger.debug("Regex parse also failed for %s: %s", rel_path, exc2)
 
         # Build doc-block index: map function names to doc metadata
         doc_blocks = self._extract_doc_blocks(raw_content)
@@ -5400,16 +5775,64 @@ class SourceCodeKnowledgeGraphBuilder:
                                     "case_label": sc.get("case"),
                                 })
 
-                # Register accesses
-                reg_accesses = func_data.get("register_accesses", [])
-                for ra in reg_accesses:
+                # Register / SFR accesses
+                # Prefer sfr_accesses (clang-resolved with KG register names)
+                sfr_accesses = func_data.get("sfr_accesses", [])
+                for sa in sfr_accesses:
                     self._register_accesses.append({
                         "function_id": func_id,
-                        "register_name": ra.get("register", ""),
-                        "field": ra.get("field", ""),
-                        "access_type": ra.get("access_type", ""),
-                        "line": ra.get("line", 0),
+                        "register_name": sa.get("register", ""),
+                        "field": sa.get("field", ""),
+                        "access_type": sa.get("access_type", ""),
+                        "line": sa.get("line", 0),
                     })
+                # Fall back to legacy register_accesses if no sfr_accesses
+                if not sfr_accesses:
+                    reg_accesses = func_data.get("register_accesses", [])
+                    for ra in reg_accesses:
+                        self._register_accesses.append({
+                            "function_id": func_id,
+                            "register_name": ra.get("register", ""),
+                            "field": ra.get("field", ""),
+                            "access_type": ra.get("access_type", ""),
+                            "line": ra.get("line", 0),
+                        })
+
+                # Global variable references (clang-extracted)
+                global_refs = func_data.get("global_refs", [])
+                for gr in global_refs:
+                    self._global_ref_edges.append({
+                        "function_id": func_id,
+                        "global_name": gr.get("name", ""),
+                        "access_type": gr.get("access_type", ""),
+                        "line": gr.get("line", 0),
+                        "access_context": gr.get("access_context", "DIRECT"),
+                        "callee": gr.get("callee", ""),
+                        "alias_local": gr.get("alias_local", ""),
+                        "via_chain": gr.get("via_chain", ""),
+                    })
+            else:
+                # ━━━━ Regex fallback for functions NOT covered by clang ━━━━
+                # Functions hidden behind #ifdef blocks that clang evaluates
+                # as disabled still need SFR extraction via regex patterns.
+                try:
+                    from c_parser import _RegisterAccessExtractor  # type: ignore[import-not-found]
+                    raw_body = raw_content.split("\n")[start_line - 1 : end_line]
+                    raw_body_text = "\n".join(raw_body)
+                    extractor = _RegisterAccessExtractor(raw_body_text)
+                    regex_sfr = extractor.extract_function_accesses(
+                        func_name, raw_body_text
+                    )
+                    for ra in regex_sfr:
+                        self._register_accesses.append({
+                            "function_id": func_id,
+                            "register_name": ra.get("register", ""),
+                            "field": ra.get("field", "U"),
+                            "access_type": ra["access_type"],
+                            "line": ra.get("line", 0) + start_line - 1,
+                        })
+                except Exception:
+                    pass  # Regex extraction not available or failed
 
     def _extract_doc_blocks(self, content: str) -> dict:
         """Extract Doxygen-like documentation blocks and map to function names."""
@@ -5653,6 +6076,26 @@ class SourceCodeKnowledgeGraphBuilder:
             if f["_file_id"] == rel_path:
                 func_ranges.append((f.get("start_line", 0), f.get("end_line", 0)))
 
+        # Identify ranges of struct/union/enum bodies to exclude
+        # (their members are NOT global variables)
+        struct_ranges: list[tuple[int, int]] = []
+        _struct_start_re = re.compile(
+            r'(?:typedef\s+)?(?:struct|union|enum)\s*(?:\w*\s*)?\{',
+        )
+        for sm in _struct_start_re.finditer(clean_content):
+            brace_pos = clean_content.index('{', sm.start())
+            depth = 1
+            pos = brace_pos + 1
+            while pos < len(clean_content) and depth > 0:
+                if clean_content[pos] == '{':
+                    depth += 1
+                elif clean_content[pos] == '}':
+                    depth -= 1
+                pos += 1
+            s_line = clean_content[:brace_pos].count("\n") + 1
+            e_line = clean_content[:pos].count("\n") + 1
+            struct_ranges.append((s_line, e_line))
+
         # Track current memory section
         active_memsec: Optional[str] = None
         active_conditions = self._build_condition_map(lines)
@@ -5679,9 +6122,11 @@ class SourceCodeKnowledgeGraphBuilder:
             line_end = clean_content.find("\n", m.end())
             if line_end == -1:
                 line_end = len(clean_content)
-            # If there's a ( before the ; on this match, it's a function decl
+            # If there's a ( outside array bounds, it's a function decl
             match_text = clean_content[m.start():m.end()]
-            if "(" in match_text:
+            array_part = m.group(4) or ""
+            non_array = match_text.replace(array_part, "", 1)
+            if "(" in non_array:
                 continue
 
             start_line = clean_content[:m.start()].count("\n") + 1
@@ -5693,6 +6138,15 @@ class SourceCodeKnowledgeGraphBuilder:
                     inside_func = True
                     break
             if inside_func:
+                continue
+
+            # Skip variables that fall inside a struct/union/enum body
+            inside_struct = False
+            for (ss, se) in struct_ranges:
+                if ss <= start_line <= se:
+                    inside_struct = True
+                    break
+            if inside_struct:
                 continue
 
             # Determine memory section from preceding lines
@@ -5736,6 +6190,107 @@ class SourceCodeKnowledgeGraphBuilder:
                 "module": self.module,
                 "_file_id": rel_path,
             })
+
+    def _deduplicate_collected_data(self) -> None:
+        """Remove duplicates that arise when multiple Sum configs are parsed.
+
+        Each config re-parses the shared ssc/ and Plugins/ files, so the
+        accumulated lists contain N copies of each item (one per config).
+        We keep the **last** occurrence of each unique ID, so that
+        config-specific overrides (CfgMcal files) take priority.
+        """
+        def _dedup(items: list[dict], key: str) -> list[dict]:
+            seen: dict[str, dict] = {}
+            for item in items:
+                seen[item[key]] = item  # last wins
+            return list(seen.values())
+
+        before = {
+            "files": len(self._files),
+            "functions": len(self._functions),
+            "globals": len(self._global_variables),
+            "locals": len(self._local_variables),
+        }
+
+        self._files = _dedup(self._files, "file_id")
+        self._functions = _dedup(self._functions, "function_id")
+        self._data_types = _dedup(self._data_types, "type_id")
+        self._macros = _dedup(self._macros, "macro_id")
+        self._global_variables = _dedup(self._global_variables, "variable_id")
+        self._local_variables = _dedup(self._local_variables, "variable_id")
+
+        # Edges: deduplicate by composite key
+        seen_calls: dict[tuple, dict] = {}
+        for e in self._call_edges:
+            k = (e["caller_id"], e["callee_name"], e.get("call_order", 0))
+            seen_calls[k] = e
+        self._call_edges = list(seen_calls.values())
+
+        seen_regs: dict[tuple, dict] = {}
+        for e in self._register_accesses:
+            k = (e["function_id"], e["register_name"], e.get("line", 0))
+            seen_regs[k] = e
+        self._register_accesses = list(seen_regs.values())
+
+        seen_grefs: dict[tuple, dict] = {}
+        for e in self._global_ref_edges:
+            k = (e["function_id"], e["global_name"], e.get("line", 0),
+                 e.get("access_context", ""))
+            seen_grefs[k] = e
+        self._global_ref_edges = list(seen_grefs.values())
+
+        logger.info(
+            "  Dedup: files %d→%d, functions %d→%d, "
+            "globals %d→%d, locals %d→%d, "
+            "global_ref_edges %d",
+            before["files"], len(self._files),
+            before["functions"], len(self._functions),
+            before["globals"], len(self._global_variables),
+            before["locals"], len(self._local_variables),
+            len(self._global_ref_edges),
+        )
+
+    def _inject_resolver_globals(self) -> None:
+        """Add missing globals from Phase 4 struct chain refs.
+
+        The config struct resolver may reference globals (from CfgMcal
+        initializers) that the regex-based global extractor missed —
+        typically pointer-array variables.  Without corresponding
+        ``SRC_GlobalVariable`` nodes, the ``SRC_USES_GLOBAL`` edges
+        for these cannot be created.
+        """
+        if not self._global_ref_edges:
+            return
+        known = {gv["name"] for gv in self._global_variables}
+        added = 0
+        for gre in self._global_ref_edges:
+            gname = gre["global_name"]
+            if gname in known:
+                continue
+            known.add(gname)
+            self._global_variables.append({
+                "variable_id": f"CfgMcal::{gname}",
+                "name": gname,
+                "data_type": "",
+                "is_static": True,
+                "is_extern": False,
+                "is_const": True,
+                "array_bounds": None,
+                "initial_value": None,
+                "memory_section": None,
+                "compile_condition": None,
+                "start_line": 0,
+                "description": "Auto-injected from struct chain resolver",
+                "traceability_ids": None,
+                "module": self.module,
+                "_file_id": "CfgMcal",
+            })
+            added += 1
+        if added:
+            logger.info(
+                "  Injected %d resolver-discovered globals into SRC_GlobalVariable",
+                added,
+            )
 
     # ΓöÇΓöÇ Local variable extraction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
@@ -5928,6 +6483,15 @@ class SourceCodeKnowledgeGraphBuilder:
 
     def _create_nodes(self):
         """Create all SRC_ nodes using UNWIND + MERGE."""
+
+        # Clean up stale SRC_GlobalVariable nodes for this module
+        # (struct field false positives may remain from earlier runs)
+        if self._global_variables is not None:
+            self._write_tx(
+                "MATCH (g:SRC_GlobalVariable {module: $module}) DETACH DELETE g",
+                {"module": self.module},
+            )
+
         node_groups = {
             "SRC_SourceFile":    self._files,
             "SRC_Function":      self._functions,
@@ -6115,95 +6679,136 @@ class SourceCodeKnowledgeGraphBuilder:
         self.stats["rel:SRC_HAS_LOCAL_VAR"] = len(edges)
 
     def _create_uses_global_rels(self):
-        """SRC_Function -[SRC_USES_GLOBAL]ΓåÆ SRC_GlobalVariable.
+        """SRC_Function -[SRC_USES_GLOBAL]→ SRC_GlobalVariable.
 
-        Infers usage by checking if a global variable's name appears in
-        the function body text (between start_line and end_line).
-        Uses a Cypher-only approach: match functions whose line range
-        overlaps with global variables in the same file, then use
-        apoc-free string matching as a filter.
+        Uses two sources:
+        1. Clang-extracted global_refs (precise, AST-based)
+        2. Regex text-scan fallback (for functions where clang had no data)
         """
         if not self._global_variables or not self._functions:
             return
 
-        # Build a mapping of file ΓåÆ global variable names
-        file_globals: dict[str, list[str]] = {}
-        for gv in self._global_variables:
-            fid = gv.get("_file_id", "")
-            if fid:
-                file_globals.setdefault(fid, []).append(gv["name"])
-
-        if not file_globals:
-            return
-
-        # For each file's functions, check which globals they reference
-        # by re-reading the source file and scanning function bodies
         edges: list[dict] = []
         global_names_set = {gv["name"] for gv in self._global_variables}
 
+        # Build a lookup: global name → variable_id (first match)
+        gv_name_to_id: dict[str, str] = {}
+        for gv in self._global_variables:
+            if gv["name"] not in gv_name_to_id:
+                gv_name_to_id[gv["name"]] = gv["variable_id"]
+
+        # --- Phase 1: Use clang-extracted global_ref_edges ---
+        clang_covered_funcs: set = set()
+        if self._global_ref_edges:
+            for gre in self._global_ref_edges:
+                func_id = gre["function_id"]
+                gv_name = gre["global_name"]
+                if gv_name in gv_name_to_id:
+                    edges.append({
+                        "func_id": func_id,
+                        "var_id": gv_name_to_id[gv_name],
+                        "access_type": gre.get("access_type", "READ"),
+                        "access_context": gre.get("access_context", "DIRECT"),
+                        "callee": gre.get("callee", ""),
+                        "alias_local": gre.get("alias_local", ""),
+                        "via_chain": gre.get("via_chain", ""),
+                    })
+                    clang_covered_funcs.add(func_id)
+
+        # --- Phase 2: Regex fallback for functions NOT covered by clang ---
         for func in self._functions:
             func_id = func["function_id"]
-            file_id = func.get("_file_id", "")
-            # Only check globals from the same module (not just same file)
-            func_name = func["name"]
+            if func_id in clang_covered_funcs:
+                continue  # already handled by clang
 
-            # Get function body from temp data if available
             start = func.get("start_line", 0)
             end = func.get("end_line", 0)
             if start == 0 or end == 0:
                 continue
 
-            # Read source file to get function body
-            src_path = self.source_dir / file_id
+            file_id = func.get("_file_id", "")
+            # Resolve source path — CfgMcal files use "CfgMcal/<name>" ids
+            if file_id.startswith("CfgMcal/") and self.cfgmcal_dir:
+                src_path = self.cfgmcal_dir / "src" / file_id.split("/", 1)[1]
+                if not src_path.exists():
+                    src_path = self.cfgmcal_dir / file_id.split("/", 1)[1]
+            else:
+                src_path = self.source_dir / file_id
             if not src_path.exists():
                 continue
 
             try:
                 all_lines = src_path.read_text(encoding="utf-8", errors="replace").split("\n")
-                body_lines = all_lines[start - 1 : end]
-                body_text = "\n".join(body_lines)
+                body_text = "\n".join(all_lines[start - 1 : end])
             except OSError:
                 continue
 
-            # Check which global variable names appear in the function body
             import re as _re
             for gv_name in global_names_set:
                 if len(gv_name) < 3:
-                    continue  # skip very short names to avoid false matches
-                # Word-boundary match to avoid partial name collisions
+                    continue
                 if _re.search(r'\b' + _re.escape(gv_name) + r'\b', body_text):
-                    gv_id = f"{file_id}::{gv_name}"
-                    # Check if this variable_id actually exists
-                    if any(gv["variable_id"] == gv_id for gv in self._global_variables):
-                        edges.append({"func_id": func_id, "var_id": gv_id})
+                    if gv_name in gv_name_to_id:
+                        edges.append({"func_id": func_id, "var_id": gv_name_to_id[gv_name],
+                                      "access_type": "READ", "access_context": "REGEX",
+                                      "callee": "", "alias_local": ""})
                     else:
-                        # Variable might be from a different file ΓÇö search all
                         for gv in self._global_variables:
                             if gv["name"] == gv_name:
-                                edges.append({"func_id": func_id, "var_id": gv["variable_id"]})
+                                edges.append({"func_id": func_id, "var_id": gv["variable_id"],
+                                              "access_type": "READ", "access_context": "REGEX",
+                                              "callee": "", "alias_local": ""})
                                 break
 
         if not edges:
             logger.info("  Skipping SRC_USES_GLOBAL (no usage edges detected)")
             return
 
-        # Deduplicate
-        seen = set()
-        unique_edges = []
+        # Deduplicate — merge contexts when same (func, global) pair
+        seen: dict[tuple, dict] = {}
         for e in edges:
             key = (e["func_id"], e["var_id"])
             if key not in seen:
-                seen.add(key)
-                unique_edges.append(e)
-        edges = unique_edges
+                seen[key] = e
+            else:
+                existing = seen[key]
+                new_ctx = e.get("access_context", "")
+                existing_ctx = existing.get("access_context", "")
+                if new_ctx and new_ctx not in existing_ctx:
+                    existing["access_context"] = f"{existing_ctx},{new_ctx}"
+                if e.get("alias_local") and not existing.get("alias_local"):
+                    existing["alias_local"] = e["alias_local"]
+                if e.get("via_chain") and not existing.get("via_chain"):
+                    existing["via_chain"] = e["via_chain"]
+                if e.get("callee") and not existing.get("callee"):
+                    existing["callee"] = e["callee"]
+                # Merge access types: different types → READ_WRITE
+                ea = existing.get("access_type", "READ")
+                na = e.get("access_type", "READ")
+                if ea != na:
+                    existing["access_type"] = "READ_WRITE"
+        edges = list(seen.values())
 
-        logger.info("  Creating SRC_USES_GLOBAL (%d edges)ΓÇª", len(edges))
+        logger.info("  Creating SRC_USES_GLOBAL (%d edges, %d from clang, rest from regex)…",
+                     len(edges), len(clang_covered_funcs))
+
+        # Clean up existing SRC_USES_GLOBAL edges for this module
+        self._write_tx(
+            "MATCH (f:SRC_Function {module: $module})-[r:SRC_USES_GLOBAL]->() DELETE r",
+            {"module": self.module},
+        )
+
         for chunk in self._chunked(edges, self.BATCH_SIZE):
             cypher = (
                 "UNWIND $edges AS e "
                 "MATCH (f:SRC_Function {function_id: e.func_id}) "
                 "MATCH (g:SRC_GlobalVariable {variable_id: e.var_id}) "
-                "MERGE (f)-[:SRC_USES_GLOBAL]->(g)"
+                "MERGE (f)-[r:SRC_USES_GLOBAL]->(g) "
+                "SET r.access_type = e.access_type, "
+                "    r.access_context = e.access_context, "
+                "    r.callee = CASE WHEN e.callee <> '' THEN e.callee ELSE null END, "
+                "    r.alias_local = CASE WHEN e.alias_local <> '' THEN e.alias_local ELSE null END, "
+                "    r.via_chain = CASE WHEN e.via_chain <> '' THEN e.via_chain ELSE null END"
             )
             self._write_tx(cypher, {"edges": chunk})
         self.stats["rel:SRC_USES_GLOBAL"] = len(edges)
@@ -6273,7 +6878,15 @@ class SourceCodeKnowledgeGraphBuilder:
         self.stats["rel:SRC_IMPLEMENTS_SWA"] = count_res[0]["cnt"] if count_res else 0
 
     def _create_implements_swud_rels(self):
-        """SRC_Function ΓåÆ SWUD_Function (by matching function name)."""
+        """SRC_Function → SWUD_Function (by matching function name).
+
+        Handles OCR artefact where PDF→Markdown conversion misreads
+        lowercase 'l' (local-function prefix) as uppercase 'I'.
+        E.g. SWUD has ``Dma_IChannelDeInit`` for source ``Dma_lChannelDeInit``.
+        A case-insensitive fallback with ``_l`` → ``_I`` replacement catches
+        these, including adjacent-case corruption (``Dma_IrpErrorChecks``
+        for ``Dma_lRpErrorChecks``).
+        """
         check = self._run(
             "MATCH (s:SWUD_Function {module: $module}) RETURN count(s) AS cnt",
             {"module": self.module},
@@ -6283,17 +6896,35 @@ class SourceCodeKnowledgeGraphBuilder:
             logger.info("  Skipping SRC_IMPLEMENTS_SWUD (no SWUD_Function nodes for %s)", self.module)
             return
 
-        logger.info("  Creating SRC_IMPLEMENTS_SWUD (matching against %d SWUD functions)ΓÇª", swud_count)
-        cypher = (
+        logger.info("  Creating SRC_IMPLEMENTS_SWUD (matching against %d SWUD functions)…", swud_count)
+
+        # --- Pass 1: exact name match (fast, indexed) ---
+        cypher_exact = (
             "MATCH (src:SRC_Function {module: $module}) "
             "MATCH (swud:SWUD_Function {function_name: src.name, module: $module}) "
             "MERGE (src)-[:SRC_IMPLEMENTS_SWUD]->(swud)"
         )
-        self._write_tx(cypher, {"module": self.module})
+        self._write_tx(cypher_exact, {"module": self.module})
+
+        # --- Pass 2: OCR l→I fuzzy match for remaining unlinked functions ---
+        # Only targets SRC functions with '_l' (local prefix) that have no
+        # SRC_IMPLEMENTS_SWUD edge yet, matching SWUD names where '_l' was
+        # OCR'd to '_I' (case-insensitive to handle adjacent-char corruption).
+        cypher_ocr = (
+            "MATCH (src:SRC_Function {module: $module}) "
+            "WHERE src.name CONTAINS '_l' "
+            "AND NOT EXISTS { MATCH (src)-[:SRC_IMPLEMENTS_SWUD]->() } "
+            "MATCH (swud:SWUD_Function {module: $module}) "
+            "WHERE toLower(swud.function_name) = toLower(replace(src.name, '_l', '_I')) "
+            "AND NOT EXISTS { MATCH ()-[:SRC_IMPLEMENTS_SWUD]->(swud) } "
+            "MERGE (src)-[:SRC_IMPLEMENTS_SWUD]->(swud)"
+        )
+        self._write_tx(cypher_ocr, {"module": self.module})
 
         count_res = self._run(
-            "MATCH (:SRC_Function)-[r:SRC_IMPLEMENTS_SWUD]->(:SWUD_Function) "
-            "RETURN count(r) AS cnt"
+            "MATCH (:SRC_Function {module: $module})-[r:SRC_IMPLEMENTS_SWUD]->(:SWUD_Function) "
+            "RETURN count(r) AS cnt",
+            {"module": self.module},
         )
         self.stats["rel:SRC_IMPLEMENTS_SWUD"] = count_res[0]["cnt"] if count_res else 0
 
@@ -6386,15 +7017,21 @@ class SourceCodeKnowledgeGraphBuilder:
         self.stats["rel:SRC_TRACES_TO"] = total_created
 
     def _create_register_access_rels(self):
-        """Store register access data as properties on SRC_Function nodes.
+        """Create SRC_ACCESSES_SFR edges from SRC_Function to SFR_Register.
 
-        Since register definitions are not separate nodes in the current
-        graph, we store the register access summary as a JSON property
-        on each SRC_Function node that accesses hardware registers.
+        Also stores a JSON summary as properties on the function node for
+        quick lookups without traversing edges.
         """
         if not self._register_accesses:
-            logger.info("  Skipping register access storage (no register accesses extracted)")
+            logger.info("  Skipping register access (no register accesses extracted)")
             return
+
+        # Clean up existing SRC_ACCESSES_SFR edges for this module
+        logger.info("  Removing existing SRC_ACCESSES_SFR edges for module %s…", self.module)
+        self._write_tx(
+            "MATCH (f:SRC_Function {module: $module})-[r:SRC_ACCESSES_SFR]->() DELETE r",
+            {"module": self.module},
+        )
 
         # Group by function_id
         from collections import defaultdict
@@ -6407,18 +7044,18 @@ class SourceCodeKnowledgeGraphBuilder:
                 "line": ra.get("line", 0),
             })
 
-        logger.info("  Storing register accesses on %d functionsΓÇª", len(by_func))
+        logger.info("  Creating SRC_ACCESSES_SFR edges for %d functions…", len(by_func))
 
-        batch = []
+        # -- Phase 1: Store JSON summary properties on function nodes --
+        prop_batch = []
         for func_id, accesses in by_func.items():
-            # Summarise: unique registers + access types
             registers_read = sorted(set(
                 a["register"] for a in accesses if a["access_type"] == "READ"
             ))
             registers_written = sorted(set(
                 a["register"] for a in accesses if a["access_type"] == "WRITE"
             ))
-            batch.append({
+            prop_batch.append({
                 "func_id": func_id,
                 "register_accesses": json.dumps(accesses),
                 "registers_read": json.dumps(registers_read),
@@ -6426,7 +7063,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "register_access_count": len(accesses),
             })
 
-        for chunk in self._chunked(batch, self.BATCH_SIZE):
+        for chunk in self._chunked(prop_batch, self.BATCH_SIZE):
             cypher = (
                 "UNWIND $items AS item "
                 "MATCH (f:SRC_Function {function_id: item.func_id}) "
@@ -6437,10 +7074,68 @@ class SourceCodeKnowledgeGraphBuilder:
             )
             self._write_tx(cypher, {"items": chunk})
 
+        # -- Phase 2: Create SRC_ACCESSES_SFR edges to SFR_Register nodes --
+        # Normalize register names: strip array subscripts, replace dots
+        import re as _re_norm
+
+        def _normalize_reg(name: str) -> str:
+            # "CH[ChIndex].CFG" → "CH_CFG", "MODSTAT" → "MODSTAT"
+            name = _re_norm.sub(r'\[.*?\]', '', name)
+            return name.replace('.', '_')
+
+        # Deduplicate: one edge per (function, normalized_register, access_type)
+        edge_set: set = set()
+        edge_batch: list[dict] = []
+        for ra in self._register_accesses:
+            norm = _normalize_reg(ra["register_name"])
+            if len(norm) < 3:
+                continue  # Skip tiny names like "U" or "B"
+            key = (ra["function_id"], norm, ra["access_type"])
+            if key not in edge_set:
+                edge_set.add(key)
+                edge_batch.append({
+                    "func_id": ra["function_id"],
+                    "register_name": ra["register_name"],
+                    "norm_name": norm,
+                    "access_type": ra["access_type"],
+                    "field": ra.get("field", ""),
+                })
+
+        # Determine target device from SFR include dir (e.g. "TC44xA")
+        target_device = self.sfr_include_dir.name if self.sfr_include_dir else None
+
+        sfr_edges_created = 0
+        for chunk in self._chunked(edge_batch, self.BATCH_SIZE):
+            # Match by exact name first, then by suffix (_NORM_NAME)
+            if target_device:
+                cypher = (
+                    "UNWIND $items AS item "
+                    "MATCH (f:SRC_Function {function_id: item.func_id}) "
+                    "MATCH (r:SFR_Register {module: $module, device: $device}) "
+                    "WHERE r.name = item.register_name "
+                    "   OR r.name ENDS WITH ('_' + item.norm_name) "
+                    "MERGE (f)-[rel:SRC_ACCESSES_SFR {access_type: item.access_type}]->(r) "
+                    "SET rel.field = item.field"
+                )
+                self._write_tx(cypher, {"items": chunk, "module": self.module, "device": target_device})
+            else:
+                cypher = (
+                    "UNWIND $items AS item "
+                    "MATCH (f:SRC_Function {function_id: item.func_id}) "
+                    "MATCH (r:SFR_Register {module: $module}) "
+                    "WHERE r.name = item.register_name "
+                    "   OR r.name ENDS WITH ('_' + item.norm_name) "
+                    "MERGE (f)-[rel:SRC_ACCESSES_SFR {access_type: item.access_type}]->(r) "
+                    "SET rel.field = item.field"
+                )
+                self._write_tx(cypher, {"items": chunk, "module": self.module})
+            sfr_edges_created += len(chunk)
+
         self.stats["register_access_functions"] = len(by_func)
         self.stats["register_access_total"] = len(self._register_accesses)
-        logger.info("    ΓåÆ %d functions with %d register accesses",
-                     len(by_func), len(self._register_accesses))
+        self.stats["rel:SRC_ACCESSES_SFR"] = sfr_edges_created
+        logger.info("    → %d functions, %d accesses, %d SFR edges",
+                     len(by_func), len(self._register_accesses), sfr_edges_created)
 
     # -- Preview (dry-run) --------------------------------------------------
 
@@ -6450,6 +7145,8 @@ class SourceCodeKnowledgeGraphBuilder:
         print("=" * 60)
 
         print(f"\n  Source directory: {self.source_dir}")
+        if self.cfgmcal_dir:
+            print(f"  CfgMcal directory: {self.cfgmcal_dir}")
         print(f"  Intermediate data saved to: {self.temp_dir}")
 
         print(f"\n  Node types:")
@@ -7268,6 +7965,48 @@ def main():
         ),
     )
     parser.add_argument(
+        "--cfgmcal-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the CfgMcal generated code directory (from Tresos "
+            "code generation). Should contain inc/ and src/ sub-directories "
+            "with generated .c and .h files. When provided, these replace "
+            "the corresponding Tresos template files under Plugins/. "
+            "Default: temp/temporary_data/adc_cfgmcal (auto-detected)."
+        ),
+    )
+    parser.add_argument(
+        "--sum-mode",
+        action="store_true",
+        help=(
+            "Use Sum (pre-configured) build variants for ground-truth AST "
+            "parsing.  Downloads real production headers from Bitbucket "
+            "instead of using stubs.  Each Sum config contains fully "
+            "generated CfgMcal, MemMap, and SchM files.  Requires network "
+            "access to Bitbucket (IFX_USERNAME / IFX_PASSWORD in env/.env)."
+        ),
+    )
+    parser.add_argument(
+        "--sum-configs",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Specific Sum config name(s) to parse in --sum-mode. "
+            "Example: --sum-configs AS460_TC499N_STD_Host_Config1. "
+            "Default: discover and parse all available configs."
+        ),
+    )
+    parser.add_argument(
+        "--force-fetch",
+        action="store_true",
+        help=(
+            "Force re-download of dependency headers and Sum configs "
+            "from Bitbucket, even if they were previously fetched."
+        ),
+    )
+    parser.add_argument(
         "--ingest-sfr",
         action="store_true",
         help=(
@@ -7412,11 +8151,28 @@ def main():
         if source_dir is None:
             # Default: look under temp/temporary_data/
             source_dir = HYBRIDRAG_DIR / "temp" / "temporary_data" / f"aurix3g_sw_mcal_tc4xx_{module.lower()}_src"
+        cfgmcal_dir = args.cfgmcal_dir
+        if cfgmcal_dir is None and not args.sum_mode:
+            # Auto-detect: look under temp/temporary_data/<module>_cfgmcal
+            candidate = HYBRIDRAG_DIR / "temp" / "temporary_data" / f"{module.lower()}_cfgmcal"
+            if candidate.is_dir():
+                cfgmcal_dir = candidate
+                logger.info("Auto-detected CfgMcal directory: %s", cfgmcal_dir)
+        if args.sum_mode and cfgmcal_dir:
+            logger.info(
+                "--sum-mode active: ignoring --cfgmcal-dir "
+                "(Sum configs provide CfgMcal)"
+            )
+            cfgmcal_dir = None
         builder = SourceCodeKnowledgeGraphBuilder(
             neo4j_cfg=neo4j_cfg,
             module=module,
             source_dir=source_dir,
             dry_run=args.dry_run,
+            cfgmcal_dir=cfgmcal_dir,
+            sum_mode=args.sum_mode,
+            sum_configs=args.sum_configs,
+            force_fetch=args.force_fetch,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()

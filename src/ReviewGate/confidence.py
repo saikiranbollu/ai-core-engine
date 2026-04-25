@@ -257,7 +257,6 @@ class FeedbackSink:
                     pattern = ApprovedPattern(
                         pattern_text=response_context[:4000],  # Cap at 4K chars
                         pattern_type=task_type or "generic",
-                        project=profile or "illd",
                         module=module or "unknown",
                         profile=profile or "illd",
                         confidence=0.9 if decision == "APPROVE" else 0.75,
@@ -276,9 +275,9 @@ class FeedbackSink:
             # Index in Qdrant via PatternIndex for semantic search
             if self._pattern_index and module:
                 try:
-                    self._pattern_index.ensure_collection(profile or "illd", module)
+                    # PatternIndex delegates to PatternStore; collection assumed pre-existing
                     # PatternIndex.index_pattern expects an ApprovedPattern
-                    if pattern_stored and 'pattern' in dir():
+                    if pattern_stored and pattern is not None:  # N-H04 fix
                         self._pattern_index.index_pattern(pattern)
                         pattern_indexed = True
                         logger.info(

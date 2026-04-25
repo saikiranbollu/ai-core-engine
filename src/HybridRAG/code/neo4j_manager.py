@@ -290,6 +290,44 @@ class Neo4jConnection:
             "labels": labels[0]["labels"] if labels else [],
         }
 
+    def ensure_fulltext_index(self) -> bool:
+        """Create the AICE full-text search index if it does not already exist.
+
+        Index covers 13 searchable properties across all node types used by
+        the graph search in SearchService._graph_search(). Uses Lucene-backed
+        full-text indexing which is orders of magnitude faster than
+        toLower(CONTAINS) property scans.
+
+        Returns True if the index exists (created or already present).
+        """
+        # Get all labels in the database to build the index over them
+        try:
+            stats = self.get_database_stats()
+            all_labels = stats.get("labels", [])
+            if not all_labels:
+                logger.warning("No labels found — skipping fulltext index creation")
+                return False
+
+            label_list = "|".join(all_labels)
+            properties = [
+                "name", "function_name", "description", "param_name",
+                "requirement_id", "title", "api_name", "type_name",
+                "macro_name", "module_name", "file_name", "register_name",
+                "struct_name",
+            ]
+            prop_list = ", ".join(f"n.{p}" for p in properties)
+
+            cypher = (
+                f"CREATE FULLTEXT INDEX aice_search_idx IF NOT EXISTS "
+                f"FOR (n:{label_list}) ON EACH [{prop_list}]"
+            )
+            self.query(cypher)
+            logger.info("Fulltext index 'aice_search_idx' ensured on %d labels", len(all_labels))
+            return True
+        except Exception as e:
+            logger.warning("Could not create fulltext index: %s", e)
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Qdrant Connection Manager

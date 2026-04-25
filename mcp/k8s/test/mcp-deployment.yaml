@@ -1,0 +1,154 @@
+# AICE Test Environment — MCP Server Deployment + Service
+# =========================================================
+# Mirrors production deployment.yaml but points at test-* services.
+# ConfigMap volumes override storage_config.yaml and api_keys.yaml.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-aice-mcp-server
+  namespace: mcswai
+  labels:
+    app: aice-mcp-server
+    env: test
+    component: core-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-aice-mcp-server
+      env: test
+  template:
+    metadata:
+      labels:
+        app: test-aice-mcp-server
+        env: test
+        component: core-engine
+    spec:
+      containers:
+        - name: aice-mcp
+          image: image-registry.openshift-image-registry.svc:5000/mcswai/aice-mcp:latest
+          # Uses Dockerfile CMD: python aice_mcp/app.py
+          ports:
+            - name: mcp-http
+              containerPort: 8000
+              protocol: TCP
+            - name: cerbos-http
+              containerPort: 3592
+              protocol: TCP
+            - name: cerbos-grpc
+              containerPort: 3593
+              protocol: TCP
+          env:
+            # --- Cerbos ---
+            - name: CERBOS_HOST
+              value: "localhost"
+            - name: CERBOS_HTTP_PORT
+              value: "3592"
+            - name: CERBOS_GRPC_PORT
+              value: "3593"
+            - name: CERBOS_NO_TELEMETRY
+              value: "1"
+            # --- MCP ---
+            - name: FASTMCP_PORT
+              value: "8000"
+            - name: API_KEY_REGISTRY_PATH
+              value: "/app/aice_mcp/auth/api_keys.yaml"
+            # --- Offline mode (model cached in image) ---
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            # --- Neo4j (password from test secret, same value as prod) ---
+            - name: NEO4J_URI
+              valueFrom:
+                secretKeyRef:
+                  name: test-aice-db-secrets
+                  key: neo4j-uri
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: test-aice-db-secrets
+                  key: neo4j-password
+            # --- Redis ---
+            - name: REDIS_URL
+              value: "redis://test-redis:6379/0"
+            # --- PostgreSQL ---
+            - name: POSTGRES_DSN
+              value: "postgresql://aice:test-password@test-postgres:5432/aice_meta"
+            # --- External services ---
+            - name: IFX_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: test-aice-external-secrets
+                  key: ifx-username
+            - name: IFX_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: test-aice-external-secrets
+                  key: ifx-password
+            - name: JAMA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: test-aice-external-secrets
+                  key: jama-api-key
+            - name: JAMA_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: test-aice-external-secrets
+                  key: jama-api-secret
+          volumeMounts:
+            - name: storage-config
+              mountPath: /app/src/HybridRAG/config/storage_config.yaml
+              subPath: storage_config.yaml
+              readOnly: true
+            - name: api-keys
+              mountPath: /app/aice_mcp/auth/api_keys.yaml
+              subPath: api_keys.yaml
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /_cerbos/health
+              port: cerbos-http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /_cerbos/health
+              port: cerbos-http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        - name: storage-config
+          configMap:
+            name: test-aice-storage-config
+        - name: api-keys
+          configMap:
+            name: test-aice-api-keys
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-mcp
+  namespace: mcswai
+  labels:
+    app: aice-mcp-server
+    env: test
+spec:
+  type: ClusterIP
+  selector:
+    app: test-aice-mcp-server
+    env: test
+  ports:
+    - name: mcp-http
+      port: 8000
+      targetPort: mcp-http
+      protocol: TCP

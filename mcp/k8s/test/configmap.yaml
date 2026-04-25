@@ -1,0 +1,142 @@
+# AICE Test Environment — ConfigMaps
+# ====================================
+# Overrides storage_config.yaml to point at test-* services
+# and provides test API keys for integration testing.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-aice-storage-config
+  namespace: mcswai
+  labels:
+    app: aice-mcp-server
+    env: test
+data:
+  storage_config.yaml: |
+    # Test environment — points to local test-* services
+    active_instance: mcal
+    vector_backend: qdrant
+
+    ontology:
+      config_file: "ontology.yaml"
+      active_profile: "${active_instance}"
+      allow_multi_profile: false
+
+    neo4j:
+      illd:
+        description: "ILLD - Test Instance (local)"
+        uri: "bolt://test-neo4j:7687"
+        username: "neo4j"
+        password: "${NEO4J_PASSWORD}"
+        database: "neo4j"
+        encrypted: false
+        max_connection_lifetime: 3600
+        max_connection_pool_size: 50
+        connection_acquisition_timeout: 60
+        graph_settings:
+          node_label_prefix: "ILLD_"
+          embedding_dimension: 1536
+          similarity_threshold: 0.85
+      mcal:
+        description: "MCAL - Test Instance (local)"
+        uri: "bolt://test-neo4j:7687"
+        username: "neo4j"
+        password: "${NEO4J_PASSWORD}"
+        database: "neo4j"
+        encrypted: false
+        max_connection_lifetime: 3600
+        max_connection_pool_size: 50
+        connection_acquisition_timeout: 60
+        graph_settings:
+          node_label_prefix: "MCAL_"
+          embedding_dimension: 1536
+          similarity_threshold: 0.85
+
+    qdrant:
+      url: "http://test-qdrant"
+      port: 6333
+      api_key: ""
+      https: false
+      embedding_dimension: 384
+      distance_metric: "cosine"
+      grpc: true
+      timeout: 30
+      verify_ssl: false
+      in_cluster_url: "http://test-qdrant"
+      in_cluster_grpc_port: 6334
+      illd:
+        description: "ILLD - Test Vector Store"
+        collection_name: "illd_graphrag"
+      mcal:
+        description: "MCAL - Test Vector Store"
+        collection_name: "mcal_graphrag"
+
+    jama:
+      base_url: "${JAMA_BASE_URL}"
+      api_key: "${JAMA_API_KEY}"
+      api_secret: "${JAMA_API_SECRET}"
+      verify_ssl: true
+      timeout: 120
+      max_workers: 10
+      containers:
+        prq: 7463476
+        shrq: 7458908
+      illd:
+        project_id: 1986
+        container_id: 18002547
+        item_type: 83
+
+    data:
+      base_path: "./data"
+      raw_input_pattern: "{module}/raw"
+      processed_output_pattern: "{module}/processed"
+      default_module: "CXPI"
+
+    embedding:
+      model: "sentence-transformers/all-MiniLM-L6-v2"
+      revision: "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+      dimension: 384
+      batch_size: 64
+
+    pdf_pipeline:
+      api_base_url: "https://gpt4ifx.icp.infineon.com"
+      model: "gpt-5.2"
+      timeout: 300
+      max_retries: 3
+      batch_size: 2
+      dpi: 300
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-aice-api-keys
+  namespace: mcswai
+  labels:
+    app: aice-mcp-server
+    env: test
+data:
+  api_keys.yaml: |
+    # Test API keys — for integration testing only
+    keys:
+      # Public tier — basic search/query access
+      "test-key-public-001":
+        principal_id: "test_public_user"
+        roles:
+          illd: ["public"]
+          mcal: ["public"]
+      # Developer tier — advanced tools
+      "test-key-dev-001":
+        principal_id: "test_developer"
+        roles:
+          illd: ["developer"]
+          mcal: ["developer"]
+      # Admin tier — ingestion + cache management
+      "test-key-admin-001":
+        principal_id: "test_admin"
+        roles:
+          "*": ["admin"]
+      # Production admin key — allows same key for test & prod
+      "key-admin-pipeline":
+        principal_id: "ingestion_pipeline"
+        roles:
+          "*": ["admin"]

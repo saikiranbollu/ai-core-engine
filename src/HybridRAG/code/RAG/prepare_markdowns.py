@@ -259,6 +259,35 @@ def detect_sections(md_text: str) -> list[DetectedSection]:
     return sections
 
 
+def normalize_heading_levels(md_text: str) -> str:
+    """
+    Fix LLM heading-level corruption by ensuring the number of ``#``
+    characters matches the number of dot-separated segments in the
+    section number.
+
+    The LLM prompt instructs this rule but compliance is inconsistent
+    across page-boundary batches — ``# 4.3.2 Dma_DeInit`` should be
+    ``### 4.3.2 Dma_DeInit``.
+
+    This is a **lossless** text transform: only the leading ``#`` marks
+    are adjusted; the section number and title are preserved exactly.
+    """
+    def _fix_heading(m: re.Match) -> str:
+        number = m.group("number")
+        title = m.group("title")
+        correct_depth = len(number.split("."))
+        return f"{'#' * correct_depth} {number} {title}"
+
+    fixed = MD_HEADING_RE.sub(_fix_heading, md_text)
+    if fixed != md_text:
+        import difflib
+        orig_lines = md_text.splitlines(keepends=True)
+        fixed_lines = fixed.splitlines(keepends=True)
+        changes = sum(1 for a, b in zip(orig_lines, fixed_lines) if a != b)
+        logger.info("Normalized %d heading line(s) to match section-number depth", changes)
+    return fixed
+
+
 def choose_split_depth(sections: list[DetectedSection],
                        requested_depth: int | None = None) -> int:
     """
@@ -323,6 +352,23 @@ def split_at_depth(
                     break
         sec.end_offset = found_end
         sec.content = md_text[sec.start_offset:sec.end_offset].strip()
+
+    # ── Deduplicate: TOC stubs vs real content ────────────────────────
+    # The LLM-converted markdown often contains section headings TWICE:
+    # once in the Table of Contents (short stubs, ~80 chars) and again
+    # in the actual content body (thousands of chars).  Keep only the
+    # longest entry per section number.
+    seen: dict[str, int] = {}   # number → index of best entry
+    for i, sec in enumerate(split_sections):
+        prev = seen.get(sec.number)
+        if prev is None:
+            seen[sec.number] = i
+        elif len(sec.content) > len(split_sections[prev].content):
+            seen[sec.number] = i
+    if len(seen) < len(split_sections):
+        n_dupes = len(split_sections) - len(seen)
+        split_sections = [split_sections[i] for i in sorted(seen.values())]
+        logger.info("Deduplicated %d TOC-stub sections (kept longest per number)", n_dupes)
 
     # Apply section filter
     if target_sections:
@@ -554,6 +600,11 @@ def main() -> int:
         return 1
 
     logger.info("Full markdown: %d chars", len(md_text))
+
+    # ── Step 1b: Normalize heading levels ──────────────────────────────
+    md_text = normalize_heading_levels(md_text)
+    # Persist the normalised markdown so downstream tools see corrected headings
+    full_md_path.write_text(md_text, encoding="utf-8")
 
     # ── Step 2: Detect section headings ────────────────────────────────
     all_sections = detect_sections(md_text)

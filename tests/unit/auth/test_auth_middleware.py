@@ -70,11 +70,13 @@ SAMPLE_REGISTRY = textwrap.dedent("""\
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    """Reset the cached API key registry between tests."""
+    """Reset the cached API key registry and Cerbos client between tests."""
     import core.auth_middleware as mod
     mod._api_key_registry = None
+    mod._cerbos_client = None
     yield
     mod._api_key_registry = None
+    mod._cerbos_client = None
 
 
 @pytest.fixture()
@@ -94,7 +96,7 @@ class TestToolTiers:
     """Verify the TOOL_TIERS mapping and helper functions."""
 
     def test_all_56_tools_mapped(self):
-        assert len(TOOL_TIERS) == 56
+        assert len(TOOL_TIERS) == 58
 
     def test_tiers_are_valid(self):
         valid = {PUBLIC, DEVELOPER, ADMIN}

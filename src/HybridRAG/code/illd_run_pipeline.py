@@ -12,7 +12,7 @@ Data sources:
     2. Requirements    (Jama API)   → JamaConnector               → KG + RAG
     3. SWA Header      (GitLab)     → illd_swa_parser              → KG + RAG
     4. Source Code     (GitLab)     → c_parser                     → KG + RAG
-    5. SFR regdef      (GitLab)     → sfr_parser                   → KG + RAG
+    5. SFR regdef      (GitLab)     → regdef_parser                 → KG + RAG
     6. PlantUML        (GitLab)     → puml_parser                  → KG + RAG
     7. Cross-source relationships                                  → KG
 
@@ -79,10 +79,10 @@ logger = logging.getLogger("illd_pipeline")
 
 def _import_parsers():
     """Import ILLD parsers from IngestionPipeline."""
-    from src.IngestionPipeline.Parsers import (
+    from src.IngestionPipeline.parsers import (
         illd_swa_parser,
         c_parser,
-        sfr_parser,
+        regdef_parser,
         puml_parser,
         hw_spec_parser,
         pdf_parser,
@@ -90,7 +90,7 @@ def _import_parsers():
     return {
         "swa": illd_swa_parser,
         "c": c_parser,
-        "sfr": sfr_parser,
+        "sfr": regdef_parser,
         "puml": puml_parser,
         "hw_spec": hw_spec_parser,
         "pdf": pdf_parser,

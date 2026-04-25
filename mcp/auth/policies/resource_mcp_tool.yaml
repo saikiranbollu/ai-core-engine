@@ -49,6 +49,7 @@ resourcePolicy:
               - expr: "request.resource.attr.tool_name == 'sandbox_query'"
               - expr: "request.resource.attr.tool_name == 'sandbox_status'"
               - expr: "request.resource.attr.tool_name == 'sandbox_clear'"
+              - expr: "request.resource.attr.tool_name == 'sandbox_diff'"
               # Category 6+: RLM
               - expr: "request.resource.attr.tool_name == 'rlm_orchestrate'"
               - expr: "request.resource.attr.tool_name == 'rlm_plan_preview'"
@@ -100,6 +101,8 @@ resourcePolicy:
               - expr: "request.resource.attr.tool_name == 'visualize_subgraph'"
               # Category 13: Authentication
               - expr: "request.resource.attr.tool_name == 'get_token_info'"
+              # Category 14: GAP v2 Tools
+              - expr: "request.resource.attr.tool_name == 'query_enhance'"
 
     # ── ADMIN tools — admin only ──
     - actions: ["invoke"]

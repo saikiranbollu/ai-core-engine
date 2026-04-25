@@ -52,6 +52,8 @@ All ingestion tools require **admin** tier authorization (Cerbos RBAC).
 | **Single file** | `ingest_file` | One file | Quick testing, targeted updates |
 | **Module** | `ingest_module_from_repo` | All files in a module directory | Module onboarding |
 | **Batch** | `batch_ingest_modules` | Multiple modules in parallel | Bulk onboarding |
+
+Sprint 9: `batch_ingest()` uses `ThreadPoolExecutor(max_workers=4)` with `as_completed()` for parallel module processing (~4x speedup).
 | **Repository** | `ingest_repository` | Auto-discover and ingest all modules | Initial setup |
 
 ### Single File Flow
@@ -261,6 +263,9 @@ create_job(job_id, file_path, module)
 update(job_id, progress=10, status="processing")
     → status: "processing", progress: 10%
     
+update_progress(job_id, completed=3, total=10)
+    → progress: 30% (auto-calculated from completed/total)
+    
 update(job_id, progress=50)
     → progress: 50%
     
@@ -270,6 +275,8 @@ complete(job_id, node_count, rel_count)
 fail(job_id, error_message)
     → status: "failed", error: "..."
 ```
+
+Sprint 9: Added `update_progress()` method to `IngestionJobTracker` for automatic progress calculation from completed/total module counts during batch ingestion.
 
 ### Progress Stages
 
@@ -298,7 +305,7 @@ MERGE (ns)-[:HAS_MODULE]->(f)
 
 **`overwrite` flag**: When `true`, existing node properties are fully replaced. When `false` (default), only missing properties are added (existing values preserved).
 
-> **Note**: The `_write_to_kg()` method in `IngestionService` is currently a placeholder — the actual KG write is performed via the `build_knowledge_graph.py` pipeline. Full integration is tracked for completion.
+> **Note**: The `_write_to_kg()` method in `IngestionService` uses `Neo4jBatchWriter` with UNWIND-based MERGE (or CREATE when `overwrite=True`) semantics. It handles C source/header files, JSON, PDF, XLSX, and text types, creating typed nodes and `CALLS_INTERNALLY` relationships. All nodes are linked to the module's `NodeSet` anchor via `[:HAS_MODULE]`. For full initial KG population from a repository, use the `build_knowledge_graph.py` pipeline.
 
 ### Qdrant Write
 

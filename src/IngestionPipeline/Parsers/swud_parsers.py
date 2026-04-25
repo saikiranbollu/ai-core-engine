@@ -1021,6 +1021,9 @@ def parse_functions(
             "design_decisions": spec.get("design decisions"),
             "feature_id": fid,
             "prq_references": prqs if prqs else None,
+            "hsi_constituents": _truncate(spec.get("hsi constituents"), 2000),
+            "global_shared_memory": _truncate(spec.get("global/shared memory"), 2000),
+            "events": _truncate(spec.get("events"), 500),
             "module": module.upper(),
             "source_document": source_document,
         })

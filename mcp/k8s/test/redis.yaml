@@ -1,0 +1,98 @@
+# AICE Test Environment — Redis 7
+# =================================
+# Local Redis instance for session storage and LRU cache.
+# 256MB maxmemory with allkeys-lru eviction + AOF persistence.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-redis
+  namespace: mcswai
+  labels:
+    app: test-redis
+    env: test
+spec:
+  selector:
+    app: test-redis
+    env: test
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-redis
+  namespace: mcswai
+  labels:
+    app: test-redis
+    env: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-redis
+      env: test
+  template:
+    metadata:
+      labels:
+        app: test-redis
+        env: test
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - redis-server
+            - "--maxmemory"
+            - "256mb"
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+            - "--appendonly"
+            - "yes"
+          ports:
+            - containerPort: 6379
+              name: redis
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: test-redis-data
+              mountPath: /data
+      volumes:
+        - name: test-redis-data
+          persistentVolumeClaim:
+            claimName: test-redis-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-redis-data
+  namespace: mcswai
+  labels:
+    app: test-redis
+    env: test
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi

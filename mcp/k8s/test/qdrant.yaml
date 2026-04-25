@@ -1,0 +1,95 @@
+# AICE Test Environment — Qdrant v1.12.1
+# ========================================
+# Local Qdrant vector store for test environment.
+# Exposes both REST (6333) and gRPC (6334) ports.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-qdrant
+  namespace: mcswai
+  labels:
+    app: test-qdrant
+    env: test
+spec:
+  selector:
+    app: test-qdrant
+    env: test
+  ports:
+    - name: rest
+      port: 6333
+      targetPort: 6333
+    - name: grpc
+      port: 6334
+      targetPort: 6334
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: test-qdrant
+  namespace: mcswai
+  labels:
+    app: test-qdrant
+    env: test
+spec:
+  serviceName: test-qdrant
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-qdrant
+      env: test
+  template:
+    metadata:
+      labels:
+        app: test-qdrant
+        env: test
+    spec:
+      containers:
+        - name: qdrant
+          image: dockerregistry-v2.vih.infineon.com/qdrant/qdrant:v1.12.1
+          ports:
+            - containerPort: 6333
+              name: rest
+            - containerPort: 6334
+              name: grpc
+          env:
+            # Redirect snapshots into the mounted PVC to avoid permission errors
+            - name: QDRANT__STORAGE__SNAPSHOTS_PATH
+              value: "/qdrant/storage/snapshots"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 6333
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 6333
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "125m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: test-qdrant-data
+              mountPath: /qdrant/storage
+  volumeClaimTemplates:
+    - metadata:
+        name: test-qdrant-data
+        labels:
+          env: test
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

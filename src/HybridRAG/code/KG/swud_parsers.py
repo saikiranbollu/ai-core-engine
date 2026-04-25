@@ -1460,8 +1460,14 @@ def parse_swud_directory(
 
     # Find markdown files to parse
     # Prefer the full combined markdown (contains all sections)
+    # Filter to current module only — the shared swud/ directory may
+    # contain SWUD docs from other modules (e.g. DMA, PORT).
     full_md_files = sorted(swud_dir.glob("*SWUD*.md"))
-    full_md_files = [f for f in full_md_files if not f.name.startswith("section_")]
+    full_md_files = [
+        f for f in full_md_files
+        if not f.name.startswith("section_")
+        and module.upper() in f.name.upper()
+    ]
 
     section_files = sorted(swud_dir.glob("section_*_raw.md"))
 

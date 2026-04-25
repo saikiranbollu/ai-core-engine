@@ -36,6 +36,9 @@ def _str_to_uuid(string_id: str) -> str:
 # Qdrant Collection Adapter
 # ---------------------------------------------------------------------------
 
+QDRANT_UPSERT_BATCH_SIZE = 512
+
+
 class _QdrantCollectionAdapter:
     """Wraps a single Qdrant collection behind a common collection API."""
 
@@ -50,6 +53,7 @@ class _QdrantCollectionAdapter:
         documents: Optional[List[str]] = None,
         embeddings: Optional[List[List[float]]] = None,
         metadatas: Optional[List[Dict[str, Any]]] = None,
+        batch_size: int = QDRANT_UPSERT_BATCH_SIZE,
     ) -> None:
         from qdrant_client.models import PointStruct
 
@@ -68,7 +72,33 @@ class _QdrantCollectionAdapter:
                 payload=payload,
             ))
 
-        self._client.upsert(collection_name=self._name, points=points)
+        # Batch upsert — avoids oversized single requests
+        if len(points) <= batch_size:
+            self._client.upsert(collection_name=self._name, points=points)
+        else:
+            self._batch_upsert(points, batch_size)
+
+    def _batch_upsert(self, points: list, batch_size: int) -> None:
+        """Upsert in batches, disabling Qdrant indexing during bulk load."""
+        from qdrant_client.models import OptimizersConfigDiff
+
+        # Pause indexing while bulk-loading
+        self._client.update_collection(
+            collection_name=self._name,
+            optimizer_config=OptimizersConfigDiff(indexing_threshold=0),
+        )
+        try:
+            for start in range(0, len(points), batch_size):
+                batch = points[start : start + batch_size]
+                self._client.upsert(collection_name=self._name, points=batch)
+                logger.debug("Batch upsert %s: %d-%d / %d",
+                             self._name, start, start + len(batch), len(points))
+        finally:
+            # Re-enable indexing
+            self._client.update_collection(
+                collection_name=self._name,
+                optimizer_config=OptimizersConfigDiff(indexing_threshold=20_000),
+            )
 
     def query(
         self,

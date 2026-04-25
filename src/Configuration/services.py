@@ -74,6 +74,15 @@ _COMPATIBILITY_NODE_TYPES = {
 # ═════════════════════════════════════════════════════════════════════════
 
 
+
+def _sanitize_label(label: str) -> str:
+    """Sanitize a Neo4j label to prevent Cypher injection. H17 fix."""
+    import re as _re
+    if not _re.match(r'^[A-Za-z_]*$', label):
+        raise ValueError(f"Invalid Neo4j label: {label!r}")
+    return label
+
+
 class OntologyService:
     """Serves ontology profiles and validation."""
 
@@ -257,6 +266,15 @@ class ObservabilityService:
             }
 
         prop = {"status": "status", "asil": "asil_level", "domain": "module"}.get(dimension, dimension)
+        # H17 fix: validate label against allowlist to prevent Cypher injection
+        _VALID_LABELS = {
+            "Module", "MCALModule", "Function", "Register", "Interrupt",
+            "SoftwareRequirement", "ProductRequirement", "TestCase",
+            "ConfigParameter", "Driver", "HWModule", "SFR",
+        }
+        if label and label not in _VALID_LABELS:
+            return {"dimension": dimension, "distribution": [],
+                    "error": f"Invalid label '{label}'. Allowed: {sorted(_VALID_LABELS)}"}
         label_filter = f":{label}" if label else ""
         try:
             db = _resolve_db(profile)

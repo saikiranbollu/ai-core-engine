@@ -1,0 +1,30 @@
+# AICE Test Environment — Kustomize Overlay
+# ============================================
+# Apply all test resources with:
+#   kubectl apply -k mcp/k8s/test/
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: mcswai
+
+commonLabels:
+  env: test
+  app.kubernetes.io/part-of: aice-test-env
+
+resources:
+  # Phase 1 — Secrets & Network Policy
+  - secrets.yaml
+  - network-policy.yaml
+  # Phase 2 — Databases
+  - neo4j.yaml
+  - qdrant.yaml
+  - redis.yaml
+  - postgres.yaml
+  # Phase 3 — Configuration
+  - configmap.yaml
+  # Phase 4 — Schema Init Jobs
+  - init-postgres.yaml
+  - init-neo4j.yaml
+  # Phase 5 — MCP Server
+  - mcp-deployment.yaml
+  - route.yaml

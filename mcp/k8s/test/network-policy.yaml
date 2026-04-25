@@ -1,0 +1,37 @@
+# AICE Test Environment — Network Isolation
+# ===========================================
+# Ensures test pods (env=test) can only communicate with each other
+# and with external services (GPT4IFX, Jama). Production pods in the
+# same mcswai namespace cannot reach test databases and vice versa.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: test-isolation
+  namespace: mcswai
+  labels:
+    env: test
+spec:
+  # Apply to all pods labelled env=test
+  podSelector:
+    matchLabels:
+      env: test
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow inbound traffic from other test pods
+    - from:
+        - podSelector:
+            matchLabels:
+              env: test
+    # Allow inbound traffic from OpenShift router (for routes)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+
+  egress:
+    # Allow all egress (test environment — isolation is ingress-only)
+    - {}

@@ -170,11 +170,11 @@ PAGE_MARKER_RE = re.compile(r"^##\s+Pages?\s+(\d+)(?:\s*[-–]\s*(\d+))?\s*$",
                             re.MULTILINE)
 
 # Markdown heading with section number
-#   ## 3.2.1 Initialization
-#   ### 3.1.3.2.1 ADC: Conversion complete notification ...
+#   # 3.2.1 Initialization
+#   ## 3.1.3.2.1 ADC: Conversion complete notification ...
 #   ## Figure 25: Initialization (diagram explained)
 MD_HEADING_RE = re.compile(
-    r"^(?P<hashes>#{2,6})\s+"
+    r"^(?P<hashes>#{1,6})\s+"
     r"(?:(?P<number>\d+(?:\.\d+)+)\s+)?"
     r"(?P<title>.+?)\s*$",
     re.MULTILINE,
@@ -498,6 +498,20 @@ class MarkdownChunker:
             if len(sec.content) <= self.max_chunk_chars:
                 result.append(sec)
                 continue
+
+            # ── Try sub-heading-aware splitting first ──────────────────
+            # If the oversized section contains numbered sub-headings
+            # (e.g. a monolithic "4.3 API functions" containing
+            # "### 4.3.1 Func1", "### 4.3.2 Func2", …), split at
+            # those sub-headings so each chunk carries the correct
+            # function-level title and section number.
+            sub_sections = self._split_by_subheadings(sec)
+            if sub_sections:
+                # Each sub-section may itself be oversized → recurse
+                result.extend(self._split_large(sub_sections))
+                continue
+
+            # ── Fallback: paragraph-boundary split with overlap ────────
             parts = self._split_with_overlap(
                 sec.content, self.max_chunk_chars, self.overlap_chars
             )
@@ -515,6 +529,70 @@ class MarkdownChunker:
                     page_end=sec.page_end,
                     token_count=estimate_tokens(part),
                 ))
+        return result
+
+    def _split_by_subheadings(self, sec: Section) -> list[Section] | None:
+        """
+        If *sec.content* contains numbered sub-headings deeper than the
+        section itself, split at those sub-headings and return child
+        sections.  Returns ``None`` if no suitable sub-headings found
+        (caller falls back to paragraph splitting).
+        """
+        # Find all sub-headings inside the content
+        hits = list(MD_HEADING_RE.finditer(sec.content))
+        if not hits:
+            return None
+
+        # Only consider sub-headings that are deeper (more segments)
+        parent_depth = len(sec.number.split("."))
+        sub_hits = [h for h in hits if len(h.group("number").split(".")) > parent_depth]
+        if len(sub_hits) < 2:
+            return None
+
+        logger.debug("Splitting section %s (%s) into %d sub-heading chunks",
+                      sec.number, sec.title, len(sub_hits))
+
+        children: list[Section] = []
+        for i, m in enumerate(sub_hits):
+            sub_num = m.group("number")
+            sub_title = m.group("title").strip()
+            nl = sec.content.find("\n", m.start())
+            body_start = nl + 1 if nl != -1 else m.end()
+            body_end = sub_hits[i + 1].start() if i + 1 < len(sub_hits) else len(sec.content)
+            body = sec.content[body_start:body_end].strip()
+
+            # Any content BEFORE the first sub-heading belongs to the parent
+            if i == 0 and m.start() > 0:
+                preamble = sec.content[:m.start()].strip()
+                if preamble:
+                    children.append(Section(
+                        section_id=f"{sec.section_id}_pre",
+                        title=sec.title,
+                        number=sec.number,
+                        level=sec.level,
+                        raw_level=sec.raw_level,
+                        content=preamble,
+                        parent_id=sec.parent_id,
+                        page_start=sec.page_start,
+                        page_end=sec.page_end,
+                        token_count=estimate_tokens(preamble),
+                    ))
+
+            sub_level = min(len(sub_num.split(".")), MAX_HIERARCHY_DEPTH)
+            children.append(Section(
+                section_id=f"{sec.section_id}_{sub_num.replace('.', '_')}",
+                title=sub_title,
+                number=sub_num,
+                level=sub_level,
+                raw_level=len(sub_num.split(".")),
+                content=body,
+                parent_id=sec.section_id,
+                page_start=sec.page_start,
+                page_end=sec.page_end,
+                token_count=estimate_tokens(body),
+            ))
+
+        return children
         return result
 
     @staticmethod

@@ -41,9 +41,25 @@ class KnowledgeIntelligenceService:
         self._neo4j = neo4j_driver
         self._search = search_service
         self._default_db = default_database
+        self._use_element_id: Optional[bool] = None  # detected lazily
 
     def _db(self, ws: str) -> str:
         return self._default_db
+
+    def _eid_fn(self) -> str:
+        """Return the correct node-ID function name for this Neo4j version."""
+        if self._use_element_id is None:
+            if not self._neo4j:
+                self._use_element_id = False
+            else:
+                try:
+                    with self._neo4j.session(database=self._default_db) as s:
+                        ver = s.run("CALL dbms.components() YIELD versions RETURN versions[0] AS v").single()["v"]
+                    major = int(str(ver).split(".")[0])
+                    self._use_element_id = major >= 5
+                except Exception:
+                    self._use_element_id = False
+        return "elementId" if self._use_element_id else "id"
 
     def _run_cypher(self, cypher: str, params: Dict, ws: str = "illd") -> List[Dict]:
         """Execute a read-only Cypher query, return list of row dicts."""
@@ -69,7 +85,7 @@ class KnowledgeIntelligenceService:
                 f"OR toLower(coalesce(n.function_name,'')) CONTAINS $kw "
                 f"OR toLower(coalesce(n.type_name,'')) CONTAINS $kw "
                 f"OR toLower(coalesce(n.macro_name,'')) CONTAINS $kw "
-                f"RETURN n, labels(n) AS lbl, id(n) AS nid ORDER BY "
+                f"RETURN n, labels(n) AS lbl, {self._eid_fn()}(n) AS nid ORDER BY "
                 f"CASE WHEN toLower(coalesce(n.name, n.type_name, n.macro_name, n.function_name, '')) = $exact THEN 0 "
                 f"WHEN toLower(coalesce(n.name, n.type_name, n.macro_name, n.function_name, '')) STARTS WITH $kw THEN 1 ELSE 2 END "
                 f"LIMIT $limit",
@@ -104,25 +120,15 @@ class KnowledgeIntelligenceService:
         if rel_types:
             rel_filter = "AND type(r) IN $rels"
 
-        # Use id() for Neo4j 4.x compat (integer node IDs)
-        if isinstance(element_id, int):
-            id_clause = "id(a) = $nid"
-            params = {"nid": element_id, "rels": rel_types or [], "limit": limit}
-        else:
-            id_clause = "id(a) = $nid"
-            try:
-                params = {"nid": int(element_id), "rels": rel_types or [], "limit": limit}
-            except (ValueError, TypeError):
-                # Fallback for element_id strings like "4:xxx:124"
-                parts = str(element_id).split(":")
-                nid = int(parts[-1]) if parts[-1].isdigit() else 0
-                params = {"nid": nid, "rels": rel_types or [], "limit": limit}
+        eid_fn = self._eid_fn()
+        id_clause = f"{eid_fn}(a) = $nid"
+        params = {"nid": element_id, "rels": rel_types or [], "limit": limit}
 
         rows = self._run_cypher(
             f"MATCH {pattern} WHERE {id_clause} {rel_filter} "
             f"RETURN type(r) AS rel, labels(b)[0] AS lbl, "
             f"coalesce(b.name, b.function_name, b.type_name, b.macro_name, b.requirement_id) AS name, "
-            f"b AS node, id(b) AS beid LIMIT $limit",
+            f"b AS node, {eid_fn}(b) AS beid LIMIT $limit",
             params, ws
         )
         neighbors = []
@@ -189,7 +195,11 @@ class KnowledgeIntelligenceService:
             neighbors = self._get_neighbors(eid, ws=ws)
             best["related_functions"] = [n["name"] for n in neighbors
                                           if "Function" in n.get("type", "") and n.get("name")]
-            best["fields"] = [n for n in neighbors if n["relationship"] in ("HAS_FIELD", "HAS_MEMBER")]
+            # Collect fields from multiple possible relationship types
+            # iLLD: HAS_FIELD, HAS_MEMBER | MCAL: may use additional types like CONTAINS_MEMBER, HAS_PARAMETER
+            field_relationships = ("HAS_FIELD", "HAS_MEMBER", "CONTAINS_MEMBER", "HAS_PARAMETER", 
+                                  "SWA_HAS_MEMBER", "SWUD_HAS_FIELD")
+            best["fields"] = [n for n in neighbors if n["relationship"] in field_relationships]
 
         return best
 
@@ -206,27 +216,41 @@ class KnowledgeIntelligenceService:
         lines = [f"/* Auto-generated initializer for {struct_name} */",
                  f"{struct_name} {var};"]
 
+        # Track which overrides were actually applied and which were rejected
+        applied_overrides = []
+        rejected_overrides = []
+
         # If we found fields, generate member assignments
         fields = type_def.get("fields", [])
         if fields:
             lines.append(f"/* Initialize with defaults + overrides */")
+            field_names = set()
             for f in fields:
                 fname = f.get("name", f.get("properties", {}).get("name", ""))
                 if fname:
+                    field_names.add(fname)
                     if fname in overrides:
                         lines.append(f"{var}.{fname} = {overrides[fname]};  /* user override */")
+                        applied_overrides.append(fname)
                     else:
                         default = f.get("properties", {}).get("default_value", "0")
                         lines.append(f"{var}.{fname} = {default};  /* KG default */")
+            
+            # Track which override keys don't correspond to struct fields
+            for k in overrides.keys():
+                if k not in field_names:
+                    rejected_overrides.append(k)
         else:
             # No field info — generate placeholder with overrides
             lines.append(f"/* Field details not available — applying overrides only */")
             for k, v in overrides.items():
                 lines.append(f"{var}.{k} = {v};")
+                applied_overrides.append(k)
 
         c_code = "\n".join(lines)
         return {"struct_name": struct_name, "variable_name": var,
-                "c_code": c_code, "overrides_applied": list(overrides.keys()),
+                "c_code": c_code, "overrides_applied": applied_overrides,
+                "overrides_rejected": rejected_overrides,
                 "fields_from_kg": len(fields)}
 
     # ═══════════════════════════════════════════════════════════════════
@@ -256,13 +280,14 @@ class KnowledgeIntelligenceService:
                     "transitive_dependencies": [], "call_order": [], "found": True}
 
         # Direct dependencies: ALL outgoing relationships from the matched node
+        eid_fn = self._eid_fn()
         direct_rows = self._run_cypher(
-            "MATCH (a)-[r]->(b) WHERE id(a) = $nid "
-            "RETURN type(r) AS rel, labels(b) AS lbls, "
-            "coalesce(b.name, b.function_name, b.type_name, b.macro_name, "
-            "  b.requirement_id, b.decision_id) AS name, "
-            "properties(b) AS props, id(b) AS beid "
-            "LIMIT 100",
+            f"MATCH (a)-[r]->(b) WHERE {eid_fn}(a) = $nid "
+            f"RETURN type(r) AS rel, labels(b) AS lbls, "
+            f"coalesce(b.name, b.function_name, b.type_name, b.macro_name, "
+            f"  b.requirement_id, b.decision_id) AS name, "
+            f"properties(b) AS props, {eid_fn}(b) AS beid "
+            f"LIMIT 100",
             {"nid": nid}, ws
         )
         direct = []
@@ -279,8 +304,8 @@ class KnowledgeIntelligenceService:
         seen_names = {d["name"] for d in direct}
         if max_depth >= 2:
             transitive_rows = self._run_cypher(
-                f"MATCH path = (a)-[*2..{int(max_depth)}]->(b) WHERE id(a) = $nid "
-                "AND id(b) <> $nid "
+                f"MATCH path = (a)-[*2..{int(max_depth)}]->(b) WHERE {eid_fn}(a) = $nid "
+                f"AND {eid_fn}(b) <> $nid "
                 "WITH b, min(length(path)) AS depth "
                 "RETURN labels(b) AS lbls, "
                 "coalesce(b.name, b.function_name, b.type_name, b.macro_name, "
@@ -428,9 +453,10 @@ class KnowledgeIntelligenceService:
         chain = [{"level": "requirement", "id": requirement_id, "properties": req_node}]
 
         # Follow IMPLEMENTS → code
+        eid_fn = self._eid_fn()
         code_rows = self._run_cypher(
-            "MATCH (r)-[:IMPLEMENTS]->(f) WHERE id(r) = $nid "
-            "RETURN f, labels(f)[0] AS lbl, id(f) AS fnid",
+            f"MATCH (r)-[:IMPLEMENTS]->(f) WHERE {eid_fn}(r) = $nid "
+            f"RETURN f, labels(f)[0] AS lbl, {eid_fn}(f) AS fnid",
             {"nid": req_nid}, ws
         )
         for cr in code_rows:
@@ -441,8 +467,8 @@ class KnowledgeIntelligenceService:
             # Follow TRACES_TO → test
             if include_tests:
                 test_rows = self._run_cypher(
-                    "MATCH (f)-[:TRACES_TO]->(t) WHERE id(f) = $fnid "
-                    "RETURN t, labels(t)[0] AS lbl",
+                    f"MATCH (f)-[:TRACES_TO]->(t) WHERE {eid_fn}(f) = $fnid "
+                    f"RETURN t, labels(t)[0] AS lbl",
                     {"fnid": cr["fnid"]}, ws
                 )
                 for tr in test_rows:

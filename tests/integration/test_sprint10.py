@@ -360,4 +360,4 @@ class TestHealthCheckToolCount:
     def test_tool_tiers_has_56(self):
         """tool_tiers.py should have exactly 56 tools."""
         from mcp.core.tool_tiers import TOOL_TIERS
-        assert len(TOOL_TIERS) == 56, f"Expected 56, got {len(TOOL_TIERS)}"
+        assert len(TOOL_TIERS) == 62, f"Expected 62, got {len(TOOL_TIERS)}"

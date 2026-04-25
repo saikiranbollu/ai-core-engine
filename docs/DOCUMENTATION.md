@@ -130,7 +130,7 @@ AICE serves 21+ Domain Assistants, each specialized for a phase of the V-Model l
 - **FR-8.3**: Preview mode for inspecting query plans before execution
 
 #### FR-9: Cache Layer
-- **FR-9.1**: Two-tier caching: LRU exact match + semantic similarity
+- **FR-9.1**: Three-tier caching: LRU exact match + FAISS L1 semantic (in-process) + RediSearch L2 (shared, feature-flagged)
 - **FR-9.2**: TTL-based expiration with configurable thresholds
 - **FR-9.3**: Module-scoped and full cache invalidation
 - **FR-9.4**: Cache stats and performance monitoring
@@ -157,7 +157,7 @@ AICE serves 21+ Domain Assistants, each specialized for a phase of the V-Model l
 
 #### NFR-3: Performance
 - **NFR-3.1**: LRU cache ~2500x speedup for exact matches
-- **NFR-3.2**: Semantic cache ~40x speedup for similar queries
+- **NFR-3.2**: FAISS L1 semantic cache sub-ms at 25K+ entries (vs ~5-10ms O(n) scan at 500 entries)
 - **NFR-3.3**: Expected ~60% cache hit rate under normal usage patterns
 - **NFR-3.4**: Configurable token budgets for context assembly (8K default)
 
@@ -204,7 +204,7 @@ AICE serves 21+ Domain Assistants, each specialized for a phase of the V-Model l
 | Context Builder (token-budget) | ✅ Complete | 2, 8 | Memory |
 | Ephemeral Sandbox | ✅ Complete | 3 | Memory |
 | RLM Orchestrator | ✅ Complete | 5 | Memory |
-| LRU + Semantic Cache | ✅ Complete | 6 | Performance |
+| LRU + FAISS L1 + RediSearch L2 Cache | ✅ Complete | 6, 9 | Performance |
 | Confidence Scoring | ✅ Complete | 4 | Quality |
 | Human Feedback Loop | ✅ Complete | 4 | Quality |
 | Review Gate Routing | ✅ Complete | 4 | Quality |
@@ -736,7 +736,7 @@ Both workspaces share the same MCP server instance and tool set but use separate
 #### `cache_stats` — Cache Metrics
 - **Tier**: developer
 - **Purpose**: Retrieve cache performance metrics
-- **Returns**: LRU and semantic cache stats (hit rate, size, evictions, TTL info)
+- **Returns**: LRU, FAISS L1 semantic, and RediSearch L2 cache stats (hit rate, size, FAISS enabled status, RediSearch availability)
 
 #### `cache_invalidate_module` — Module Invalidation
 - **Tier**: admin
@@ -1383,33 +1383,42 @@ PatternIndex → Qdrant semantic index (for future similarity matching)
 
 ## 11. Cache Service
 
-### 11.1 Two-Tier Architecture
+### 11.1 Three-Tier Architecture (Sprint 9)
 
 ```
 Query arrives
     │
     ▼
-┌─────────────────────┐
-│ Tier 1: LRU Cache   │ ← Exact string match
-│ Thread-safe OrderedDict
-│ Max: 1000 entries   │
-│ TTL: configurable   │
-│ Speedup: ~2500x     │
-└──────┬──────────────┘
+┌─────────────────────────┐
+│ Tier 1: LRU Cache       │ ← Exact string match
+│ Thread-safe OrderedDict  │
+│ Max: 1000 entries       │
+│ TTL: configurable       │
+│ Speedup: ~2500x         │
+└──────┬──────────────────┘
        │ MISS
        ▼
-┌─────────────────────┐
-│ Tier 2: Semantic    │ ← Embedding cosine similarity ≥ 0.85
-│ Model: MiniLM-L6-v2 │
-│ Max: 500 entries    │
-│ Speedup: ~40x       │
-└──────┬──────────────┘
+┌─────────────────────────┐
+│ Tier 2: FAISS L1        │ ← In-process FAISS IndexFlatIP
+│ Model: MiniLM-L6-v2     │   Inner-product on normalized vectors
+│ Max: 500 entries        │   = cosine similarity ≥ 0.85
+│ Speedup: sub-ms at 25K+ │
+│ Fallback: np.dot O(n)   │   (if faiss-cpu not installed)
+└──────┬──────────────────┘
+       │ MISS
+       ▼
+┌─────────────────────────┐
+│ Tier 3: RediSearch L2   │ ← Shared HNSW vector index (optional)
+│ Feature flag:            │   AICE_CACHE_L2_REDIS=true
+│ Latency: ~1-5ms         │
+│ On hit: backfill L1+LRU │
+└──────┬──────────────────┘
        │ MISS
        ▼
   Full Hybrid RAG execution
        │
        ▼
-  Write-back to both tiers
+  Write-through to all tiers
 ```
 
 ### 11.2 Cache Key Dimensions
@@ -1429,7 +1438,7 @@ Different parameter combinations produce distinct cache entries, preventing cros
 - **Model**: `all-MiniLM-L6-v2` (Sentence Transformers)
 - **Dimension**: 384
 - **Local cache**: `local_models/` directory
-- **Fallback**: When `sentence-transformers` is unavailable, semantic cache is disabled (LRU-only mode)
+- **Fallback**: When `sentence-transformers` is unavailable, semantic cache is disabled (LRU-only mode). When `faiss-cpu` is unavailable, semantic cache falls back to O(n) NumPy dot-product scan. When `AICE_CACHE_L2_REDIS` is not set, RediSearch L2 is disabled (FAISS L1 only).
 
 ---
 

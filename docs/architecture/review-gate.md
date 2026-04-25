@@ -209,7 +209,7 @@ When a response is `APPROVE`d, the `FeedbackSink` extracts an `ApprovedPattern` 
 |--------|-------------|-------------|
 | `JUnitParser` | JUnit XML | Any JUnit-compatible runner |
 | `VPParser` | VectorCAST VP format | VectorCAST test results |
-| `PolyspaceParser` | SARIF (JSON) | Polyspace Bugfinder / CodeProver |
+| `PolyspaceParser` | CSV / SARIF | Polyspace Bugfinder / CodeProver |
 | Coverage parser | Coverage reports | Various coverage tools |
 | Compiler log parser | Text logs | GCC, Tasking, GHS compilers |
 

@@ -273,3 +273,216 @@ class TestParseDefaults:
         assert regex_funcs.issubset(clang_funcs), (
             f"Regex found functions not in clang: {regex_funcs - clang_funcs}"
         )
+
+
+# ===================================================================
+# Enhanced global_refs tests (direct, passed-to-callee, alias)
+# ===================================================================
+
+GLOBAL_REFS_C_CODE = textwrap.dedent("""\
+    /* Minimal types */
+    typedef unsigned int uint32;
+    typedef unsigned char uint8;
+
+    typedef struct {
+        uint32 status;
+        uint32 count;
+    } PartitionDataType;
+
+    typedef struct {
+        const PartitionDataType *PartitionPtr;
+    } ConfigType;
+
+    /* ── Global variables ── */
+    static PartitionDataType GlobalData;
+    static uint32 GlobalCounter;
+    static const ConfigType *ConfigPtr;
+
+    /* ── Helper functions ── */
+    static void helper_read_only(const PartitionDataType *const ptr) {
+        volatile uint32 x = ptr->status;
+    }
+
+    static void helper_read_write(PartitionDataType *ptr) {
+        ptr->count = 0;
+    }
+
+    /* ── Direct access ── */
+    static void func_direct_read(void) {
+        volatile uint32 x = GlobalCounter;
+    }
+
+    static void func_direct_write(void) {
+        GlobalCounter = 42;
+    }
+
+    /* ── Passed-to-callee ── */
+    static void func_pass_const(void) {
+        helper_read_only(&GlobalData);
+    }
+
+    static void func_pass_mutable(void) {
+        helper_read_write(&GlobalData);
+    }
+
+    /* ── Local alias ── */
+    static void func_alias_read(void) {
+        const PartitionDataType *local_ptr = &GlobalData;
+        volatile uint32 x = local_ptr->status;
+    }
+
+    static void func_alias_write(void) {
+        PartitionDataType *local_ptr = &GlobalData;
+        local_ptr->count = 99;
+    }
+
+    /* ── Mixed: direct + alias + pass ── */
+    static void func_mixed(void) {
+        uint32 val = GlobalCounter;
+        PartitionDataType *ptr = &GlobalData;
+        ptr->count = val;
+        helper_read_only(&GlobalData);
+    }
+
+    /* ── Scalar copy (not alias) ── */
+    static void func_scalar_copy(void) {
+        uint32 localVal = GlobalCounter;
+        localVal = localVal + 1;
+    }
+""")
+
+
+@pytest.fixture(scope="session")
+def global_refs_c_file(tmp_path_factory):
+    """Write GLOBAL_REFS_C_CODE to a temp .c file."""
+    tmp = tmp_path_factory.mktemp("global_refs_tests")
+    c_file = tmp / "global_refs.c"
+    c_file.write_text(GLOBAL_REFS_C_CODE, encoding="utf-8")
+    return str(c_file)
+
+
+@pytest.mark.skipif(not c_parser.LIBCLANG_AVAILABLE,
+                    reason="libclang not installed")
+class TestEnhancedGlobalRefs:
+    """Tests for the three-layer global variable detection."""
+
+    def _get_refs(self, global_refs_c_file, func_name):
+        """Parse the test file and return global_refs for *func_name*."""
+        result = c_parser.parse(global_refs_c_file, method="clang")
+        func = result["functions"].get(func_name, {})
+        return func.get("global_refs", [])
+
+    # ── Direct access ──────────────────────────────────────────────
+
+    def test_direct_read(self, global_refs_c_file):
+        refs = self._get_refs(global_refs_c_file, "func_direct_read")
+        names = [r["name"] for r in refs]
+        assert "GlobalCounter" in names
+        gr = next(r for r in refs if r["name"] == "GlobalCounter")
+        assert gr["access_type"] == "READ"
+        assert gr["access_context"] == "DIRECT"
+
+    def test_direct_write(self, global_refs_c_file):
+        refs = self._get_refs(global_refs_c_file, "func_direct_write")
+        names = [r["name"] for r in refs]
+        assert "GlobalCounter" in names
+        wr = next(r for r in refs if r["name"] == "GlobalCounter")
+        assert wr["access_type"] == "WRITE"
+        assert wr["access_context"] == "DIRECT"
+
+    # ── Passed to callee ──────────────────────────────────────────
+
+    def test_pass_to_const_callee(self, global_refs_c_file):
+        refs = self._get_refs(global_refs_c_file, "func_pass_const")
+        passed = [r for r in refs
+                  if r.get("access_context") == "PASSED_TO_CALLEE"]
+        assert len(passed) >= 1
+        gr = next(r for r in passed if r["name"] == "GlobalData")
+        assert gr["callee"] == "helper_read_only"
+        assert gr["access_type"] == "READ"  # const param
+
+    def test_pass_to_mutable_callee(self, global_refs_c_file):
+        refs = self._get_refs(global_refs_c_file, "func_pass_mutable")
+        passed = [r for r in refs
+                  if r.get("access_context") == "PASSED_TO_CALLEE"]
+        assert len(passed) >= 1
+        gr = next(r for r in passed if r["name"] == "GlobalData")
+        assert gr["callee"] == "helper_read_write"
+        assert gr["access_type"] == "READ_WRITE"  # non-const param
+
+    # ── Local alias ───────────────────────────────────────────────
+
+    def test_alias_read(self, global_refs_c_file):
+        refs = self._get_refs(global_refs_c_file, "func_alias_read")
+        aliases = [r for r in refs if r.get("access_context") == "ALIAS"]
+        assert len(aliases) >= 1
+        assert any(r["name"] == "GlobalData" for r in aliases)
+
+    def test_alias_write(self, global_refs_c_file):
+        refs = self._get_refs(global_refs_c_file, "func_alias_write")
+        aliases = [r for r in refs if r.get("access_context") == "ALIAS"]
+        assert len(aliases) >= 1
+        assert any(r["name"] == "GlobalData" for r in aliases)
+
+    # ── Mixed scenario ────────────────────────────────────────────
+
+    def test_mixed_all_three_contexts(self, global_refs_c_file):
+        refs = self._get_refs(global_refs_c_file, "func_mixed")
+        contexts = {r.get("access_context") for r in refs}
+        # Should contain at least DIRECT (GlobalCounter) and one of
+        # ALIAS or PASSED_TO_CALLEE (GlobalData)
+        assert "DIRECT" in contexts
+        names = {r["name"] for r in refs}
+        assert "GlobalCounter" in names
+        assert "GlobalData" in names
+
+    def test_mixed_has_direct_and_passed(self, global_refs_c_file):
+        refs = self._get_refs(global_refs_c_file, "func_mixed")
+        passed = [r for r in refs
+                  if r.get("access_context") == "PASSED_TO_CALLEE"]
+        assert len(passed) >= 1
+
+    # ── All refs have required keys ───────────────────────────────
+
+    def test_all_refs_have_access_context(self, global_refs_c_file):
+        result = c_parser.parse(global_refs_c_file, method="clang")
+        for fname, fdata in result["functions"].items():
+            for gr in fdata.get("global_refs", []):
+                assert "access_context" in gr, (
+                    f"Missing access_context in {fname}: {gr}"
+                )
+                assert gr["access_context"] in (
+                    "DIRECT", "PASSED_TO_CALLEE", "ALIAS"
+                ), f"Unexpected access_context in {fname}: {gr['access_context']}"
+
+    def test_passed_refs_have_callee(self, global_refs_c_file):
+        result = c_parser.parse(global_refs_c_file, method="clang")
+        for fname, fdata in result["functions"].items():
+            for gr in fdata.get("global_refs", []):
+                if gr["access_context"] == "PASSED_TO_CALLEE":
+                    assert "callee" in gr and gr["callee"], (
+                        f"Missing callee in PASSED_TO_CALLEE ref in {fname}"
+                    )
+
+    def test_alias_refs_have_alias_local(self, global_refs_c_file):
+        result = c_parser.parse(global_refs_c_file, method="clang")
+        for fname, fdata in result["functions"].items():
+            for gr in fdata.get("global_refs", []):
+                if gr["access_context"] == "ALIAS":
+                    assert "alias_local" in gr and gr["alias_local"], (
+                        f"Missing alias_local in ALIAS ref in {fname}"
+                    )
+
+    # ── Scalar copy should NOT produce ALIAS context ──────────────
+
+    def test_scalar_copy_not_alias(self, global_refs_c_file):
+        """A scalar copy (uint32 localVal = GlobalCounter) must not
+        generate ALIAS refs — only DIRECT."""
+        refs = self._get_refs(global_refs_c_file, "func_scalar_copy")
+        aliases = [r for r in refs if r.get("access_context") == "ALIAS"]
+        assert len(aliases) == 0, (
+            f"Scalar copy should not produce ALIAS refs: {aliases}"
+        )
+        # GlobalCounter should still appear as DIRECT
+        direct = [r for r in refs if r.get("access_context") == "DIRECT"]
+        assert any(r["name"] == "GlobalCounter" for r in direct)

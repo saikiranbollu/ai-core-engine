@@ -1,6 +1,10 @@
 # AI Core Engine — Full Dependencies
 # =====================================
+# Sprint 25: CPU-only PyTorch to avoid ~2.5GB NVIDIA/CUDA downloads.
+
+# ─── Force CPU-only PyTorch (must come before any torch-dependent package) ─
 --extra-index-url https://download.pytorch.org/whl/cpu
+torch
 
 # ─── MCP SDK (Model Context Protocol) ─────────────────────
 mcp>=1.26.0               # includes mcp.server.fastmcp (FastMCP)
@@ -18,8 +22,19 @@ requests>=2.32.0
 
 # ─── LLM & Embeddings ─────────────────────────────────────
 langchain-openai>=0.1.0
-sentence-transformers>=5.0.0
-torch>=2.0.0
+sentence-transformers>=2.2.0  # Required for vector search embeddings & reranker fallback
+
+# ─── Reranking (GAP-A01) ─────────────────────────────────
+flashrank>=0.2.0          # ONNX-based cross-encoder reranking
+
+# ─── Context Compression (GAP-A04) ───────────────────────
+llmlingua>=0.2.0          # Microsoft LongLLMLingua compression
+
+# ─── LLM-as-Judge (GAP-A08) ─────────────────────────────
+deepeval>=1.0.0           # DeepEval relevance/faithfulness metrics
+
+# ─── Citation Verification (GAP-A13) ─────────────────────
+ragchecker>=0.1.0         # Amazon RAGChecker citation verification
 
 # ─── NLP ───────────────────────────────────────────────────
 nltk>=3.9.0
@@ -38,9 +53,15 @@ docx2pdf>=0.1.8
 numpy>=2.0.0
 scipy>=1.10.0
 scikit-learn>=1.0.0
+faiss-cpu>=1.7.0          # FAISS L1 semantic cache (Phase 4.1)
 
 # ─── API Server ───────────────────────────────────────────
 uvicorn>=0.20.0
+gunicorn>=22.0            # Multi-worker ASGI deployment (C06 fix)
+
+# ─── Rate Limiting (C05 fix) ─────────────────────────────
+slowapi>=0.1.9            # ASGI rate limiting middleware
+limits>=3.0.0             # Rate limit backend for slowapi
 
 # ─── Graph Visualization & Analysis ───────────────────────
 networkx>=3.3
@@ -63,9 +84,14 @@ tree-sitter>=0.22
 psycopg2-binary>=2.9      # PostgreSQL (ASPICE audit/feedback/sessions)
 prometheus_client>=0.21   # Prometheus metrics (/metrics endpoint)
 starlette>=0.37           # ASGI routing for /metrics alongside MCP
+apscheduler>=3.10.0       # Background scheduled jobs (Phase 6)
+
+# ─── OpenTelemetry (GAP-A12) ─────────────────────────────
+opentelemetry-api>=1.25.0
+opentelemetry-sdk>=1.25.0
+opentelemetry-exporter-otlp>=1.25.0
 
 # ─── Testing & Linting ────────────────────────────────────
 pytest>=8.0.0
 pytest-asyncio>=0.23
 ruff>=0.4
-

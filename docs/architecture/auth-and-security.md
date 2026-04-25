@@ -62,7 +62,7 @@ DA Request (HTTP)
 
 | Tier | Tools | Typical User | Purpose |
 |------|-------|-------------|---------|
-| **public** | 36 tools | All Domain Assistants | Read-only search, sessions, basic operations |
+| **public** | 34 tools | All Domain Assistants | Read-only search, sessions, basic operations |
 | **developer** | 14 tools | DA developers, operators | Overrides, analytics, validation, RLM access |
 | **admin** | 6 tools | Platform team | Ingestion, data mutation, token management |
 

@@ -536,7 +536,9 @@ def step10_kg_source(module: str, dry_run: bool) -> None:
     cmd = [
         sys.executable, "build_knowledge_graph.py",
         "--profile", "mcal", "--module", module,
-        "--ingest-source", "--source-dir", str(source_dir), "-v",
+        "--ingest-source", "--source-dir", str(source_dir),
+        "--sum-mode",           # auto-discovers configs from Bitbucket
+        "-v",
     ]
     if dry_run:
         cmd.append("--dry-run")
@@ -580,8 +582,8 @@ STEPS: dict[int, dict] = {
     7:  {"fn": step7_rag_ingestion,  "label": "RAG ingestion (Qdrant)",         "needs_module": True},
     8:  {"fn": step8_kg_swa_swud,    "label": "KG ingestion (SWA + SWUD)",      "needs_module": True},
     9:  {"fn": step9_kg_testspec,    "label": "KG ingestion (Test Spec)",       "needs_module": True},
-    10: {"fn": step10_kg_source,     "label": "KG ingestion (Source Code)",     "needs_module": True},
-    11: {"fn": step11_kg_sfr,        "label": "KG ingestion (SFR)",             "needs_module": True},
+    10: {"fn": step11_kg_sfr,        "label": "KG ingestion (SFR → Neo4j)",      "needs_module": True},
+    11: {"fn": step10_kg_source,     "label": "KG ingestion (Source Code)",     "needs_module": True},
 }
 
 

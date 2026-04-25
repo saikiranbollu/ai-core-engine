@@ -1,0 +1,94 @@
+# AICE Test Environment — PostgreSQL 16
+# =======================================
+# Local PostgreSQL for audit logs, feedback, ingestion jobs.
+# Database: aice_meta, User: aice
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-postgres
+  namespace: mcswai
+  labels:
+    app: test-postgres
+    env: test
+spec:
+  selector:
+    app: test-postgres
+    env: test
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: test-postgres
+  namespace: mcswai
+  labels:
+    app: test-postgres
+    env: test
+spec:
+  serviceName: test-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-postgres
+      env: test
+  template:
+    metadata:
+      labels:
+        app: test-postgres
+        env: test
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              value: "aice_meta"
+            - name: POSTGRES_USER
+              value: "aice"
+            - name: POSTGRES_PASSWORD
+              value: "test-password"
+            # Subdirectory avoids chmod issues with OpenShift random UIDs
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "aice"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "aice"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "125m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: test-postgres-data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: test-postgres-data
+        labels:
+          env: test
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

@@ -1,0 +1,42 @@
+# AICE Test Environment — PostgreSQL Schema Init Job
+# ====================================================
+# Creates all 7 ASPICE compliance tables in the test PostgreSQL instance.
+# Uses the MCP server image which contains postgres_schema.py.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-init-postgres
+  namespace: mcswai
+  labels:
+    app: aice-mcp-server
+    env: test
+    component: init
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: test-init-postgres
+        env: test
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init-postgres
+          image: image-registry.openshift-image-registry.svc:5000/mcswai/aice-mcp:latest
+          command:
+            - python
+            - "-m"
+            - "src.Observability.postgres_schema"
+            - "--init"
+          env:
+            - name: POSTGRES_DSN
+              value: "postgresql://aice:test-password@test-postgres:5432/aice_meta"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"

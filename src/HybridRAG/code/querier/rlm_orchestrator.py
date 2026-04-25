@@ -43,6 +43,8 @@ MAX_STEPS = 6
 SUB_BUDGET = 8000
 
 # ── Shared httpx + OpenAI client (connection pooling) ─────────────────
+import threading as _threading
+_rlm_client_lock = _threading.Lock()  # M08 fix: guard global mutable state
 _shared_http_client = None
 _shared_openai_client = None
 _shared_openai_token = None   # tracks token to detect refreshes
@@ -54,31 +56,32 @@ def _get_shared_openai_client():
     Rebuilds only when the auth token has changed (refresh).
     """
     global _shared_http_client, _shared_openai_client, _shared_openai_token
-    from pathlib import Path
-    import httpx
-    from openai import OpenAI
-    from src.HybridRAG.code.token_manager import get_token
+    with _rlm_client_lock:  # M08 fix
+        from pathlib import Path
+        import httpx
+        from openai import OpenAI
+        from src.HybridRAG.code.token_manager import get_token
 
-    token = get_token()
+        token = get_token()
 
-    if _shared_openai_client is not None and token == _shared_openai_token:
+        if _shared_openai_client is not None and token == _shared_openai_token:
+            return _shared_openai_client
+
+        # Build/rebuild httpx client only when needed
+        if _shared_http_client is None:
+            ca_bundle = Path(__file__).resolve().parent.parent / "ca-bundle.crt"
+            if ca_bundle.exists():
+                _shared_http_client = httpx.Client(verify=str(ca_bundle), timeout=httpx.Timeout(60))
+            else:
+                _shared_http_client = httpx.Client(timeout=httpx.Timeout(60))
+
+        _shared_openai_client = OpenAI(
+            base_url="https://gpt4ifx.icp.infineon.com",
+            api_key=token,
+            http_client=_shared_http_client,
+        )
+        _shared_openai_token = token
         return _shared_openai_client
-
-    # Build/rebuild httpx client only when needed
-    if _shared_http_client is None:
-        ca_bundle = Path(__file__).resolve().parent.parent / "ca-bundle.crt"
-        if ca_bundle.exists():
-            _shared_http_client = httpx.Client(verify=str(ca_bundle), timeout=httpx.Timeout(60))
-        else:
-            _shared_http_client = httpx.Client(timeout=httpx.Timeout(60))
-
-    _shared_openai_client = OpenAI(
-        base_url="https://gpt4ifx.icp.infineon.com",
-        api_key=token,
-        http_client=_shared_http_client,
-    )
-    _shared_openai_token = token
-    return _shared_openai_client
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -578,8 +581,16 @@ class RLMOrchestrator:
     # ── Public API ─────────────────────────────────────────────────────
 
     def run(self, query: str, task_type: str = "generic",
-            session_context: Optional[List] = None) -> RLMContext:
-        """Execute multi-step context assembly."""
+            session_context: Optional[List] = None,
+            on_progress: Optional[callable] = None) -> RLMContext:
+        """Execute multi-step context assembly.
+
+        Parameters
+        ----------
+        on_progress : callable, optional
+            Callback ``(step_index: int, total_steps: int, message: str) -> None``
+            invoked after planning and after each sub-query completes.
+        """
         t0 = time.time()
         tt = task_type if task_type in [e.value for e in RLMTaskType] else "generic"
         total_tokens = 0
@@ -588,21 +599,28 @@ class RLMOrchestrator:
         plan, plan_tokens = self._plan(query, tt)
         total_tokens += plan_tokens
         steps = plan.get("steps", [])[:MAX_STEPS]
+        total_steps = len(steps) + 2  # plan + N sub-queries + synthesize
         logger.info("[RLM] Plan: %d steps for task '%s'", len(steps), tt)
+        if on_progress:
+            on_progress(1, total_steps, f"Planned {len(steps)} sub-queries")
 
         # Step 2: Execute sub-queries
         sub_results: List[SubQueryStep] = []
         accumulated: Dict[int, str] = {}
 
-        for step_data in steps:
+        for i, step_data in enumerate(steps):
             sq = self._execute_step(step_data, accumulated)
             sub_results.append(sq)
             accumulated[sq.step_id] = sq.answer
             total_tokens += sq.tokens
+            if on_progress:
+                on_progress(i + 2, total_steps, f"Sub-query {i+1}/{len(steps)} done")
 
         # Step 3: Synthesize
         final, synth_tokens = self._synthesize(query, tt, accumulated, session_context)
         total_tokens += synth_tokens
+        if on_progress:
+            on_progress(total_steps, total_steps, "Synthesis complete")
 
         elapsed = time.time() - t0
         logger.info("[RLM] Complete — %d sub-queries, %d tokens, %.1fs", len(sub_results), total_tokens, elapsed)
@@ -663,8 +681,25 @@ class RLMOrchestrator:
         answer = ""
         if self._search_fn:
             try:
-                results = self._search_fn(query=query, max_results=10,
-                                           alpha=alpha, workspace_id=self.profile)
+                try:
+                    # Intermediate RLM steps should avoid expensive LLM-as-judge.
+                    # We keep judging for non-RLM final contexts.
+                    results = self._search_fn(
+                        query=query,
+                        max_results=10,
+                        alpha=alpha,
+                        workspace_id=self.profile,
+                        skip_judge=True,
+                    )
+                except TypeError:
+                    # Backward compatibility for search_fn implementations
+                    # that do not accept the new parameter yet.
+                    results = self._search_fn(
+                        query=query,
+                        max_results=10,
+                        alpha=alpha,
+                        workspace_id=self.profile,
+                    )
                 sources = results if isinstance(results, list) else results.get("results", [])
                 sources_n = len(sources)
 

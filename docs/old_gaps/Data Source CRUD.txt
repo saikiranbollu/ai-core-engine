@@ -1,0 +1,386 @@
+# Data Source CRUD - Explained
+
+**CRUD** = **Create, Read, Update, Delete** — the four basic operations for managing data.
+
+**Data Source** = where your data lives (database, file system, API, Neo4j, etc.)
+
+## Breaking Down CRUD
+
+| Operation | Meaning | Example |
+|-----------|---------|---------|
+| **C** reate | Add new data | Insert a new function into Neo4j |
+| **R** ead | Retrieve existing data | Query all CXPI functions |
+| **U** pdate | Modify existing data | Change function signature |
+| **D** elete | Remove data | Delete old test case |
+
+## CRUD in Automotive-GraphRAG Context
+
+### Example 1: Knowledge Graph (Neo4j)
+
+```python
+# CREATE - Add a new API function to graph
+def create_api_function(name, signature, module):
+    query = """
+    CREATE (f:Function {
+        name: $name,
+        signature: $signature,
+        module: $module,
+        created_at: datetime()
+    })
+    """
+    neo4j_driver.run(query, name=name, signature=signature, module=module)
+
+# READ - Retrieve function from graph
+def get_api_function(function_name, module):
+    query = """
+    MATCH (f:Function {name: $name, module: $module})
+    RETURN f.name, f.signature, f.depends_on
+    """
+    return neo4j_driver.run(query, name=function_name, module=module)
+
+# UPDATE - Modify function details
+def update_api_function(function_name, new_signature):
+    query = """
+    MATCH (f:Function {name: $name})
+    SET f.signature = $new_sig,
+        f.updated_at = datetime()
+    """
+    neo4j_driver.run(query, name=function_name, new_sig=new_signature)
+
+# DELETE - Remove function from graph
+def delete_api_function(function_name):
+    query = """
+    MATCH (f:Function {name: $name})
+    DELETE f
+    """
+    neo4j_driver.run(query, name=function_name)
+```
+
+### Example 2: Test Results (PostgreSQL or SQLite)
+
+```python
+# CREATE - Store new test result
+def create_test_result(requirement_id, test_name, status, execution_time):
+    query = """
+    INSERT INTO test_results (requirement_id, test_name, status, execution_time, timestamp)
+    VALUES (%s, %s, %s, %s, NOW())
+    """
+    db.execute(query, (requirement_id, test_name, status, execution_time))
+
+# READ - Get test result
+def get_test_result(test_id):
+    query = "SELECT * FROM test_results WHERE id = %s"
+    return db.fetch_one(query, (test_id,))
+
+# UPDATE - Mark test as passed
+def update_test_status(test_id, new_status):
+    query = """
+    UPDATE test_results 
+    SET status = %s, updated_at = NOW()
+    WHERE id = %s
+    """
+    db.execute(query, (new_status, test_id))
+
+# DELETE - Remove old test result
+def delete_test_result(test_id):
+    query = "DELETE FROM test_results WHERE id = %s"
+    db.execute(query, (test_id,))
+```
+
+### Example 3: Vector Embeddings (Qdrant)
+
+```python
+# CREATE - Add vector embedding
+def create_vector_embedding(content, module, data_type):
+    vector = embed_text(content)  # Create 384-dim embedding
+    qdrant.upsert(
+        collection_name=f"proj_a_{module}",
+        points=[{
+            "id": generate_id(),
+            "vector": vector,
+            "payload": {
+                "data_type": data_type,
+                "content": content,
+                "module": module,
+                "created_at": timestamp()
+            }
+        }]
+    )
+
+# READ - Search for similar vectors
+def read_similar_embeddings(query, module, top_k=10):
+    query_vector = embed_text(query)
+    results = qdrant.search(
+        collection_name=f"proj_a_{module}",
+        query_vector=query_vector,
+        limit=top_k
+    )
+    return results
+
+# UPDATE - Update vector metadata
+def update_vector_metadata(vector_id, new_payload):
+    qdrant.update_payload(
+        collection_name="proj_a_cxpi",
+        point_ids=[vector_id],
+        payload=new_payload
+    )
+
+# DELETE - Remove vector
+def delete_vector_embedding(vector_id):
+    qdrant.delete(
+        collection_name="proj_a_cxpi",
+        points_selector=[vector_id]
+    )
+```
+
+## CRUD Operations Flow in Your Project
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Ingestion Pipeline (Add New Module Data)                    │
+├──────────────────────────────────────────────────────────────┤
+│ 1. Parse datasheet                                          │
+│ 2. Extract functions, registers, requirements              │
+│ 3. CREATE in Neo4j → Function nodes created                │
+│ 4. CREATE in Qdrant → Vectors created                      │
+│ 5. CREATE in PostgreSQL → Metadata stored                  │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ Query Operations (Domain Assistants)                         │
+├──────────────────────────────────────────────────────────────┤
+│ User: "Find initialization functions for CXPI"             │
+│ 1. READ from Neo4j → All Function nodes for CXPI           │
+│ 2. READ from Qdrant → Vector similarity search             │
+│ 3. Combine and rank results                                │
+│ 4. Return context to Domain Assistant                      │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ Test Generation & Feedback                                  │
+├──────────────────────────────────────────────────────────────┤
+│ 1. READ from Neo4j → Get function dependencies             │
+│ 2. READ from PostgreSQL → Get previous test results        │
+│ 3. Generate test                                           │
+│ 4. CREATE in PostgreSQL → Store test result                │
+│ 5. UPDATE in Neo4j → Link test to requirement              │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ Module Updates (Maintenance)                                │
+├──────────────────────────────────────────────────────────────┤
+│ 1. New version of CXPI driver released                      │
+│ 2. UPDATE in Neo4j → Function signatures changed           │
+│ 3. DELETE old vectors from Qdrant                          │
+│ 4. CREATE new vectors with updated content                 │
+│ 5. UPDATE version in PostgreSQL metadata                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## CRUD in API Design
+
+Typical REST API uses CRUD:
+
+```python
+# FastAPI example
+from fastapi import FastAPI
+
+app = FastAPI()
+
+# CREATE - POST
+@app.post("/api/functions")
+def create_function(function_data):
+    """Add new API function to Neo4j"""
+    result = neo4j_create_function(function_data)
+    return {"id": result.id, "status": "created"}
+
+# READ - GET
+@app.get("/api/functions/{function_id}")
+def read_function(function_id):
+    """Retrieve function from Neo4j"""
+    result = neo4j_get_function(function_id)
+    return result
+
+# UPDATE - PUT
+@app.put("/api/functions/{function_id}")
+def update_function(function_id, updated_data):
+    """Modify function in Neo4j"""
+    result = neo4j_update_function(function_id, updated_data)
+    return {"status": "updated", "data": result}
+
+# DELETE - DELETE
+@app.delete("/api/functions/{function_id}")
+def delete_function(function_id):
+    """Remove function from Neo4j"""
+    result = neo4j_delete_function(function_id)
+    return {"status": "deleted"}
+```
+
+## CRUD with Different Data Sources
+
+Your project has **multiple data sources**, each with its own CRUD:
+
+### 1. Neo4j Graph (Structural)
+```python
+# CRUD for graph relationships
+CREATE (f:Function) -[:IMPLEMENTS]-> (r:Requirement)
+READ (f:Function) <-[:IMPLEMENTS]- (r:Requirement)
+UPDATE SET f.signature = "new_sig"
+DELETE (f) -[:IMPLEMENTS]-> (r)
+```
+
+### 2. Qdrant Vectors (Semantic)
+```python
+# CRUD for embeddings
+CREATE upsert(point with vector)
+READ search(query_vector, top_k=10)
+UPDATE update_payload(point_id, new_metadata)
+DELETE delete(point_ids)
+```
+
+### 3. PostgreSQL Metadata (Relational)
+```python
+# CRUD for structured data
+CREATE INSERT INTO audit_logs ...
+READ SELECT * FROM audit_logs WHERE ...
+UPDATE UPDATE audit_logs SET ...
+DELETE FROM audit_logs WHERE ...
+```
+
+### 4. Redis Cache (Key-Value)
+```python
+# CRUD for cache
+CREATE SET cache_key, value
+READ GET cache_key
+UPDATE SET cache_key, new_value  # overwrites
+DELETE DEL cache_key
+```
+
+### 5. Filesystem (Documents)
+```python
+# CRUD for files
+CREATE write_file(path, content)
+READ read_file(path)
+UPDATE overwrite_file(path, new_content)
+DELETE remove_file(path)
+```
+
+## CRUD Repository Pattern (Best Practice)
+
+```python
+# data_source_crud.py - Abstract CRUD operations
+from abc import ABC, abstractmethod
+
+class DataSourceCRUD(ABC):
+    """Base class for all data source CRUD operations"""
+    
+    @abstractmethod
+    def create(self, data):
+        pass
+    
+    @abstractmethod
+    def read(self, id):
+        pass
+    
+    @abstractmethod
+    def update(self, id, data):
+        pass
+    
+    @abstractmethod
+    def delete(self, id):
+        pass
+
+class Neo4jCRUD(DataSourceCRUD):
+    """CRUD implementation for Neo4j"""
+    
+    def create(self, function_data):
+        query = "CREATE (f:Function $data) RETURN f"
+        return self.driver.run(query, data=function_data)
+    
+    def read(self, function_id):
+        query = "MATCH (f:Function {id: $id}) RETURN f"
+        return self.driver.run(query, id=function_id)
+    
+    def update(self, function_id, updates):
+        query = "MATCH (f:Function {id: $id}) SET f += $updates RETURN f"
+        return self.driver.run(query, id=function_id, updates=updates)
+    
+    def delete(self, function_id):
+        query = "MATCH (f:Function {id: $id}) DELETE f"
+        return self.driver.run(query, id=function_id)
+
+class PostgresCRUD(DataSourceCRUD):
+    """CRUD implementation for PostgreSQL"""
+    
+    def create(self, data):
+        query = "INSERT INTO test_results (...) VALUES (...) RETURNING *"
+        return self.db.execute(query, data)
+    
+    def read(self, id):
+        query = "SELECT * FROM test_results WHERE id = %s"
+        return self.db.fetch_one(query, (id,))
+    
+    def update(self, id, updates):
+        query = "UPDATE test_results SET ... WHERE id = %s RETURNING *"
+        return self.db.execute(query, (id,) + tuple(updates.values()))
+    
+    def delete(self, id):
+        query = "DELETE FROM test_results WHERE id = %s"
+        return self.db.execute(query, (id,))
+
+# Usage - same interface for different data sources!
+neo4j_crud = Neo4jCRUD(neo4j_driver)
+postgres_crud = PostgresCRUD(db_connection)
+
+# Both use same CRUD interface
+neo4j_crud.create({"name": "IfxCxpi_init", module: "cxpi"})
+postgres_crud.create({"test_name": "test_cxpi", "status": "pass"})
+```
+
+## Summary Table
+
+| Operation | Example | Purpose |
+|-----------|---------|---------|
+| **CREATE** | `INSERT`, `CREATE (node)`, `upsert()` | Add new data to data source |
+| **READ** | `SELECT`, `MATCH`, `search()` | Retrieve existing data |
+| **UPDATE** | `UPDATE SET`, `SET f +=`, `update()` | Modify existing data |
+| **DELETE** | `DELETE`, `DELETE (node)`, `delete()` | Remove data entirely |
+
+## Where CRUD Appears in Your Project
+
+```
+packages/graphrag_core/
+├─ engine/
+│  └─ graphrag_engine.py      ← READ operations (queries)
+├─ ingestion/
+│  └─ ingestion_pipeline.py   ← CREATE operations (parsing & storing)
+└─ memory/
+   └─ memory_layer.py         ← READ/UPDATE operations
+
+apps/test_generator/
+├─ generator/
+│  └─ test_generator.py       ← READ (pull context) → CREATE (generate)
+└─ validation/
+   └─ enhanced_validator.py   ← READ (validate against stored rules)
+
+apps/code_reviewer/
+├─ review/
+│  └─ code_review_engine.py   ← READ (pull rules) → UPDATE (store findings)
+```
+
+## TL;DR
+
+**CRUD = The four basic operations to manage any data source:**
+
+- **C**reate: Add new data (INSERT, POST)
+- **R**ead: Get existing data (SELECT, GET)
+- **U**pdate: Modify data (UPDATE, PUT)
+- **D**elete: Remove data (DELETE)
+
+**In automotive-graphrag context:**
+- CREATE when ingesting new datasheets/modules
+- READ when querying for test generation context
+- UPDATE when modifying function signatures or test results
+- DELETE when removing old/deprecated modules
+
+Most APIs and database operations follow CRUD patterns.

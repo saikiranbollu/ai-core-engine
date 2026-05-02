@@ -26,7 +26,7 @@ The Ingestion Pipeline transforms raw engineering artifacts (source code, specif
 ```
 Source Files          Connectors              Ingestion Service
 ─────────────        ──────────              ─────────────────
-.c/.h files ──┐                             ┌─ Parse (14 parsers)
+.c/.h files ──┐                             ┌─ Parse (17 parsers)
 .arxml files ─┤                             │
 .pdf files ───┤                             ├─ Extract nodes + relationships
 .xlsx files ──┤──► IngestionService ────────┤
@@ -41,20 +41,21 @@ Polarion ─────┘                         │
                               Same write pipeline
 ```
 
-All ingestion tools require **admin** tier authorization (Cerbos RBAC).
+> **Important**: Direct ingestion MCP tools were removed from the MCP interface in Sprint 17 (Plan 2, Phase 2). The `IngestionService` and all 17 parsers remain as library code used by the platform team. For per-session user document ingestion, DAs use `sandbox_upload`.
 
 ---
 
 ## 2. Ingestion Modes
 
-| Mode | Tool | Scope | Use Case |
-|------|------|-------|----------|
-| **Single file** | `ingest_file` | One file | Quick testing, targeted updates |
-| **Module** | `ingest_module_from_repo` | All files in a module directory | Module onboarding |
-| **Batch** | `batch_ingest_modules` | Multiple modules in parallel | Bulk onboarding |
+> These modes are invoked by the platform team directly via the `IngestionService` class. They are not exposed as MCP tools.
 
-Sprint 9: `batch_ingest()` uses `ThreadPoolExecutor(max_workers=4)` with `as_completed()` for parallel module processing (~4x speedup).
-| **Repository** | `ingest_repository` | Auto-discover and ingest all modules | Initial setup |
+| Mode | Method | Scope | Use Case |
+|------|--------|-------|----------|
+| **Single file** | `ingest_file()` | One file | Targeted update |
+| **Module** | `ingest_module()` | All files in a module directory | Module onboarding |
+| **Batch** | `batch_ingest()` | Multiple modules in parallel | Bulk onboarding (uses `ThreadPoolExecutor(max_workers=4)`) |
+| **Repository** | `ingest_repository()` | Auto-discover and ingest all modules | Initial setup |
+| **Per-session (DA)** | `sandbox_upload` MCP tool | User-provided docs → ephemeral store | DA developer workflow |
 
 ### Single File Flow
 
@@ -88,7 +89,7 @@ repo_root/
 
 ## 3. Parser Architecture
 
-14 specialized parsers handle different file formats. Each parser extracts typed nodes and relationships following the ontology schema.
+17 specialized parsers handle different file formats. Each parser extracts typed nodes and relationships following the ontology schema.
 
 ### Parser Registry
 
@@ -105,8 +106,12 @@ repo_root/
 | `swa_parsers.py` | SW Architecture docs | Components, interfaces, ports, connections | Structure-aware parsing |
 | `illd_swa_parser.py` | iLLD SW Architecture | iLLD-specific architecture elements | Custom parsing |
 | `testspec_parsers.py` | Test specifications | Test cases, test steps, expected results | Structure-aware parsing |
-| `regdef_parser.py` | Register definitions | Registers, bitfields, addresses, reset values | Custom parsing |
+| `sfr_parser.py` | SFR/Register definitions | Special Function Registers, bitfields, addresses, reset values, access types | Custom parsing |
 | `doxygen_parser.py` | Doxygen comments | API documentation, parameter descriptions | Comment extraction |
+| `hw_spec_parser.py` | HW specification PDFs | Hardware peripheral specs, register maps from datasheets | Structure-aware parsing |
+| `ocr_processor.py` | Scanned PDFs / images | OCR-extracted text from scanned documents | Tesseract OCR |
+| `header_fetcher.py` | Remote headers | Fetches and caches header files from remote repositories | HTTP fetch + caching |
+| `auto_stub_generator.py` | Stub generation | Generates function stubs from header declarations | C AST analysis |
 | JSON / text | `.json`, `.md`, `.txt`, `.csv` | Generic key-value, text content | Standard library |
 
 ### Parser Output Format
@@ -276,7 +281,7 @@ fail(job_id, error_message)
     → status: "failed", error: "..."
 ```
 
-Sprint 9: Added `update_progress()` method to `IngestionJobTracker` for automatic progress calculation from completed/total module counts during batch ingestion.
+Added `update_progress()` method to `IngestionJobTracker` for automatic progress calculation from completed/total module counts during batch ingestion.
 
 ### Progress Stages
 

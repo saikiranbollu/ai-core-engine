@@ -20,7 +20,7 @@
 
 ## 1. Overview
 
-The AI Core Engine (AICE) MCP server exposes **56 tools across 13 categories** for automotive embedded software development. Domain Assistants (DAs) connect via the Model Context Protocol (MCP) over HTTP (`streamable-http`).
+The AI Core Engine (AICE) MCP server exposes **55 tools across 14 categories** for automotive embedded software development. Domain Assistants (DAs) connect via the Model Context Protocol (MCP) over HTTP (`streamable-http`).
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -179,9 +179,9 @@ The AICE server uses a three-tier role-based access control system:
 
 | Tier | Access | Tool Count |
 |------|--------|-----------|
-| **public** | Basic search, sessions, feedback | 34 |
-| **developer** | + graph traversal, analytics, visualization | 14 |
-| **admin** | + ingestion, cache management, token refresh | 8 |
+| **public** | Basic search, sessions, feedback, confidence scoring | 34 |
+| **developer** | + graph traversal, analytics, visualization, `query_enhance` | 16 |
+| **admin** | + cache management (`invalidate`, `clear`, `refresh_config`), token refresh | 5 |
 
 Hierarchy: `admin ⊃ developer ⊃ public` — higher tiers inherit all lower-tier permissions.
 
@@ -293,25 +293,23 @@ find_coverage_gaps(module="Adc", workspace="mcal")
 analyze_hw_sw_links(module="Adc", workspace="illd")
 ```
 
-### 5.5 Ingestion (Category 5 — Admin)
+### 5.5 Ingestion (Category 5 — Platform Operation Only)
+
+> **Important**: The direct ingestion MCP tools (`ingest_file`, `ingest_module_from_repo`, `batch_ingest_modules`, `ingest_repository`) were removed from the MCP interface in Sprint 17. Production knowledge base ingestion is handled by the platform team.
+>
+> **For DA developers**: Use `sandbox_upload` to load user-provided documents into a per-session ephemeral store (see Section 5.7).
 
 ```python
-# Single file
-ingest_file(file_path="/repo/Adc/src/Adc.c",
-            workspace="illd", module="Adc")
+# Upload user documents to your session's ephemeral store
+sandbox_upload(session_id="CIA_20260322_001",
+               file_path="/path/to/customer_spec.pdf")
 
-# Entire module
-ingest_module_from_repo(repo_path="/repo", module="Adc",
-                        workspace="illd")
-
-# Multiple modules
-batch_ingest_modules(repo_path="/repo",
-                     modules=["Adc", "Spi", "Can"],
-                     workspace="illd")
-
-# Full repository
-ingest_repository(repo_path="/repo", workspace="illd")
+# Then query them
+sandbox_query(session_id="CIA_20260322_001",
+              query="ADC timing requirements")
 ```
+
+For production ingestion requests, contact the **platform team** with the repository path and target workspace.
 
 ### 5.6 Session & Context (Category 6)
 
@@ -356,6 +354,21 @@ sandbox_status(session_id="CIA_20260322_001")
 sandbox_clear(session_id="CIA_20260322_001")
 ```
 
+### 5.7b Sandbox Diff
+
+```python
+# See what changed in your sandbox vs production knowledge
+sandbox_diff(session_id="CIA_20260322_001")
+# Returns: nodes_added, nodes_modified (with before/after), nodes_unchanged, edges counts
+```
+
+### 5.7c HSI — Hardware-Software Interface (Category 5b)
+
+```python
+# Get SWUD-format HSI data for a function: registers + global vars + events
+get_function_hsi(function_name="Adc_Init", module="Adc", profile="mcal")
+```
+
 ### 5.8 RLM — Multi-Step Context (Category 6+)
 
 ```python
@@ -389,6 +402,9 @@ cache_invalidate_module(module="Adc")
 
 # Clear all caches (admin)
 cache_clear(tier="all")
+
+# Reload cache config from env vars without restart (admin)
+cache_refresh_config()
 ```
 
 ### 5.10 Feedback & Learning (Category 8)
@@ -457,7 +473,17 @@ override_review_routing(review_id="rev-001",
 get_review_analytics()
 ```
 
-### 5.12 Observability (Category 11)
+### 5.12 Query Enhancement (Category 14 — GAP v2)
+
+```python
+# Analyze query complexity and get search strategy recommendations (developer tier)
+query_enhance(query="Find all ADC functions that access SFR registers in trust zone 1",
+              include_synonyms=False)
+# Returns: complexity=COMPLEX, strategy=GRAPH_HEAVY, suggested_alpha=0.2,
+#          detected_entities=["ADC"], detected_modules=["Adc"]
+```
+
+### 5.13 Observability (Category 11)
 
 ```python
 # System health

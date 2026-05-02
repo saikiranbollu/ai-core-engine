@@ -145,12 +145,14 @@ sandbox_upload(file_path)
     ├── Add nodes/edges to EphemeralGraph (NetworkX)
     └── Index content in EphemeralVectors (keyword index)
 
-sandbox_query(query)
-    │
-    ├── Search EphemeralGraph (property matching)
-    ├── Search EphemeralVectors (keyword matching)
-    └── Merge and return results
+sandbox_status()        → file count, node count, storage stats
+sandbox_clear()         → explicitly release sandbox storage
+sandbox_diff()          → diff sandbox nodes vs production counterparts
+                            returns: nodes_added, nodes_modified (with before/after),
+                                     nodes_unchanged count, edges_added, edges_total
 ```
+
+> **Note**: `sandbox_query` was deprecated in Plan 2 Phase 6. Use `search_database(session_id=<id>)` instead — it routes queries through the sandbox when a session is active.
 
 ### Resource Limits
 
@@ -167,6 +169,17 @@ sandbox_query(query)
 - `IfxCan_Node_initBitTiming` → `["Ifx", "Can", "Node", "init", "Bit", "Timing"]`
 - Queries are also split and matched against the index
 - No embedding model needed — lightweight for temporary use
+
+### HSI Tool (Category 5b — related to Sandbox context)
+
+`get_function_hsi` extracts the Hardware-Software Interface (HSI) section for a function in SWUD format. It complements the sandbox by providing structured hardware access data:
+
+- **Registers accessed**: SFR name, access type (R/W/RW), trust zone, line numbers
+- **Global/shared variables**: variable name, access type, data type, via_chain
+- **Events**: hardware events triggered
+- **summary_text**: Markdown-formatted SWUD HSI section ready for documentation
+
+Use `get_function_hsi` when you need the precise hardware footprint of a function, not general code context.
 
 ---
 

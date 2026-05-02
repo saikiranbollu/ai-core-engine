@@ -10,7 +10,7 @@ Multiple access points:
 
 - VS Code Extension (e.g., CARL The Coder)
 - CLI tools (technology supported but not available in IFX)
-- MCP server (available for IFX users from Jan 2026)
+- MCP server with 55 tools across 14 categories (available for IFX users from Jan 2026)
 - GitHub Copilot prompt
 - GPT4IFX API
 
@@ -92,7 +92,7 @@ Chain of custody for AI-generated artifacts:
 Triple storage architecture:
 
 - Neo4j: knowledge graph (nodes, relationships)
-- Qdrant: vector embeddings (1536-dim)
+- Qdrant: vector embeddings (384-dim, all-MiniLM-L6-v2)
 - PostgreSQL metadata store: provenance, audit trail, and metadata
 
 Additional storage features:

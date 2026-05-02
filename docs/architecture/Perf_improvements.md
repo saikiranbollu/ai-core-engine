@@ -20,12 +20,12 @@ Adapt 8 proven DocJockey patterns (parallel init, batch ingestion, UNWIND graph 
 - **Status**: 🟡 Main had 29 `to_thread` calls. ✅ Branch extends to 63 (all remaining tool handlers wrapped).
 - **Verification**: Run existing unit tests `tests/unit/test_sprint*.py`; add a simple async integration test that calls two tools concurrently to confirm no event-loop blocking.
 
-### Step 1.2: Parallel service initialization at startup ✅
+### Step 1.2: Parallel service initialization at startup ⚠️ PARTIAL
 - **Problem**: AICE lazy-initializes Neo4j, Qdrant, Redis, Cerbos sequentially on first call
 - **Template**: DocJockey `rag_pipeline.py` L112-132 — `asyncio.create_task()` + `asyncio.gather()` for 4 services
 - **File**: `mcp/app.py` and `mcp/core/mcp_server.py` (lazy-init functions `_get_neo4j()`, `_get_qdrant()` at L200-265)
 - **Change**: Add an `async def _warm_backends()` function that creates tasks for Neo4j driver, Qdrant client, Redis, and embedding model initialization — run them with `asyncio.gather()` during server startup in `app.py`. Keep lazy-init as fallback for graceful degradation.
-- **Status**: ✅ `_warm_backends()` added to `mcp_server.py` — parallel-inits Neo4j (illd + mcal), Qdrant, Redis, PostgreSQL, CacheService with per-service error handling.
+- **Status**: ⚠️ `_warmup()` function exists in `mcp_server.py` and is called at startup, but it initializes Qdrant, SearchService, and CacheService **sequentially** (one after another) — NOT via `asyncio.gather()`. The plan for true parallel init via `asyncio.gather()` is not yet implemented.
 - **Verification**: Measure first-tool latency before/after; confirm backends are ready at startup via `health_check` tool.
 
 ---
@@ -80,11 +80,13 @@ Adapt 8 proven DocJockey patterns (parallel init, batch ingestion, UNWIND graph 
 
 ---
 
-## Phase 4: Hybrid Semantic Cache — FAISS L1 + RediSearch L2 (P2) ✅ IMPLEMENTED
+## Phase 4: Hybrid Semantic Cache — FAISS L1 + RediSearch L2 (P2) ❌ NOT IMPLEMENTED
+
+> **Status**: This entire phase was planned but never implemented. The actual `cache_service.py` uses a simple 2-tier design: LRU exact match → `SemanticCache` with O(n) cosine scan via `sentence-transformers`. There is no FAISS, no RediSearch, no `AICE_CACHE_L2_REDIS` flag, and no `faiss-cpu` dependency. All claims of ✅ below reflect the original plan, not the current code.
 
 **Context**: With 50+ modules × 2 workspaces, semantic cache scales to ~25K-50K entries (384-dim, ~73MB). Current pure-Python linear scan is O(n) — unusable at scale. Hybrid approach gives sub-millisecond in-process lookups + shared persistence across pods.
 
-### Step 4.1: Add FAISS as in-process L1 semantic cache ✅
+### Step 4.1: Add FAISS as in-process L1 semantic cache ❌ NOT IMPLEMENTED
 - **Problem**: `SemanticCache.get()` at `cache_service.py` L90-110 does O(n) dot products per lookup (pure Python `_cosine()`, not even NumPy)
 - **File**: `src/Configuration/cache_service.py` L90-110
 - **Change**:
@@ -99,7 +101,7 @@ Adapt 8 proven DocJockey patterns (parallel init, batch ingestion, UNWIND graph 
 - **Performance**: <0.1ms for 50K vectors (SIMD-optimized brute-force). Only need `IndexIVFFlat` beyond ~1M vectors.
 - **Limitation**: Cache lost on process restart — acceptable for single-instance; addressed by L2 in Step 4.2.
 
-### Step 4.2: Add RediSearch VSS as shared L2 semantic cache *(depends on 4.1, targets multi-pod K8s)* ✅
+### Step 4.2: Add RediSearch VSS as shared L2 semantic cache *(depends on 4.1, targets multi-pod K8s)* ❌ NOT IMPLEMENTED
 - **Problem**: In K8s with multiple MCP pods, each pod has its own FAISS L1 = cold caches per pod, no sharing
 - **Prerequisite**: Redis server must have the RediSearch module loaded (`redis-stack` Docker image or `LOADMODULE /path/to/redisearch.so`)
 - **File**: `src/Configuration/cache_service.py` — add `RediSearchSemanticCache` class
@@ -113,12 +115,12 @@ Adapt 8 proven DocJockey patterns (parallel init, batch ingestion, UNWIND graph 
 - **Performance**: ~1-5ms per L2 lookup (network hop), still 100x faster than full RAG search (~100-500ms)
 - **Note**: Can be feature-flagged (`AICE_CACHE_L2_REDIS=true`) — disabled by default for single-instance deployments
 
-### Step 4.3: Update `CacheService` to 3-tier lookup ✅
+### Step 4.3: Update `CacheService` to 3-tier lookup ❌ NOT IMPLEMENTED
 - **File**: `src/Configuration/cache_service.py` — `CacheService.get()`
 - **Change**: Update flow to: LRU (exact match) → FAISS L1 (in-process semantic) → RediSearch L2 (shared semantic, if enabled) → RAG
 - **Cache put**: Write to all tiers (LRU + FAISS L1 + RediSearch L2)
 - **Metrics**: Add `CACHE_REQUESTS_TOTAL` labels for `faiss_l1` and `redis_l2` tiers in `mcp_server.py`
-- **Status**: ✅ `CacheService` upgraded to 3-tier: LRU → FAISS L1 → RediSearch L2 → RAG. `RediSearchSemanticCache` class added, feature-flagged via `AICE_CACHE_L2_REDIS`. `faiss-cpu>=1.7.0` added to `requirements.txt`.
+- **Actual status**: `CacheService` remains 2-tier: LRU → `SemanticCache` (O(n) cosine scan). No FAISS, no RediSearch L2, no `AICE_CACHE_L2_REDIS` flag.
 
 **Verification**:
 - Existing cache tests in `tests/unit/test_sprint8_fixes.py` must pass
@@ -127,13 +129,13 @@ Adapt 8 proven DocJockey patterns (parallel init, batch ingestion, UNWIND graph 
 
 ---
 
-## Phase 5: Streaming Responses for MCP (Enhancement) ✅ IMPLEMENTED
+## Phase 5: Streaming Responses for MCP (Enhancement) ❌ NOT WIRED IN MCP
 
-### Step 5.1: Add SSE streaming to long-running tools ✅
+### Step 5.1: Add SSE streaming to long-running tools ❌ NOT WIRED
 - **Template**: DocJockey's `combined_responses()` async generator in `rag_pipeline.py` L183-410 — SSE format with `"data: "` prefix
 - **File**: `mcp/core/mcp_server.py` — `rlm_orchestrate` tool handler
-- **Change**: `rlm_orchestrate` now accepts `ctx: Context` (FastMCP SDK injection). The sync `on_progress` callback bridges to async `ctx.report_progress(step, total)` and `ctx.info(msg)` via `asyncio.run_coroutine_threadsafe()` from the worker thread. Progress notifications stream over SSE/streamable-HTTP transports in real time.
-- **Status**: ✅ Implemented. `Context` imported from FastMCP SDK alongside `FastMCP` in the import shim. Best-effort delivery — notification failures don't break RLM execution.
+- **Change**: `rlm_orchestrate` should accept `ctx: Context` (FastMCP SDK injection). The sync `on_progress` callback should bridge to async `ctx.report_progress(step, total)` and `ctx.info(msg)` via `asyncio.run_coroutine_threadsafe()` from the worker thread.
+- **Actual status**: The `on_progress` callback parameter exists in `RLMOrchestrator.run()` and is wired internally (fires after planning, each sub-query, and synthesis). However, the `rlm_orchestrate` MCP tool handler calls `rlm.run()` with **no callback** (`await asyncio.to_thread(rlm.run, query=query, task_type=task_type, session_context=None)`). No `ctx.report_progress()` call is made — there is no SSE streaming from the MCP layer.
 - **Depends on**: Phase 1 (async tools must be working first)
 - **Verification**: Manual test with MCP client over streamable-http transport; confirm intermediate progress notifications arrive before final response.
 
@@ -155,9 +157,9 @@ Adapt 8 proven DocJockey patterns (parallel init, batch ingestion, UNWIND graph 
 - **Parallel with**: Any phase
 - **Verification**: Check logs for periodic health check output; confirm scheduler shutdown on SIGTERM.
 
-### Additional: RLM Progress Reporting ✅
+### Additional: RLM Progress Reporting ⚠️ PARTIAL
 - **File**: `src/HybridRAG/code/querier/rlm_orchestrator.py`
-- **Status**: ✅ Added `on_progress` callback to `RLMOrchestrator.run()` — invoked after planning, each sub-query, and synthesis. The `rlm_orchestrate` tool handler logs step-by-step progress. (Prerequisite for Phase 5 streaming.)
+- **Status**: ⚠️ `on_progress` callback parameter exists in `RLMOrchestrator.run()` and fires internally after planning, each sub-query, and synthesis. However, the `rlm_orchestrate` MCP tool handler passes **no callback** to `rlm.run()` — progress events are never surfaced at the MCP layer. The MCP SSE wiring (Phase 5) is not implemented.
 
 ---
 
@@ -165,14 +167,14 @@ Adapt 8 proven DocJockey patterns (parallel init, batch ingestion, UNWIND graph 
 
 | File | Phase | Change | Status |
 |------|-------|--------|--------|
-| `mcp/core/mcp_server.py` | 1 | Async tool wrappers (29→63), `_warm_backends()` | ✅ |
+| `mcp/core/mcp_server.py` | 1, 5 | Async tool wrappers (`to_thread`), `_warmup()` sequential | ⚠️ (1.1 ✅, 1.2 sequential not parallel, Phase 5 not wired) |
 | `mcp/app.py` | 1, 6 | Startup warm-up, APScheduler | ✅ |
 | `src/HybridRAG/code/querier/search_service.py` | 2 | UNWIND + fulltext fallback | ✅ (UNWIND 🟡, fulltext ✅) |
 | `src/HybridRAG/code/neo4j_manager.py` | 2 | `ensure_fulltext_index()` | ✅ |
 | `src/IngestionPipeline/ingestion_service.py` | 3 | ThreadPool + progress | ✅ (batch writes ❌) |
-| `src/Configuration/cache_service.py` | 4 | FAISS L1 + RediSearch L2 + 3-tier | ✅ |
+| `src/Configuration/cache_service.py` | 4 | FAISS L1 + RediSearch L2 + 3-tier | ❌ (2-tier only: LRU + SemanticCache O(n)) |
 | `src/HybridRAG/code/querier/rlm_orchestrator.py` | Enh | `on_progress` callback | ✅ |
-| `requirements.txt` | 3, 4, 6 | `faiss-cpu`, `apscheduler` | ✅ |
+| `requirements.txt` | 3, 6 | `apscheduler` (confirmed); `faiss-cpu` not added (Phase 4 not impl) | ⚠️ |
 
 ### Reference templates (DocJockey)
 - `docjockey-backend/src/pipeline/rag_pipeline.py` L112-132 — Parallel init pattern
@@ -191,21 +193,20 @@ Adapt 8 proven DocJockey patterns (parallel init, batch ingestion, UNWIND graph 
    - Phase 1: First-tool latency (target: <500ms vs current cold-start)
    - Phase 2: Query count per search (target: 1-3 vs current 50-200)
    - Phase 3: 10-module ingestion time (target: 4x speedup with 4 workers)
-   - Phase 4: Cache lookup — FAISS L1 <0.1ms at 50K entries, RediSearch L2 <5ms, vs current ~5-10ms at 500 entries
+   - Phase 4 (❌ not impl): If implemented — FAISS L1 <0.1ms at 50K entries, RediSearch L2 <5ms; current SemanticCache is ~5-10ms at ≤500 entries
 4. **Health check**: `health_check(verbose=true)` after deployment
 5. **Load test**: 10 concurrent MCP tool calls — confirm no event-loop blocking (Phase 1 validation)
-6. **Multi-pod cache test** (Phase 4): 2 MCP instances sharing Redis → confirm L2 hit on pod B for query cached by pod A
 
 ## Decisions
 
-- **Hybrid FAISS + RediSearch for semantic cache** — FAISS as L1 (in-process, <0.1ms) for hot path; RediSearch as L2 (shared, ~2ms) for multi-pod persistence. At 50K entries / 384 dims, FAISS `IndexFlatIP` is trivial (<0.1ms SIMD brute-force). RediSearch L2 is feature-flagged, disabled for single-instance. Only need ANN indices beyond ~1M vectors.
+- **Hybrid FAISS + RediSearch for semantic cache** — *Planned but not implemented*. Current implementation uses a 2-tier cache (LRU + SemanticCache with O(n) cosine scan). FAISS as L1 and RediSearch L2 remain as a future improvement for scaling beyond 500 cached entries.
 - **ThreadPoolExecutor over asyncio for ingestion** — Ingestion is CPU-bound (parsing) + I/O-bound (Neo4j/Qdrant writes); ThreadPool handles both; asyncio alone won't help with CPU work
 - **Full-text index over dynamic Cypher** — Neo4j full-text indexes are Lucene-backed, orders of magnitude faster than `toLower(CONTAINS)` pattern matching
 - **Phases are ordered by impact**: P0 fixes first (sync I/O, N+1 queries), then P1 (batch ingestion), P2 (cache), then enhancements (streaming, scheduler)
 
 ## Scope
 
-- **Included**: Async patterns, batch processing, hybrid cache optimization (FAISS L1 + RediSearch L2), streaming, scheduling
+- **Included**: Async patterns (Phase 1 ✅), batch processing (Phase 3 ✅), scheduled jobs (Phase 6 ✅), graph query consolidation (Phase 2 ✅); hybrid cache (Phase 4 ❌ not impl), SSE streaming (Phase 5 ❌ not wired)
 - **Excluded**: DocJockey's aiomysql patterns (AICE uses PostgreSQL not MySQL), permission sync cron jobs (AICE uses Cerbos RBAC not source-level permissions), reranking service (AICE deferred cross-encoder per ADR-018)
 
 -----------------------------

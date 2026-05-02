@@ -74,7 +74,7 @@ Tiers are hierarchical — higher tiers inherit all permissions from lower tiers
 admin ⊃ developer ⊃ public
 ```
 
-An admin API key can invoke all 56 tools. A developer key can invoke public + developer tools (50 tools). A public key is limited to 36 tools.
+An admin API key can invoke all 55 tools. A developer key can invoke public + developer tools (50 tools). A public key is limited to 34 tools.
 
 This inheritance is implemented via **Cerbos derived roles** in `policies/derived_roles.yaml`.
 

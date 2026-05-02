@@ -120,6 +120,8 @@ class RLMTaskType(str, Enum):
     # Infrastructure
     KNOWLEDGE_INGESTION = "knowledge_ingestion"
     STOP_TYPING = "stop_typing"
+    # HSI
+    HSI_ANALYSIS = "hsi_analysis"
     GENERIC = "generic"
 
 
@@ -379,6 +381,19 @@ _PLAN_CONTEXT = {
         "Do NOT over-decompose. Speed over comprehensiveness. "
         "Use alpha=0.5 balanced."
     ),
+    "hsi_analysis": (
+        "HSI (Hardware-Software Interface) analysis for AUTOSAR MCAL function. "
+        "This produces SWUD-format HSI documentation. "
+        "Step 1 (alpha=0.8): Query the function's SRC_ACCESSES_SFR relationships "
+        "to get all SFR registers accessed, with access_type (READ/WRITE), field, line number. "
+        "Step 2 (alpha=0.8): Query the function's SRC_USES_GLOBAL relationships "
+        "to get all global/shared variables used, with access_type, via_chain, data_type. "
+        "Step 3 (alpha=0.8): Query EA_Register nodes for trust zone data "
+        "(read_apu, write_apu, cpu_mode) for each register found in step 1. "
+        "Also query EA_Function -> EA_ACCESSES_REGISTER for additional register access info. "
+        "IMPORTANT: Include the exact function name in every sub-query. "
+        "Keep to 3 steps max — this is a structured extraction, not a broad search."
+    ),
     "generic": "General automotive embedded software knowledge base query.",
 }
 
@@ -500,7 +515,35 @@ _SYNTH_INSTRUCTIONS = {
         "Synthesise a concise, focused answer. Keep it short and direct — "
         "quick lookup, not comprehensive analysis."
     ),
-    "generic": "Synthesise a comprehensive answer from the gathered knowledge.",
+    "hsi_analysis": (
+        "Synthesise the HSI (Hardware-Software Interface) section in SWUD format. "
+        "You MUST produce THREE tables:\n"
+        "1. **SFR Registers Accessed** table with columns: "
+        "Register Name | Access Type (READ/WRITE) | Field | Line | Trust Zone | Description\n"
+        "2. **Global/Shared Variables** table with columns: "
+        "Variable Name | Access Type (READ/WRITE/READ_WRITE) | Data Type | Via Chain | Description\n"
+        "3. **Events** table (or 'None' if no events)\n\n"
+        "RULES:\n"
+        "- For each register, append access type abbreviation: e.g. ADC_SUPLLEV(w) for WRITE\n"
+        "- Trust zone: cite read_apu/write_apu values. PTOP = Untrusted, PCPU = Trusted\n"
+        "- For global variables, show the via_chain if present (e.g. ConfigPtr->PartitionConfigPtr)\n"
+        "- Group partition-specific variables (e.g. list all 7 Adc_kEcucPartition_X_ConfigPtr together)\n"
+        "- Include access line numbers when available\n"
+        "- Do NOT add registers or variables that are not in the sub-query data\n"
+        "- Do NOT paraphrase — use exact names from the data"
+    ),
+    "generic": (
+        "Synthesise a comprehensive, citation-rich answer from the gathered knowledge. "
+        "CRITICAL: You MUST cite specific entity names, register names, variable names, "
+        "property values, and relationship details exactly as they appear in the sub-query data. "
+        "Do NOT paraphrase concrete data into vague categories. "
+        "For SFR registers: cite the exact register name, access type (READ/WRITE), line number. "
+        "For global variables: cite the exact variable name, data type, access_type, via_chain if present. "
+        "For functions: cite parameters, return type, register_accesses, traceability IDs. "
+        "For HSI details: cite trust zone (read_apu, write_apu), cpu_mode, device. "
+        "Use markdown tables or structured lists for clarity. "
+        "If a piece of data appears in the sub-query results, it MUST appear in your answer."
+    ),
 }
 
 
@@ -509,8 +552,11 @@ _SYNTH_INSTRUCTIONS = {
 # ═════════════════════════════════════════════════════════════════════════
 
 REGISTER_KEYWORDS = {"register", "bitfield", "sfr", "clc", "krst", "globcon",
-                     "hwreg", "peripheral", "dma", "interrupt", "isr"}
+                     "hwreg", "peripheral", "dma", "interrupt", "isr",
+                     "hsi", "trust zone", "trust_zone", "apu", "hardware-software"}
 ASIL_KEYWORDS = {"asil-b", "asil-c", "asil-d", "safety-critical", "iso26262", "iso 26262"}
+HSI_KEYWORDS = {"hsi", "trust zone", "hardware-software interface", "hardware software interface",
+                "read_apu", "write_apu", "access type", "global variable"}
 
 
 def should_use_rlm(query: str, task_type: str = "generic") -> bool:
@@ -528,7 +574,7 @@ def should_use_rlm(query: str, task_type: str = "generic") -> bool:
     if any(kw in query_lower for kw in ASIL_KEYWORDS):
         signals += 1
     # Always use RLM for certain task types (inherently complex)
-    if task_type in ("traceability", "debug_analysis", "architecture_analysis"):
+    if task_type in ("traceability", "debug_analysis", "architecture_analysis", "hsi_analysis"):
         signals += 2
     return signals >= 2
 
@@ -684,22 +730,20 @@ class RLMOrchestrator:
                 try:
                     # Intermediate RLM steps should avoid expensive LLM-as-judge.
                     # We keep judging for non-RLM final contexts.
-                    results = self._search_fn(
-                        query=query,
-                        max_results=10,
-                        alpha=alpha,
-                        workspace_id=self.profile,
-                        skip_judge=True,
-                    )
+                    search_kwargs = dict(query=query, max_results=20,
+                                         alpha=alpha, workspace_id=self.profile,
+                                         skip_judge=True)
+                    if self.module:
+                        search_kwargs["filter_by_module"] = self.module
+                    results = self._search_fn(**search_kwargs)
                 except TypeError:
                     # Backward compatibility for search_fn implementations
-                    # that do not accept the new parameter yet.
-                    results = self._search_fn(
-                        query=query,
-                        max_results=10,
-                        alpha=alpha,
-                        workspace_id=self.profile,
-                    )
+                    # that do not accept the new parameters yet.
+                    search_kwargs = dict(query=query, max_results=10,
+                                         alpha=alpha, workspace_id=self.profile)
+                    if self.module:
+                        search_kwargs["filter_by_module"] = self.module
+                    results = self._search_fn(**search_kwargs)
                 sources = results if isinstance(results, list) else results.get("results", [])
                 sources_n = len(sources)
 
@@ -761,11 +805,11 @@ class RLMOrchestrator:
         if session_context:
             parts.append(f"Session context: {json.dumps(session_context[:5], default=str)[:500]}\n")
         for step_id, answer in sorted(accumulated.items()):
-            parts.append(f"--- Sub-query {step_id} ---\n{answer[:2000]}\n")
+            parts.append(f"--- Sub-query {step_id} ---\n{answer[:6000]}\n")
 
         system = f"You are a synthesis engine. {instruction}"
         user = "\n".join(parts)
 
-        final = self._llm_fn(system, user, max_tokens=4000)
+        final = self._llm_fn(system, user, max_tokens=8000)
         tokens = len(final) // 4
         return final, tokens

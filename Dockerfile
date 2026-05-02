@@ -28,9 +28,15 @@ COPY --from=cerbos /cerbos /usr/local/bin/cerbos
 
 # Install Python dependencies (CPU-only PyTorch via extra index)
 COPY requirements.txt .
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+RUN pip install --no-cache-dir --timeout 120 \
+    --index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pypi-org/simple \
+    --trusted-host artifactory.intra.infineon.com \
+    --extra-index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pytorch-remote/cpu \
     -r requirements.txt && \
-    pip install --no-cache-dir gunicorn uvicorn[standard]
+    pip install --no-cache-dir \
+    --index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pypi-org/simple \
+    --trusted-host artifactory.intra.infineon.com \
+    gunicorn uvicorn[standard]
 
 # Pre-download the sentence-transformers embedding model into the image
 # so the first search_database call doesn't block on a network download.

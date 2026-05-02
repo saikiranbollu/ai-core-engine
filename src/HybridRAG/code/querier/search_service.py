@@ -38,10 +38,63 @@ from .kg_node_utils import (
     serialize_node,
 )
 from .query_enhancer import QueryEnhancer
+from .mcal_query_enhancer import McalEnhancedQuery, McalPatternExecutor, McalQueryEnhancer
+from .query_logger import log_query as _log_query
 from .relevance_judge import RelevanceJudge
 from .reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
+
+# Structural/navigational labels that should score lower in keyword search.
+# These appear frequently with generic names (e.g. Folder "Adc_Init") but
+# carry little domain content compared to SRC_Function, SFR_Register, etc.
+_LOW_VALUE_LABELS = frozenset({
+    "Folder", "EA_Diagram", "EA_ActivityNode",
+})
+
+# ── Regex patterns for extracting citation metadata from Cypher queries ──
+_CYPHER_LABEL_RE = re.compile(r'\([\w]*:([\w]+)\)', re.IGNORECASE)
+_CYPHER_REL_RE = re.compile(r'\[[\w]*:?([\w]+)?\]', re.IGNORECASE)
+_CYPHER_REL_TYPE_RE = re.compile(r'\[:(\w+)\]', re.IGNORECASE)
+
+
+def _build_cypher_citations(
+    query: str,
+    rows: List[Dict[str, Any]],
+    workspace_id: str,
+    database: str,
+) -> Dict[str, Any]:
+    """Extract citation metadata from a Cypher query and its results."""
+    # Parse labels and relationship types from query
+    labels_in_query = _CYPHER_LABEL_RE.findall(query)
+    rel_types_in_query = _CYPHER_REL_TYPE_RE.findall(query)
+
+    # Collect unique node citations from result rows
+    node_citations = []
+    seen_ids = set()
+    for row in rows:
+        for key, val in row.items():
+            if isinstance(val, dict) and "_node_id" in val:
+                nid = val["_node_id"]
+                if nid not in seen_ids:
+                    seen_ids.add(nid)
+                    node_citations.append({
+                        "node_id": nid,
+                        "label": val.get("_label", ""),
+                        "name": val.get("_name", ""),
+                    })
+
+    citations = {
+        "source": "neo4j",
+        "database": database,
+        "profile": workspace_id,
+        "cypher": query,
+        "labels_queried": list(dict.fromkeys(labels_in_query)),
+        "relationships_traversed": list(dict.fromkeys(rel_types_in_query)),
+        "result_count": len(rows),
+        "nodes": node_citations,
+    }
+    return citations
 
 
 class SearchService:
@@ -71,6 +124,8 @@ class SearchService:
         self.module: Optional[str] = module.upper() if module else None
         self._context_budget = context_budget
         self._context_builder: Optional[ContextBuilder] = None
+        self._query_enhancer: Optional[McalQueryEnhancer] = None
+        self._pattern_executor: Optional[McalPatternExecutor] = None
         # TTL-cached collection list (avoids Qdrant get_collections() on every search)
         self._collection_cache: Dict[str, List[str]] = {}  # workspace → names
         self._collection_cache_ts: Dict[str, float] = {}   # workspace → timestamp
@@ -88,6 +143,12 @@ class SearchService:
     @property
     def available(self) -> bool:
         return self._neo4j is not None
+
+    def set_query_enhancer(self, enhancer: McalQueryEnhancer) -> None:
+        """Attach a MCAL QueryEnhancer instance (LLM-powered, for mcal workspace)."""
+        self._query_enhancer = enhancer
+        if self._neo4j:
+            self._pattern_executor = McalPatternExecutor(self._neo4j, self._default_db)
 
     def set_llm_fn(self, llm_fn):
         """Wire an LLM callable into all pipeline components that need it."""
@@ -117,10 +178,26 @@ class SearchService:
         return self._default_db
 
     # ── Universal ID matching ───────────────────────────────────────────
-    # All known ID properties across ILLD (document_id, id, jama_id) and
-    # MCAL (global_id, feature_id, decision_id, service_id).
+    # All known ID properties across ILLD (document_id, id, jama_id),
+    # MCAL (global_id, feature_id, decision_id, service_id),
+    # SRC  (function_id, file_id, type_id, macro_id, variable_id),
+    # SFR  (register_id, bitfield_id, base_address_id),
+    # and shared name-based IDs (function_name, name, requirement_id,
+    # test_case_id, param_name, type_name, module_name).
 
-    _STR_ID_PROPS = ("document_id", "id", "global_id", "feature_id", "decision_id", "service_id")
+    _STR_ID_PROPS = (
+        # Original ILLD / MCAL IDs
+        "document_id", "id", "global_id", "feature_id", "decision_id", "service_id",
+        # SRC node IDs
+        "function_id", "file_id", "type_id", "macro_id", "variable_id",
+        # SFR node IDs
+        "register_id", "bitfield_id", "base_address_id",
+        # Name-based IDs (used as primary key for many labels)
+        "requirement_id", "test_case_id", "function_name", "param_name",
+        "type_name", "macro_name", "api_name", "module_name",
+        # Fallback
+        "name",
+    )
 
     @staticmethod
     def _id_where(alias: str, param: str) -> str:
@@ -168,14 +245,36 @@ class SearchService:
           0.6 = default hybrid
           1.0 = pure graph (Neo4j)
         """
+        _qs_t0 = time.perf_counter()
         graph_results = []
         vector_results = []
+        pattern_results = []
 
         # ── Stage 0: Query analysis ─────────────────────────────────
         is_agg = is_aggregation_query(query)
         named_ents = extract_named_entities(query, module=filter_by_module or self.module)
         if is_agg:
             max_results = max(max_results, 100)
+
+        # ── Stage 0b: Query enhancement (MCAL LLM expansion) ────────
+        enhanced: Optional[McalEnhancedQuery] = None
+        if self._query_enhancer and not filter_by_node_type:
+            try:
+                enhanced = self._query_enhancer.enhance(
+                    query, module=filter_by_module or self.module,
+                )
+            except Exception as e:
+                logger.warning("Query enhancement failed (continuing with basic search): %s", e)
+
+        # Execute Cypher patterns from enhancer (if any)
+        if enhanced and enhanced.cypher_patterns and self._pattern_executor:
+            try:
+                pattern_results = self._pattern_executor.execute_patterns(
+                    enhanced.cypher_patterns,
+                )
+                logger.debug("Pattern execution returned %d results", len(pattern_results))
+            except Exception as e:
+                logger.warning("Pattern execution failed: %s", e)
 
         # ── Stage 1 & 2: Graph + Vector search (parallel) ─────────────
         do_graph = alpha > 0.0 and self._neo4j
@@ -190,6 +289,7 @@ class SearchService:
                     filter_by_node_type=filter_by_node_type,
                     workspace_id=workspace_id,
                     include_relationships=include_relationships,
+                    enhanced=enhanced,
                 )
                 vector_future = pool.submit(
                     self._vector_search,
@@ -207,6 +307,7 @@ class SearchService:
                 filter_by_node_type=filter_by_node_type,
                 workspace_id=workspace_id,
                 include_relationships=include_relationships,
+                enhanced=enhanced,
             )
         elif do_vector:
             vector_results = self._vector_search(
@@ -216,8 +317,9 @@ class SearchService:
                 workspace_id=workspace_id,
             )
 
-        logger.debug("hybrid_search: graph=%d vector=%d (alpha=%.2f, do_graph=%s, do_vector=%s)",
-                      len(graph_results), len(vector_results), alpha, do_graph, do_vector)
+        logger.debug("hybrid_search: graph=%d vector=%d pattern=%d (alpha=%.2f, enhanced=%s)",
+                      len(graph_results), len(vector_results), len(pattern_results),
+                      alpha, enhanced.enhanced if enhanced else False)
         if do_graph and do_vector and not vector_results:
             logger.warning("hybrid_search: vector search returned 0 results — "
                            "check Qdrant connectivity and collection availability")
@@ -247,6 +349,37 @@ class SearchService:
                     if ar.get("node_id") not in existing_ids:
                         graph_results.append(ar)
                         existing_ids.add(ar.get("node_id"))
+
+        # ── Stage 2b: Merge pattern results into graph results ─────
+        # Pattern results have richer content (relationship properties) and
+        # score 1.5, so they should override keyword results with same node_id.
+        # Exception: keep keyword results that have neighbor expansion (longer content).
+        if pattern_results:
+            pattern_by_id = {pr.get("node_id"): pr for pr in pattern_results}
+            # Replace existing keyword results with pattern versions,
+            # but only if the pattern version has richer content.
+            for i, gr in enumerate(graph_results):
+                nid = gr.get("node_id")
+                if nid in pattern_by_id:
+                    pr = pattern_by_id.pop(nid)
+                    # Keep the keyword version if it has neighbor expansion
+                    # (typically much longer due to "Related KG nodes" section).
+                    gr_len = len(gr.get("content", ""))
+                    pr_len = len(pr.get("content", ""))
+                    if pr_len > gr_len:
+                        graph_results[i] = pr
+                    else:
+                        # Keep keyword version but boost its score
+                        graph_results[i]["score"] = max(gr.get("score", 0), pr.get("score", 0))
+            # Append remaining pattern results that had no keyword match
+            for pr in pattern_by_id.values():
+                graph_results.append(pr)
+            # Ensure max_results covers all pattern results
+            max_results = max(max_results, len(pattern_results) + 10)
+
+        # Sort graph results by score so pattern results (score 1.5) rank
+        # above keyword matches before RRF rank-based fusion.
+        graph_results.sort(key=lambda r: r.get("score", 0), reverse=True)
 
         # ── Stage 3: RRF merge ────────────────────────────────────────
         merged = self._merge_results_rrf(
@@ -357,9 +490,43 @@ class SearchService:
             except Exception:
                 logger.debug("Refiner failed, skipping", exc_info=True)
 
+        # ── Stage 6: HSI enrichment — EA_Register trust zone info ─────
+        pre_enrich = len(merged)
+        merged = self._enrich_hsi_registers(merged)
+        if len(merged) > pre_enrich:
+            # Re-sort so enrichment results slot in by score
+            merged.sort(key=lambda r: r.get("score", 0), reverse=True)
+            # Ensure enriched results fit within page
+            max_results += (len(merged) - pre_enrich)
+
         # Paginate
         total = len(merged)
         page = merged[offset:offset + max_results]
+
+        # ── Build citations ────────────────────────────────────────────
+        db = self._db_for_workspace(workspace_id)
+        citations = {
+            "source": "neo4j+qdrant" if alpha < 1.0 else "neo4j",
+            "database": db,
+            "profile": workspace_id,
+            "search_strategy": "graph" if alpha == 1.0 else ("vector" if alpha == 0.0 else "hybrid"),
+            "result_count": len(page),
+            "nodes": [
+                {
+                    "node_id": r.get("node_id", ""),
+                    "node_type": r.get("node_type", ""),
+                    "name": r.get("properties", {}).get("name", "")
+                           or r.get("properties", {}).get("function_name", ""),
+                    "source": r.get("source", ""),
+                    "score": round(r.get("score", 0), 4),
+                }
+                for r in page
+            ],
+        }
+        if filter_by_module:
+            citations["module_filter"] = filter_by_module
+        if filter_by_node_type:
+            citations["node_type_filter"] = filter_by_node_type
 
         result = {
             "results": page,
@@ -369,8 +536,16 @@ class SearchService:
             "alpha": alpha,
             "named_entities": named_ents,
             "is_aggregation": is_agg,
+            "citations": citations,
         }
         result.update(pipeline_stats)
+        _log_query(
+            method="hybrid_search", cypher=f"hybrid:{query[:200]}",
+            elapsed_ms=(time.perf_counter() - _qs_t0) * 1000,
+            row_count=result.get("total_count", 0),
+            module=filter_by_module or self.module,
+            profile=workspace_id,
+        )
         return result
 
     async def hybrid_search_async(
@@ -387,11 +562,32 @@ class SearchService:
         """Async hybrid search — runs graph and vector stages concurrently."""
         graph_results: List[Dict[str, Any]] = []
         vector_results: List[Dict[str, Any]] = []
+        pattern_results: List[Dict[str, Any]] = []
 
         is_agg = is_aggregation_query(query)
         named_ents = extract_named_entities(query, module=filter_by_module or self.module)
         if is_agg:
             max_results = max(max_results, 100)
+
+        # ── Query enhancement (MCAL LLM expansion) ───────────────────
+        enhanced: Optional[McalEnhancedQuery] = None
+        if self._query_enhancer and not filter_by_node_type:
+            try:
+                enhanced = await asyncio.to_thread(
+                    self._query_enhancer.enhance,
+                    query, filter_by_module or self.module,
+                )
+            except Exception as e:
+                logger.warning("Async query enhancement failed: %s", e)
+
+        if enhanced and enhanced.cypher_patterns and self._pattern_executor:
+            try:
+                pattern_results = await asyncio.to_thread(
+                    self._pattern_executor.execute_patterns,
+                    enhanced.cypher_patterns,
+                )
+            except Exception as e:
+                logger.warning("Async pattern execution failed: %s", e)
 
         # ── Run graph + vector searches concurrently via threads ──────
         async def _graph_stage():
@@ -404,6 +600,7 @@ class SearchService:
                 filter_by_node_type=filter_by_node_type,
                 workspace_id=workspace_id,
                 include_relationships=include_relationships,
+                enhanced=enhanced,
             )
 
         async def _vector_stage():
@@ -447,12 +644,33 @@ class SearchService:
                         graph_results.append(ar)
                         existing_ids.add(ar.get("node_id"))
 
+        # Merge pattern results into graph results
+        if pattern_results:
+            pattern_by_id = {pr.get("node_id"): pr for pr in pattern_results}
+            for i, gr in enumerate(graph_results):
+                nid = gr.get("node_id")
+                if nid in pattern_by_id:
+                    pr = pattern_by_id.pop(nid)
+                    gr_len = len(gr.get("content", ""))
+                    pr_len = len(pr.get("content", ""))
+                    if pr_len > gr_len:
+                        graph_results[i] = pr
+                    else:
+                        graph_results[i]["score"] = max(gr.get("score", 0), pr.get("score", 0))
+            for pr in pattern_by_id.values():
+                graph_results.append(pr)
+            max_results = max(max_results, len(pattern_results) + 10)
+
+        # Sort graph results by score so pattern results (score 1.5) rank
+        # above keyword matches before RRF rank-based fusion.
+        graph_results.sort(key=lambda r: r.get("score", 0), reverse=True)
+
         merged = self._merge_results_rrf(
             graph_results, vector_results, alpha,
             workspace_id=workspace_id,
         )
 
-        # ── MCAL post-fusion guarantees ───────────────────────────────
+        # ── Stage 4: MCAL post-fusion guarantees ───────────────────────
         if workspace_id == "mcal":
             # Must-include guarantee — entity-targeted results survive
             must_include = [r for r in merged if r.get("_must_include")]
@@ -485,10 +703,42 @@ class SearchService:
                             break
                 merged.sort(key=lambda r: r.get("score", 0), reverse=True)
 
+        # ── Stage 5: HSI enrichment — EA_Register trust zone info ─────
+        pre_enrich = len(merged)
+        merged = self._enrich_hsi_registers(merged)
+        if len(merged) > pre_enrich:
+            merged.sort(key=lambda r: r.get("score", 0), reverse=True)
+            max_results += (len(merged) - pre_enrich)
+
         total = len(merged)
         page = merged[offset:offset + max_results]
 
-        return {
+        # ── Build citations ────────────────────────────────────────────
+        db = self._db_for_workspace(workspace_id)
+        citations = {
+            "source": "neo4j+qdrant" if alpha < 1.0 else "neo4j",
+            "database": db,
+            "profile": workspace_id,
+            "search_strategy": "graph" if alpha == 1.0 else ("vector" if alpha == 0.0 else "hybrid"),
+            "result_count": len(page),
+            "nodes": [
+                {
+                    "node_id": r.get("node_id", ""),
+                    "node_type": r.get("node_type", ""),
+                    "name": r.get("properties", {}).get("name", "")
+                           or r.get("properties", {}).get("function_name", ""),
+                    "source": r.get("source", ""),
+                    "score": round(r.get("score", 0), 4),
+                }
+                for r in page
+            ],
+        }
+        if filter_by_module:
+            citations["module_filter"] = filter_by_module
+        if filter_by_node_type:
+            citations["node_type_filter"] = filter_by_node_type
+
+        result = {
             "results": page,
             "total_count": total,
             "has_more": (offset + max_results) < total,
@@ -496,7 +746,19 @@ class SearchService:
             "alpha": alpha,
             "named_entities": named_ents,
             "is_aggregation": is_agg,
+            "citations": citations,
         }
+        if enhanced and enhanced.enhanced:
+            result["query_enhancement"] = {
+                "intent": enhanced.intent,
+                "expanded_keywords": enhanced.expanded_keywords,
+                "target_labels": enhanced.target_labels,
+                "cypher_patterns": enhanced.cypher_patterns,
+                "cypher_patterns_executed": len(enhanced.cypher_patterns),
+                "pattern_results": len(pattern_results),
+                "enhancement_time_ms": round(enhanced.enhancement_time_ms, 1),
+            }
+        return result
 
     def _graph_search(
         self, query: str, max_results: int = 20,
@@ -504,15 +766,26 @@ class SearchService:
         filter_by_node_type: Optional[List[str]] = None,
         workspace_id: str = "illd",
         include_relationships: bool = False,
+        enhanced: Optional[McalEnhancedQuery] = None,
     ) -> List[Dict[str, Any]]:
         """Label-aware graph search with keyword extraction and rich serialization.
 
         Uses label-specific property maps from kg_node_utils to properly
         identify display names, unique IDs, and structured properties.
+        When an EnhancedQuery is provided, uses its target_labels instead of
+        infer_labels and filters out compound keywords to reduce noise.
         """
         db = self._db_for_workspace(workspace_id)
         keywords = extract_keywords(query)
-        labels = filter_by_node_type or infer_labels(query, profile=workspace_id)
+
+        # When enhanced, use LLM-chosen labels (more focused) and drop compound keywords
+        if enhanced and enhanced.enhanced and enhanced.target_labels and not filter_by_node_type:
+            labels = enhanced.target_labels
+            # Drop compound keywords (multi-word phrases) that cause noisy CONTAINS matches
+            keywords = [kw for kw in keywords if ' ' not in kw]
+            logger.debug("_graph_search: using enhanced labels=%s, keywords=%s", labels, keywords)
+        else:
+            labels = filter_by_node_type or infer_labels(query, profile=workspace_id)
         module = (filter_by_module or self.module or "").upper() or None
 
         results: List[Dict[str, Any]] = []
@@ -623,11 +896,19 @@ class SearchService:
                             if nid in seen_ids:
                                 continue
                             seen_ids.add(nid)
+
+                            desc = str(props.get("description", ""))
+                            sc = score_node(kw, name, desc)
+
+                            # Deprioritize navigational/structural labels that add noise
+                            if node_type in _LOW_VALUE_LABELS:
+                                sc *= 0.3
+
                             results.append({
                                 "node_id": nid,
                                 "node_type": node_type,
                                 "source": "neo4j",
-                                "score": record["score"],
+                                "score": sc,
                                 "properties": props,
                                 "content": serialize_node(node_type, props),
                             })
@@ -994,7 +1275,7 @@ class SearchService:
                                 regs = rec.get("registers", [])
                                 dev = rec.get("device", "?")
                                 text = (
-                                    f"[SRC→SFR Cross-link] Function {func} accesses "
+                                    f"[SRC->SFR Cross-link] Function {func} accesses "
                                     f"{len(regs)} register(s) on {dev}: {', '.join(regs[:10])}"
                                 )
                                 results.append({
@@ -1012,6 +1293,496 @@ class SearchService:
             logger.error("Aggregation search failed: %s", e)
 
         return results
+
+    # ─────────────────────────────────────────────────────────────────────
+    # HSI enrichment — fetch EA_Register trust zone info for SFR results
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _enrich_hsi_registers(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """When SFR_Register results are present, fetch corresponding EA_Register
+        nodes (trust zone, APU, CPU mode) and merge trust-zone info directly
+        into SFR_Register content so the LLM sees it in one place."""
+        if not self._neo4j:
+            return results
+
+        # Collect SFR register names AND function names from results
+        sfr_names: Set[str] = set()
+        function_names: Set[str] = set()
+        sfr_idx_map: Dict[str, int] = {}  # sfr_name -> index in results
+        for idx, r in enumerate(results):
+            ntype = r.get("node_type", "")
+            if ntype == "SFR_Register":
+                name = (r.get("properties") or {}).get("name", "")
+                if name:
+                    sfr_names.add(name)
+                    sfr_idx_map[name] = idx
+            elif ntype == "SRC_Function":
+                name = (r.get("properties") or {}).get("name", "")
+                if name:
+                    function_names.add(name)
+
+        if not sfr_names and not function_names:
+            return results
+
+        existing_ids = {r.get("node_id") for r in results}
+        db = self._default_db
+
+        try:
+            with self._neo4j.session(database=db) as session:
+                ea_by_sfr: Dict[str, Dict[str, Any]] = {}
+
+                # Path 1: Direct SFR name match on EA_Register
+                for sfr_name in sfr_names:
+                    cypher = (
+                        "MATCH (reg:EA_Register) "
+                        "WHERE reg.sfr_id = $sfr_name OR reg.name = $short_name "
+                        "RETURN reg LIMIT 1"
+                    )
+                    short_name = sfr_name.split("_", 1)[1] if "_" in sfr_name else sfr_name
+                    records = list(session.run(cypher, {"sfr_name": sfr_name, "short_name": short_name}))
+                    for rec in records:
+                        node = rec["reg"]
+                        if node is None:
+                            continue
+                        ea_by_sfr[sfr_name] = dict(node.items())
+
+                # Path 2: EA_Function -> EA_ACCESSES_REGISTER -> EA_Register
+                # (more reliable when sfr_id matching is fragile)
+                for fn_name in function_names:
+                    cypher = (
+                        "MATCH (f:EA_Function {name: $fn_name})"
+                        "-[r:EA_ACCESSES_REGISTER]->(reg:EA_Register) "
+                        "RETURN reg, r.access_type AS access_type LIMIT 50"
+                    )
+                    records = list(session.run(cypher, {"fn_name": fn_name}))
+                    for rec in records:
+                        node = rec["reg"]
+                        if node is None:
+                            continue
+                        props = dict(node.items())
+                        sfr_id = props.get("sfr_id", "")
+                        reg_name = props.get("name", "")
+                        # Match EA_Register to any SFR name we have
+                        matched_sfr = None
+                        for sn in sfr_names:
+                            if sfr_id == sn or reg_name in sn or sn.endswith(reg_name):
+                                matched_sfr = sn
+                                break
+                        if matched_sfr and matched_sfr not in ea_by_sfr:
+                            props["_ea_access_type"] = rec.get("access_type", "")
+                            ea_by_sfr[matched_sfr] = props
+
+                # Merge EA trust zone info INTO SFR_Register content
+                for sfr_name, ea_props in ea_by_sfr.items():
+                    trust_lines = []
+                    read_apu = ea_props.get("read_apu", "")
+                    write_apu = ea_props.get("write_apu", "")
+                    read_cpu = ea_props.get("read_cpu_mode", "")
+                    write_cpu = ea_props.get("write_cpu_mode", "")
+                    ea_access = ea_props.get("access_type", ea_props.get("_ea_access_type", ""))
+                    if read_apu:
+                        trust_lines.append(f"  Read APU: {read_apu}")
+                    if write_apu:
+                        trust_lines.append(f"  Write APU: {write_apu}")
+                    if read_cpu:
+                        trust_lines.append(f"  Read CPU Mode: {read_cpu}")
+                    if write_cpu:
+                        trust_lines.append(f"  Write CPU Mode: {write_cpu}")
+                    if ea_access:
+                        trust_lines.append(f"  EA Access Type: {ea_access}")
+
+                    # Inject into the SFR_Register result content
+                    if trust_lines and sfr_name in sfr_idx_map:
+                        idx = sfr_idx_map[sfr_name]
+                        old_content = results[idx].get("content", "")
+                        trust_block = "\n  --- Trust Zone (EA_Register) ---\n" + "\n".join(trust_lines)
+                        results[idx]["content"] = old_content + trust_block
+                        # Also add to properties for structured access
+                        props = results[idx].get("properties", {})
+                        if read_apu:
+                            props["read_apu"] = read_apu
+                        if write_apu:
+                            props["write_apu"] = write_apu
+                        if read_cpu:
+                            props["read_cpu_mode"] = read_cpu
+                        if write_cpu:
+                            props["write_cpu_mode"] = write_cpu
+
+                    # Still add EA_Register as separate result for completeness
+                    ntype = "EA_Register"
+                    nid = node_unique_id(ntype, ea_props)
+                    if nid not in existing_ids:
+                        display = node_display_name(ntype, ea_props)
+                        ea_props["_label"] = ntype
+                        ea_props["_node_id"] = nid
+                        ea_props["_name"] = display
+                        content = serialize_node(ntype, ea_props)
+                        results.append({
+                            "node_id": nid,
+                            "node_type": ntype,
+                            "source": "neo4j_hsi",
+                            "score": 1.4,
+                            "properties": ea_props,
+                            "content": content,
+                        })
+                        existing_ids.add(nid)
+        except Exception as exc:
+            logger.debug("HSI register enrichment failed: %s", exc)
+
+        return results
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Dedicated HSI extraction — SWUD-format register + global data
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_function_hsi(
+        self,
+        function_name: str,
+        module: Optional[str] = None,
+        workspace_id: str = "mcal",
+    ) -> Dict[str, Any]:
+        """Extract structured HSI data for a function — matching SWUD format.
+
+        Returns registers accessed (with access type, trust zone) and
+        global/shared variables used (with access type, via_chain).
+        """
+        _qs_t0 = time.perf_counter()
+        if not self._neo4j:
+            return {"error": "Neo4j not available"}
+
+        db = self._default_db
+        hsi: Dict[str, Any] = {
+            "function_name": function_name,
+            "module": module or self.module or "",
+            "registers": [],
+            "global_variables": [],
+            "events": [],
+        }
+
+        try:
+            with self._neo4j.session(database=db) as session:
+                # 1. SRC_Function metadata (register_accesses, registers_written/read)
+                fn_cypher = (
+                    "MATCH (f:SRC_Function {name: $fn_name}) "
+                    "RETURN f.register_accesses AS register_accesses, "
+                    "f.registers_written AS registers_written, "
+                    "f.registers_read AS registers_read, "
+                    "f.register_access_count AS register_access_count, "
+                    "f.parameters AS parameters, "
+                    "f.return_type AS return_type "
+                    "LIMIT 1"
+                )
+                fn_recs = list(session.run(fn_cypher, {"fn_name": function_name}))
+                fn_meta = {}
+                if fn_recs:
+                    fn_meta = {
+                        "register_accesses": fn_recs[0].get("register_accesses"),
+                        "registers_written": fn_recs[0].get("registers_written"),
+                        "registers_read": fn_recs[0].get("registers_read"),
+                        "register_access_count": fn_recs[0].get("register_access_count"),
+                        "parameters": fn_recs[0].get("parameters"),
+                        "return_type": fn_recs[0].get("return_type"),
+                    }
+                hsi["function_metadata"] = fn_meta
+
+                # Parse register_accesses JSON if available
+                reg_accesses_raw = fn_meta.get("register_accesses")
+                parsed_accesses = []
+                if reg_accesses_raw:
+                    try:
+                        if isinstance(reg_accesses_raw, str):
+                            parsed_accesses = json.loads(reg_accesses_raw)
+                        elif isinstance(reg_accesses_raw, list):
+                            parsed_accesses = reg_accesses_raw
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                # 2. SRC_ACCESSES_SFR relationships
+                sfr_cypher = (
+                    "MATCH (f:SRC_Function {name: $fn_name})"
+                    "-[r:SRC_ACCESSES_SFR]->(reg:SFR_Register) "
+                    "RETURN reg.name AS reg_name, reg.description AS description, "
+                    "reg.module AS module, reg.device AS device, "
+                    "reg.struct_name AS struct_name, "
+                    "r.access_type AS access_type, r.line AS line, "
+                    "r.field AS field, r.access_context AS access_context "
+                    "ORDER BY reg.name"
+                )
+                sfr_recs = list(session.run(sfr_cypher, {"fn_name": function_name}))
+                seen_regs: Set[str] = set()
+                reg_map: dict = {}  # rname -> entry (deduplicate across device variants)
+                for rec in sfr_recs:
+                    rname = rec.get("reg_name") or ""
+                    access = (rec.get("access_type") or "").upper()
+                    # Enrich from parsed_accesses
+                    if not access and parsed_accesses:
+                        for pa in parsed_accesses:
+                            if pa.get("register") == rname:
+                                access = (pa.get("access_type") or "").upper()
+                                break
+                    # Deduplicate: keep first entry per register, merge devices
+                    if rname in reg_map:
+                        existing = reg_map[rname]
+                        dev = rec.get("device", "")
+                        if dev and dev not in existing.get("device", ""):
+                            existing["device"] += f", {dev}"
+                        # Merge field if first was None
+                        if not existing.get("field") and rec.get("field"):
+                            existing["field"] = rec.get("field")
+                        # Merge line if first was None
+                        if existing.get("line") is None and rec.get("line") is not None:
+                            existing["line"] = rec.get("line")
+                        continue
+                    entry = {
+                        "register": rname,
+                        "access_type": access or "UNKNOWN",
+                        "description": rec.get("description", ""),
+                        "module": rec.get("module", ""),
+                        "device": rec.get("device", ""),
+                        "field": rec.get("field", ""),
+                        "line": rec.get("line"),
+                        "trust_zone": "",
+                    }
+                    reg_map[rname] = entry
+                    seen_regs.add(rname)
+                    hsi["registers"].append(entry)
+
+                # If no SRC_ACCESSES_SFR, fall back to parsed register_accesses
+                if not hsi["registers"] and parsed_accesses:
+                    for pa in parsed_accesses:
+                        rname = pa.get("register", "")
+                        if rname and rname not in seen_regs:
+                            hsi["registers"].append({
+                                "register": rname,
+                                "access_type": (pa.get("access_type") or "UNKNOWN").upper(),
+                                "description": "",
+                                "module": module or "",
+                                "device": "",
+                                "field": pa.get("field", ""),
+                                "line": pa.get("line"),
+                                "trust_zone": "",
+                            })
+                            seen_regs.add(rname)
+
+                # Also check registers_written/registers_read properties
+                rw_raw = fn_meta.get("registers_written") or []
+                if isinstance(rw_raw, str):
+                    try:
+                        rw_raw = json.loads(rw_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        rw_raw = []
+                for rw_name in rw_raw:
+                    if isinstance(rw_name, str) and rw_name not in seen_regs:
+                        hsi["registers"].append({
+                            "register": rw_name,
+                            "access_type": "WRITE",
+                            "description": "", "module": module or "",
+                            "device": "", "field": "", "line": None,
+                            "trust_zone": "",
+                        })
+                        seen_regs.add(rw_name)
+                rr_raw = fn_meta.get("registers_read") or []
+                if isinstance(rr_raw, str):
+                    try:
+                        rr_raw = json.loads(rr_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        rr_raw = []
+                for rr_name in rr_raw:
+                    if isinstance(rr_name, str) and rr_name not in seen_regs:
+                        hsi["registers"].append({
+                            "register": rr_name,
+                            "access_type": "READ",
+                            "description": "", "module": module or "",
+                            "device": "", "field": "", "line": None,
+                            "trust_zone": "",
+                        })
+                        seen_regs.add(rr_name)
+
+                # 3. EA_Register trust zone enrichment for each register
+                for entry in hsi["registers"]:
+                    rname = entry["register"]
+                    ea_cypher = (
+                        "MATCH (reg:EA_Register) "
+                        "WHERE reg.sfr_id = $sfr_name OR reg.name = $short_name "
+                        "RETURN reg.read_apu AS read_apu, reg.write_apu AS write_apu, "
+                        "reg.read_cpu_mode AS read_cpu, reg.write_cpu_mode AS write_cpu "
+                        "LIMIT 1"
+                    )
+                    short_name = rname.split("_", 1)[1] if "_" in rname else rname
+                    ea_recs = list(session.run(ea_cypher, {"sfr_name": rname, "short_name": short_name}))
+                    if ea_recs:
+                        read_apu = ea_recs[0].get("read_apu", "")
+                        write_apu = ea_recs[0].get("write_apu", "")
+                        # Determine trust zone from APU
+                        if read_apu or write_apu:
+                            apu_vals = [v for v in [read_apu, write_apu] if v]
+                            # PTOP = Untrusted, PCPU = Trusted
+                            if any("PTOP" in str(v).upper() for v in apu_vals):
+                                entry["trust_zone"] = "Untrusted"
+                            elif any("PCPU" in str(v).upper() for v in apu_vals):
+                                entry["trust_zone"] = "Trusted"
+                            else:
+                                entry["trust_zone"] = f"APU: {', '.join(apu_vals)}"
+                            entry["read_apu"] = read_apu
+                            entry["write_apu"] = write_apu
+                            entry["read_cpu_mode"] = ea_recs[0].get("read_cpu", "")
+                            entry["write_cpu_mode"] = ea_recs[0].get("write_cpu", "")
+
+                # Also try EA_Function -> EA_ACCESSES_REGISTER path
+                ea_fn_cypher = (
+                    "MATCH (f:EA_Function {name: $fn_name})"
+                    "-[r:EA_ACCESSES_REGISTER]->(reg:EA_Register) "
+                    "RETURN reg.name AS name, reg.sfr_id AS sfr_id, "
+                    "reg.read_apu AS read_apu, reg.write_apu AS write_apu, "
+                    "reg.read_cpu_mode AS read_cpu, reg.write_cpu_mode AS write_cpu, "
+                    "r.access_type AS access_type "
+                    "LIMIT 50"
+                )
+                ea_fn_recs = list(session.run(ea_fn_cypher, {"fn_name": function_name}))
+                for rec in ea_fn_recs:
+                    sfr_id = rec.get("sfr_id", "")
+                    ea_name = rec.get("name", "")
+                    # Try to match to existing register entries
+                    matched = False
+                    for entry in hsi["registers"]:
+                        rname = entry["register"]
+                        if sfr_id == rname or ea_name in rname or rname.endswith(ea_name):
+                            if not entry.get("trust_zone"):
+                                read_apu = rec.get("read_apu", "")
+                                write_apu = rec.get("write_apu", "")
+                                if read_apu or write_apu:
+                                    apu_vals = [v for v in [read_apu, write_apu] if v]
+                                    if any("PTOP" in str(v).upper() for v in apu_vals):
+                                        entry["trust_zone"] = "Untrusted"
+                                    elif any("PCPU" in str(v).upper() for v in apu_vals):
+                                        entry["trust_zone"] = "Trusted"
+                                    else:
+                                        entry["trust_zone"] = f"APU: {', '.join(apu_vals)}"
+                                    entry["read_apu"] = read_apu
+                                    entry["write_apu"] = write_apu
+                            matched = True
+                            break
+                    if not matched and (sfr_id or ea_name):
+                        # New register not in SRC_ACCESSES_SFR
+                        read_apu = rec.get("read_apu", "")
+                        write_apu = rec.get("write_apu", "")
+                        tz = ""
+                        if read_apu or write_apu:
+                            apu_vals = [v for v in [read_apu, write_apu] if v]
+                            if any("PTOP" in str(v).upper() for v in apu_vals):
+                                tz = "Untrusted"
+                            elif any("PCPU" in str(v).upper() for v in apu_vals):
+                                tz = "Trusted"
+                            else:
+                                tz = f"APU: {', '.join(apu_vals)}"
+                        hsi["registers"].append({
+                            "register": sfr_id or ea_name,
+                            "access_type": (rec.get("access_type") or "UNKNOWN").upper(),
+                            "description": "", "module": module or "",
+                            "device": "", "field": "", "line": None,
+                            "trust_zone": tz,
+                            "read_apu": read_apu,
+                            "write_apu": write_apu,
+                            "source": "EA_Register",
+                        })
+
+                # 4. Global variables via SRC_USES_GLOBAL
+                glob_cypher = (
+                    "MATCH (f:SRC_Function {name: $fn_name})"
+                    "-[r:SRC_USES_GLOBAL]->(g:SRC_GlobalVariable) "
+                    "RETURN g.name AS name, g.data_type AS data_type, "
+                    "g.is_const AS is_const, g.is_extern AS is_extern, "
+                    "g.memory_section AS memory_section, "
+                    "g.description AS description, "
+                    "r.access_type AS access_type, "
+                    "r.via_chain AS via_chain, "
+                    "r.access_context AS access_context "
+                    "ORDER BY g.name"
+                )
+                glob_recs = list(session.run(glob_cypher, {"fn_name": function_name}))
+                # Filter out noise: boolean constants, non-module globals
+                _GLOBAL_NOISE = {"TRUE", "FALSE", "NULL", "STD_ON", "STD_OFF", "E_OK", "E_NOT_OK"}
+                mod_prefix = module.lower() if module else ""
+                for rec in glob_recs:
+                    gname = rec.get("name", "")
+                    # Skip boolean/standard constants
+                    if gname.upper() in _GLOBAL_NOISE:
+                        continue
+                    # Skip globals that belong to other modules (e.g. Dma_k*, Gtm_k*, Mcu_k*)
+                    if mod_prefix and "_" in gname:
+                        gname_lower = gname.lower()
+                        # If global starts with a known module prefix that isn't ours, skip
+                        if (gname_lower.startswith(("dma_", "gtm_", "mcu_", "spi_", "can_", "port_", "dio_", "icu_", "pwm_", "gpt_", "wdg_", "fee_", "fls_"))
+                            and not gname_lower.startswith(mod_prefix + "_") and not gname_lower.startswith(mod_prefix + "k")):
+                            continue
+                    access = (rec.get("access_type") or "").upper()
+                    # Normalize READ_WRITE to separate
+                    if access == "READ_WRITE":
+                        access = "READ, WRITE"
+                    hsi["global_variables"].append({
+                        "variable": rec.get("name", ""),
+                        "access_type": access or "UNKNOWN",
+                        "data_type": rec.get("data_type", ""),
+                        "is_const": rec.get("is_const", False),
+                        "is_extern": rec.get("is_extern", False),
+                        "via_chain": rec.get("via_chain", ""),
+                        "memory_section": rec.get("memory_section", ""),
+                        "description": rec.get("description", ""),
+                    })
+
+        except Exception as exc:
+            logger.warning("HSI extraction failed for %s: %s", function_name, exc)
+            hsi["error"] = str(exc)
+
+        # Build summary text matching SWUD HSI section format
+        lines = [
+            f"=== HSI (Hardware-Software Interface) for {function_name} ===",
+            "",
+        ]
+
+        if hsi["registers"]:
+            lines.append("## SFR Registers Accessed")
+            lines.append("| Register | Access | Field | Line | Trust Zone | Device |")
+            lines.append("|----------|--------|-------|------|------------|--------|")
+            for r in hsi["registers"]:
+                access_str = r["access_type"]
+                suffix = f"({access_str[0].lower()})" if access_str and access_str != "UNKNOWN" else ""
+                tz = r.get("trust_zone", "")
+                lines.append(
+                    f"| {r['register']}{suffix} | {access_str} | "
+                    f"{r.get('field', '')} | {r.get('line', '')} | "
+                    f"{tz} | {r.get('device', '')} |"
+                )
+        else:
+            lines.append("## SFR Registers Accessed\nNone found in graph.")
+
+        lines.append("")
+
+        if hsi["global_variables"]:
+            lines.append("## Global/Shared Variables")
+            lines.append("| Variable | Access | Data Type | Via Chain | Const | Extern |")
+            lines.append("|----------|--------|-----------|-----------|-------|--------|")
+            for g in hsi["global_variables"]:
+                lines.append(
+                    f"| {g['variable']} | {g['access_type']} | "
+                    f"{g.get('data_type', '')} | {g.get('via_chain', '')} | "
+                    f"{g.get('is_const', '')} | {g.get('is_extern', '')} |"
+                )
+        else:
+            lines.append("## Global/Shared Variables\nNone found in graph.")
+
+        lines.append("")
+        lines.append("## Events")
+        lines.append("None" if not hsi["events"] else "\n".join(str(e) for e in hsi["events"]))
+
+        hsi["summary_text"] = "\n".join(lines)
+        _log_query(
+            method="get_function_hsi", cypher=f"hsi:{function_name}",
+            elapsed_ms=(time.perf_counter() - _qs_t0) * 1000,
+            row_count=len(hsi.get("registers", [])) + len(hsi.get("global_variables", [])),
+            module=module or self.module, profile=workspace_id,
+        )
+        return hsi
 
     # ─────────────────────────────────────────────────────────────────────
     # 1-hop neighbor expansion
@@ -1042,6 +1813,7 @@ class SearchService:
                     f"-[r]-(m) "
                     f"{neighbor_module_clause}"
                     f"RETURN type(r) AS rel_type, "
+                    f"properties(r) AS r_props, "
                     f"[lbl IN labels(m) WHERE lbl <> 'Node' | lbl] AS target_labels, "
                     f"m AS neighbor "
                     f"LIMIT 15"
@@ -1067,9 +1839,15 @@ class SearchService:
                     seen_ids.add(n_id)
 
                     n_desc = str(neighbor_props.get("description", ""))[:200]
-                    line = f"  [{rel_type}] → {target_label}: {n_name}"
+                    line = f"  [{rel_type}] -> {target_label}: {n_name}"
                     if n_desc:
                         line += f" — {n_desc}"
+                    # Include relationship properties (access_type, via_chain, etc.)
+                    rel_props = dict(rec["r_props"]) if rec.get("r_props") else {}
+                    for rk in ("access_type", "access_context", "via_chain"):
+                        rv = rel_props.get(rk, "")
+                        if rv:
+                            line += f"\n    {rk}: {rv}"
                     for key in ("test_case_id", "test_objective", "expected_results",
                                 "requirement_id", "asil_level", "memory_section",
                                 "param_type", "default_value", "range_values"):
@@ -1129,7 +1907,7 @@ class SearchService:
 
             display_props = LABEL_DISPLAY_PROPS.get(target_label, [])
             if display_props:
-                lines = [f"  [{rel_type}] → {target_label}: {n_name}"]
+                lines = [f"  [{rel_type}] -> {target_label}: {n_name}"]
                 for prop_key, display_label in display_props:
                     val = neighbor_props.get(prop_key, "")
                     if val:
@@ -1139,7 +1917,7 @@ class SearchService:
                         lines.append(f"    {display_label}: {val_str}")
                 sections.setdefault(rel_type, []).append("\n".join(lines))
             else:
-                line = f"  [{rel_type}] → {target_label}: {n_name}"
+                line = f"  [{rel_type}] -> {target_label}: {n_name}"
                 desc = str(neighbor_props.get("description", ""))[:300]
                 if desc:
                     line += f"\n    Description: {desc}"
@@ -1585,6 +2363,7 @@ class SearchService:
         workspace_id: str = "illd",
     ) -> Dict[str, Any]:
         """Deterministic structured query."""
+        _qs_t0 = time.perf_counter()
         if not self._neo4j:
             return {"nodes": [], "total_count": 0, "has_more": False}
 
@@ -1622,11 +2401,40 @@ class SearchService:
                     if return_properties:
                         nodes.append({p: rec[p] for p in return_properties})
                     else:
-                        nodes.append(dict(rec["n"].items()))
+                        props = dict(rec["n"].items())
+                        props["_label"] = label
+                        props["_node_id"] = node_unique_id(label, props)
+                        props["_name"] = node_display_name(label, props)
+                        nodes.append(props)
         except Exception as e:
             logger.error("search_nodes failed: %s", e)
 
-        return {"nodes": nodes, "total_count": len(nodes), "has_more": len(nodes) == limit}
+        # ── Build citations ────────────────────────────────────────────
+        citations = {
+            "source": "neo4j",
+            "database": db,
+            "profile": workspace_id,
+            "cypher": cypher,
+            "label": label,
+            "node_count": len(nodes),
+            "nodes": [
+                {"node_id": n.get("_node_id", ""), "name": n.get("_name", ""), "label": label}
+                for n in nodes if n.get("_node_id")
+            ],
+        }
+        if keyword:
+            citations["keyword"] = keyword
+        if filters:
+            citations["filters"] = filters
+
+        _result = {"nodes": nodes, "total_count": len(nodes), "has_more": len(nodes) == limit,
+                    "citations": citations}
+        _log_query(
+            method="search_nodes", cypher=cypher,
+            params=params, elapsed_ms=(time.perf_counter() - _qs_t0) * 1000,
+            row_count=len(nodes), module=self.module, profile=workspace_id,
+        )
+        return _result
 
     # ─────────────────────────────────────────────────────────────────────
     # get_node_by_id — exact lookup
@@ -1641,6 +2449,7 @@ class SearchService:
         Matches against: document_id, id, global_id, feature_id, decision_id,
         service_id (string IDs) and jama_id (integer).
         """
+        _qs_t0 = time.perf_counter()
         if not self._neo4j:
             return {"node": None, "found": False}
 
@@ -1662,11 +2471,26 @@ class SearchService:
                 rec = session.run(cypher, params).single()
                 if rec:
                     props = dict(rec["n"].items())
-                    props["_labels"] = rec["lbl"]
+                    labels = rec["lbl"]
+                    props["_labels"] = labels
+                    primary_label = labels[0] if labels else ""
+                    props["_label"] = primary_label
+                    props["_node_id"] = node_unique_id(primary_label, props)
+                    props["_name"] = node_display_name(primary_label, props)
+                    _log_query(
+                        method="get_node_by_id", cypher=cypher,
+                        params=params, elapsed_ms=(time.perf_counter() - _qs_t0) * 1000,
+                        row_count=1, module=self.module, profile=workspace_id,
+                    )
                     return {"node": props, "found": True}
         except Exception as e:
             logger.error("get_node_by_id failed: %s", e)
 
+        _log_query(
+            method="get_node_by_id", cypher=cypher,
+            params=params, elapsed_ms=(time.perf_counter() - _qs_t0) * 1000,
+            row_count=0, module=self.module, profile=workspace_id,
+        )
         return {"node": None, "found": False}
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1679,6 +2503,7 @@ class SearchService:
         limit: int = 20, workspace_id: str = "illd",
     ) -> Dict[str, Any]:
         """Direct graph traversal from a known node."""
+        _qs_t0 = time.perf_counter()
         if not self._neo4j:
             return {"neighbors": [], "total_count": 0, "has_more": False}
 
@@ -1723,16 +2548,24 @@ class SearchService:
             with self._neo4j.session(database=db) as session:
                 for rec in session.run(cypher, params):
                     props = dict(rec["n"].items())
+                    ntype = rec["neighbor_type"] or ""
                     neighbors.append({
                         "relationship": rec["rel_type"],
-                        "node_type": rec["neighbor_type"],
+                        "node_type": ntype,
                         "properties": props,
-                        "node_id": next((props[p] for p in self._STR_ID_PROPS if props.get(p)), props.get("name", "?")),
+                        "node_id": node_unique_id(ntype, props),
+                        "_name": node_display_name(ntype, props),
                     })
         except Exception as e:
             logger.error("get_neighbors failed: %s", e)
 
-        return {"neighbors": neighbors, "total_count": len(neighbors), "has_more": len(neighbors) == limit}
+        _result = {"neighbors": neighbors, "total_count": len(neighbors), "has_more": len(neighbors) == limit}
+        _log_query(
+            method="get_neighbors", cypher=cypher,
+            params=params, elapsed_ms=(time.perf_counter() - _qs_t0) * 1000,
+            row_count=len(neighbors), module=self.module, profile=workspace_id,
+        )
+        return _result
 
     # ─────────────────────────────────────────────────────────────────────
     # shortest_path — path analysis between two nodes
@@ -1809,6 +2642,7 @@ class SearchService:
         workspace_id: str = "illd",
     ) -> Dict[str, Any]:
         """Execute read-only Cypher. Write clauses are pre-rejected by MCP layer."""
+        _qs_t0 = time.perf_counter()
         if not self._neo4j:
             return {"rows": [], "error": "Neo4j not available"}
 
@@ -1823,8 +2657,15 @@ class SearchService:
                     row = {}
                     for key in record.keys():
                         val = record[key]
-                        # Convert Neo4j Node to dict
-                        if hasattr(val, "items"):
+                        # Convert Neo4j Node to dict + inject citation metadata
+                        if hasattr(val, "labels") and hasattr(val, "items"):
+                            props = dict(val.items())
+                            lbl = list(val.labels)[0] if val.labels else ""
+                            props["_label"] = lbl
+                            props["_node_id"] = node_unique_id(lbl, props)
+                            props["_name"] = node_display_name(lbl, props)
+                            row[key] = props
+                        elif hasattr(val, "items"):
                             row[key] = dict(val.items())
                         else:
                             row[key] = val
@@ -1833,4 +2674,15 @@ class SearchService:
             logger.error("execute_cypher failed: %s", e)
             return {"rows": [], "error": str(e)}
 
-        return {"rows": rows, "total_count": len(rows)}
+        _log_query(
+            method="execute_cypher", cypher=query,
+            params=params, elapsed_ms=(time.perf_counter() - _qs_t0) * 1000,
+            row_count=len(rows), module=self.module, profile=workspace_id,
+        )
+
+        # ── Build citations ────────────────────────────────────────────
+        citations = _build_cypher_citations(
+            query, rows, workspace_id, db,
+        )
+
+        return {"rows": rows, "total_count": len(rows), "citations": citations}

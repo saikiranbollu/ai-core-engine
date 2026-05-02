@@ -239,6 +239,72 @@ class EphemeralGraph:
         return [(nid, dict(data)) for nid, data in self._graph.nodes(data=True)
                 if data.get("_origin") == origin]
 
+    def get_boundary_nodes(self) -> List[Dict[str, Any]]:
+        """Return Unknown-type nodes suitable for cross-module resolution.
+
+        Filters out ALL_CAPS names (macros/HW register accesses) that
+        won't have corresponding nodes in the production KG.
+        """
+        boundary = []
+        for nid, data in self._graph.nodes(data=True):
+            if data.get("_node_type") != "Unknown":
+                continue
+            # Extract name from canonical ID: "SRC_Function:Dma_ChUpdate:Adc"
+            parts = nid.split(":")
+            name = parts[1] if len(parts) >= 2 else nid
+            # Skip ALL_CAPS names (macros/HW register accesses)
+            if re.match(r'^[A-Z][A-Z0-9_]+$', name):
+                continue
+            boundary.append({"node_id": nid, "name": name})
+        return boundary
+
+    def resolve_boundary(self, name_to_resolved: Dict[str, str]) -> Dict[str, int]:
+        """Rewire edges from Unknown stubs to resolved production nodes.
+
+        For each name that was resolved against prod, find the Unknown stub
+        in the sandbox, redirect all its edges to the resolved prod node,
+        and remove the stub.
+
+        Parameters
+        ----------
+        name_to_resolved : dict
+            Maps function name -> canonical ID of the resolved prod node.
+
+        Returns
+        -------
+        dict with {"boundary_resolved": int}
+        """
+        resolved_count = 0
+        for name, resolved_id in name_to_resolved.items():
+            if resolved_id not in self._graph:
+                continue
+            # Find Unknown stubs matching this name
+            stubs = []
+            for nid, data in list(self._graph.nodes(data=True)):
+                if data.get("_node_type") != "Unknown":
+                    continue
+                parts = nid.split(":")
+                stub_name = parts[1] if len(parts) >= 2 else nid
+                if stub_name == name and nid != resolved_id:
+                    stubs.append(nid)
+            for stub_id in stubs:
+                # Redirect incoming edges
+                for pred in list(self._graph.predecessors(stub_id)):
+                    edata = dict(self._graph.edges[pred, stub_id])
+                    if not self._graph.has_edge(pred, resolved_id):
+                        self._graph.add_edge(pred, resolved_id, **edata)
+                # Redirect outgoing edges
+                for succ in list(self._graph.successors(stub_id)):
+                    edata = dict(self._graph.edges[stub_id, succ])
+                    if not self._graph.has_edge(resolved_id, succ):
+                        self._graph.add_edge(resolved_id, succ, **edata)
+                # Remove stub from graph and keyword index
+                self._graph.remove_node(stub_id)
+                for token_set in self._keyword_index.values():
+                    token_set.discard(stub_id)
+                resolved_count += 1
+        return {"boundary_resolved": resolved_count}
+
     def load_prod_nodes(self, nodes: List[Dict], relationships: List[Dict]):
         """Load production traceability neighbors into ephemeral graph."""
         id_map = {}  # neo4j elementId → canonical node_id
@@ -1003,6 +1069,20 @@ class TraceabilityPuller:
     def __init__(self, neo4j_driver):
         self._driver = neo4j_driver
 
+    @staticmethod
+    def _resolve_database(workspace_id: str) -> str:
+        """Resolve the actual Neo4j database name from storage_config.yaml.
+
+        The workspace_id (e.g. 'mcal', 'illd') is NOT the database name —
+        both profiles use database='neo4j' in the config.
+        """
+        try:
+            from src.HybridRAG.code.neo4j_manager import get_instance_config
+            cfg = get_instance_config(workspace_id)
+            return cfg.database or "neo4j"
+        except Exception:
+            return "neo4j"
+
     def pull_neighbors(
         self, node_names: List[str], module: str,
         workspace_id: str = "illd", depth: int = 1,
@@ -1016,36 +1096,42 @@ class TraceabilityPuller:
         if not node_names or depth <= 0:
             return [], []
 
-        db = workspace_id if workspace_id in ("illd", "mcal") else "neo4j"
-        cypher = """
+        db = self._resolve_database(workspace_id)
+        module_upper = module.upper() if module else ""
+        # depth and max_nodes are injected as literals because Neo4j 4.x
+        # does not allow parameters inside [*1..N] or list slices [0..N].
+        # elementId() replaced with toString(id()) for Neo4j 4.x compat.
+        safe_depth = int(depth)
+        safe_max = int(self.MAX_PULL_NODES)
+        cypher = f"""
         MATCH (n)
-        WHERE n.module = $module
+        WHERE toUpper(n.module) = $module_upper
           AND (n.name IN $names OR n.function_name IN $names
                OR n.param_name IN $names OR n.requirement_id IN $names)
         WITH n LIMIT 200
-        CALL {
+        CALL {{
             WITH n
-            MATCH path = (n)-[*1..$depth]-(neighbor)
-            WHERE neighbor.module = $module
+            MATCH path = (n)-[*1..{safe_depth}]-(neighbor)
+            WHERE toUpper(neighbor.module) = $module_upper
             RETURN neighbor, relationships(path) AS rels
-        }
+        }}
         WITH collect(DISTINCT n) + collect(DISTINCT neighbor) AS all_nodes,
              collect(rels) AS all_rel_lists
         UNWIND all_nodes AS node
-        WITH collect(DISTINCT {
-                 node_id: elementId(node),
+        WITH collect(DISTINCT {{
+                 node_id: toString(id(node)),
                  node_type: labels(node)[0],
                  properties: properties(node)
-             })[0..$max_nodes] AS nodes,
+             }})[0..{safe_max}] AS nodes,
              all_rel_lists
         UNWIND all_rel_lists AS rel_list
         UNWIND rel_list AS rel
-        WITH nodes, collect(DISTINCT {
-                 source: elementId(startNode(rel)),
-                 target: elementId(endNode(rel)),
+        WITH nodes, collect(DISTINCT {{
+                 source: toString(id(startNode(rel))),
+                 target: toString(id(endNode(rel))),
                  rel_type: type(rel),
                  properties: properties(rel)
-             }) AS relationships
+             }}) AS relationships
         RETURN nodes, relationships
         """
         try:
@@ -1053,9 +1139,7 @@ class TraceabilityPuller:
                 result = session.run(
                     cypher,
                     names=node_names,
-                    module=module,
-                    depth=depth,
-                    max_nodes=self.MAX_PULL_NODES,
+                    module_upper=module_upper,
                 )
                 record = result.single()
                 if record:
@@ -1071,6 +1155,50 @@ class TraceabilityPuller:
         except Exception as e:
             logger.error("[TraceabilityPuller] Failed to pull neighbors: %s", e)
             return [], []
+
+    def pull_boundary_nodes(
+        self, names: List[str], workspace_id: str = "illd",
+    ) -> List[Dict]:
+        """Resolve boundary node names against prod KG (cross-module).
+
+        Unlike pull_neighbors(), this does NOT filter by module — it finds
+        nodes by name across all modules. Returns only the anchor nodes
+        (no neighbor expansion) for lightweight boundary resolution.
+
+        Returns list of node dicts: {"node_id": str, "node_type": str, "properties": dict}
+        """
+        if not names:
+            return []
+
+        db = self._resolve_database(workspace_id)
+        # Neo4j 4.x: elementId() → toString(id()), literal max_nodes
+        safe_max = int(self.MAX_PULL_NODES)
+        cypher = f"""
+        MATCH (n)
+        WHERE n.name IN $names OR n.function_name IN $names
+        RETURN collect(DISTINCT {{
+                   node_id: toString(id(n)),
+                   node_type: labels(n)[0],
+                   properties: properties(n)
+               }})[0..{safe_max}] AS nodes
+        """
+        try:
+            with self._driver.session(database=db) as session:
+                result = session.run(
+                    cypher, names=names,
+                )
+                record = result.single()
+                if record:
+                    nodes = record["nodes"] or []
+                    logger.info(
+                        "[TraceabilityPuller] Boundary resolution: %d/%d names resolved",
+                        len(nodes), len(names),
+                    )
+                    return nodes
+                return []
+        except Exception as e:
+            logger.error("[TraceabilityPuller] Failed boundary pull: %s", e)
+            return []
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1097,6 +1225,7 @@ class HybridGraphService:
         "get_ontology_compliance", "get_coverage_report",
         "get_graph_statistics", "get_failure_patterns",
         "get_review_analytics", "get_learning_metrics",
+        "execute_cypher",
     }
 
     def __init__(self, sandbox: EphemeralSandbox, neo4j_driver=None):

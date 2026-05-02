@@ -40,6 +40,8 @@ TOOL_TIERS: Dict[str, str] = {
     "sandbox_diff": PUBLIC,
     # Cat 6+: RLM
     "rlm_orchestrate": DEVELOPER, "rlm_plan_preview": PUBLIC,
+    # Cat 6+: HSI
+    "get_function_hsi": PUBLIC,
     # Cat 7: Cache
     "cache_get": DEVELOPER, "cache_stats": DEVELOPER,
     "cache_invalidate_module": ADMIN, "cache_clear": ADMIN, "cache_refresh_config": ADMIN,

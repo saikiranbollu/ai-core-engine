@@ -57,6 +57,9 @@ LABEL_NAME_PROPS: Dict[str, str] = {
     "SFR_BitField":             "name",
     "SFR_BaseAddress":          "name",
     "SFR_File":                 "file_name",
+    # EA node types
+    "EA_Register":              "name",
+    "EA_Function":              "name",
 }
 
 LABEL_ID_PROPS: Dict[str, str] = {
@@ -88,9 +91,24 @@ LABEL_ID_PROPS: Dict[str, str] = {
     "SFR_BitField":             "bitfield_id",
     "SFR_BaseAddress":          "base_address_id",
     "SFR_File":                 "file_id",
+    # EA node types
+    "EA_Register":              "ea_id",
+    "EA_Function":              "name",
 }
 
 LABEL_DISPLAY_PROPS: Dict[str, List[tuple]] = {
+    "EA_Function": [
+        ("name",               "Function Name"),
+        ("description",        "Description"),
+        ("kind",               "Kind"),
+        ("return_type",        "Return Type"),
+        ("parameters",         "Parameters"),
+        ("op_algorithm",       "Algorithm"),
+        ("op_comments",        "Comments"),
+        ("op_user_hints",      "User Hints"),
+        ("op_returnparamdescription", "Return Description"),
+        ("module",             "Module"),
+    ],
     "SWUD_Function": [
         ("function_name",  "Function"),
         ("sync_async",     "Sync/Async"),
@@ -189,6 +207,10 @@ LABEL_DISPLAY_PROPS: Dict[str, List[tuple]] = {
         ("end_line",          "End Line"),
         ("compile_condition", "Compile Condition"),
         ("service_id",        "Service ID"),
+        ("register_accesses", "Register Accesses (HSI)"),
+        ("registers_written", "Registers Written"),
+        ("registers_read",    "Registers Read"),
+        ("register_access_count", "Register Access Count"),
         ("traceability_ids",  "Traceability IDs"),
         ("description",       "Description"),
     ],
@@ -227,6 +249,7 @@ LABEL_DISPLAY_PROPS: Dict[str, List[tuple]] = {
         ("array_size",        "Array Size"),
         ("initializer",       "Initializer"),
         ("memory_section",    "Memory Section"),
+        ("access_type",       "Access Type"),
         ("compile_condition", "Compile Condition"),
         ("description",       "Description"),
     ],
@@ -244,6 +267,23 @@ LABEL_DISPLAY_PROPS: Dict[str, List[tuple]] = {
         ("struct_name",       "Struct Name"),
         ("device",            "Device"),
         ("version",           "Version"),
+        ("module",            "Module"),
+        ("address",           "Address"),
+        ("reset_value",       "Reset Value"),
+        ("offset",            "Offset"),
+        ("access_mode",       "Access Mode"),
+    ],
+    # EA (Enterprise Architect) register with trust/APU info
+    "EA_Register": [
+        ("name",              "Register Name"),
+        ("sfr_id",            "SFR ID"),
+        ("access_type",       "Access Type"),
+        ("read_apu",          "Read APU"),
+        ("write_apu",         "Write APU"),
+        ("read_cpu_mode",     "Read CPU Mode"),
+        ("write_cpu_mode",    "Write CPU Mode"),
+        ("size_bits",         "Size (bits)"),
+        ("description",       "Description"),
         ("module",            "Module"),
     ],
     "SFR_BitField": [
@@ -684,7 +724,7 @@ def classify_source(src: Source) -> str:
             return ContextSlot.CODE_EXAMPLES
         if "src_globalvariable" in label or "src_localvariable" in label:
             return ContextSlot.CODE_EXAMPLES
-        if "sfr_" in label:
+        if "sfr_" in label or "ea_register" in label:
             return ContextSlot.REGISTERS
         if "function" in label:
             return ContextSlot.API_FUNCTIONS

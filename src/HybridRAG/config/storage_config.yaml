@@ -1,7 +1,7 @@
-# GraphRAG Configuration for ILLD & MCAL
-# Select the active instance: "illd" or "mcal"
+# GraphRAG Configuration for ILLD, MCAL & Test
+# Select the active instance: "illd", "mcal", or "test"
 # This also selects the matching ontology profile in ontology.yaml
-active_instance: mcal
+active_instance: test
 
 # Select the vector store backend: qdrant
 vector_backend: qdrant
@@ -48,6 +48,36 @@ neo4j:
       embedding_dimension: 1536
       similarity_threshold: 0.85
 
+  test:
+    description: "Test Instance - EA Migration Experiments"
+    uri: "bolt+ssc://bolt-passthrough-neo4j-mcswai-test.icp.infineon.com:443"
+    username: "${NEO4J_USERNAME}"
+    password: "${NEO4J_PASSWORD}"
+    database: "neo4j"
+    encrypted: false
+    max_connection_lifetime: 3600
+    max_connection_pool_size: 50
+    connection_acquisition_timeout: 60
+    graph_settings:
+      node_label_prefix: "MCAL_"
+      embedding_dimension: 1536
+      similarity_threshold: 0.85
+
+  local:
+    description: "Local Neo4j Desktop - Incremental Ingestion Testing"
+    uri: "neo4j://127.0.0.1:7687"
+    username: "${NEO4J_USERNAME}"
+    password: "${LOCAL_NEO4J_PASSWORD}"
+    database: "neo4j"
+    encrypted: false
+    max_connection_lifetime: 3600
+    max_connection_pool_size: 50
+    connection_acquisition_timeout: 60
+    graph_settings:
+      node_label_prefix: "MCAL_"
+      embedding_dimension: 1536
+      similarity_threshold: 0.85
+
 # ---------------------------------------------------------------------------
 # Qdrant Configuration (remote vector store)
 # ---------------------------------------------------------------------------
@@ -73,6 +103,9 @@ qdrant:
   mcal:
     description: "MCAL - Productive Software Vector Store (Qdrant)"
     collection_name: "mcal_graphrag"
+  test:
+    description: "Test Instance Vector Store (Qdrant)"
+    collection_name: "test_graphrag"
 
 # ---------------------------------------------------------------------------
 # Jama REST API Configuration

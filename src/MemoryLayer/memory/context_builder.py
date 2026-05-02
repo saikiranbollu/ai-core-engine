@@ -138,13 +138,25 @@ class LegacyContextBuilder:
             if content_len <= budget_remaining:
                 included.append(item)
                 budget_remaining -= content_len
-                provenance.append({
+                props = item.get("properties") or {}
+                prov_entry = {
                     "node_id": item.get("node_id", item.get("id", "?")),
                     "node_type": item.get("node_type", item.get("label", "?")),
                     "source": item.get("source", "hybrid"),
                     "score": round(item.get("score", item.get("relevance_score", 0)), 4),
                     "tokens": _legacy_estimate_tokens(content),
-                })
+                    "title": (props.get("name") or props.get("title")
+                              or props.get("heading") or props.get("section_title")
+                              or props.get("function_name") or props.get("module_name")
+                              or item.get("node_id", "?")),
+                }
+                # Attach key domain identifiers when present
+                for key in ("requirement_id", "global_id", "jama_id",
+                            "feature_ids", "module", "collection"):
+                    val = props.get(key) or item.get(key)
+                    if val:
+                        prov_entry[key] = val
+                provenance.append(prov_entry)
             else:
                 dropped.append(item.get("node_id", item.get("id", "unknown")))
 

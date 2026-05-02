@@ -1,22 +1,18 @@
 """
-Fetch cross-module dependency headers and Sum configuration files from Bitbucket.
+Fetch RC1 MCAL artifacts from Bitbucket for Knowledge Graph ingestion.
 
-All headers are fetched from their actual production repositories — no stubs.
-This module provides three classes:
+RC1 uses a different repo structure than A3G:
+- Source code: ``aurix_rc1_sw_mcal_dev_{mod}`` (vs A3G ``aurix3g_sw_mcal_tc4xx_{mod}_src``)
+- SFR headers: ``aurix_rc1_sw_mcal_sfr`` at ``ssc/RC1S16/inc/`` (vs A3G ``ssc/inc/``)
+- Cross-module: ``aurix_rc1_sw_mcal_dev_generictypes`` for Std_Types.h, Platform_Types.h
+- Sum configs: ``aurix_rc1_sw_mcal_dev_{mod}_ver`` at ``cfg/Compile/`` (arxml only — no generated .h)
+- Project key: ``AURIXRC1MCAL`` (vs A3G ``ATVA3GMCAL``)
 
-- **DependencyFetcher**: Downloads real cross-module headers (Std_Types.h,
-  McalUtil.h, Det.h, etc.) from their respective Bitbucket repos and creates
-  minimal empty stubs for headers that are conditionally included but have
-  no effect on parsing (Test_Det.h, Userconfig.h, etc.).
+This module provides three classes mirroring A3G's ``dependency_fetcher.py``:
 
-- **SumConfigFetcher**: Downloads Sum (pre-configured) build variants from
-  the module's ``*_ver`` repository.  Each Sum config contains fully
-  generated CfgMcal files, MemMap files, and SchM files with concrete
-  ``#define`` values — the ground truth for AST parsing.
-
-- **SourceRepoFetcher**: Shallow-clones Bitbucket source repositories
-  (module src, SFR, val) into a local directory so the pipeline does not
-  require manual cloning.
+- **RC1DependencyFetcher**: Downloads cross-module headers for clang parsing.
+- **RC1SumConfigFetcher**: Downloads Sum compile configurations (arxml + generated .h when available).
+- **RC1SourceRepoFetcher**: Shallow-clones RC1 module repos (source, SFR).
 """
 
 from __future__ import annotations
@@ -32,77 +28,81 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BITBUCKET_PROJECT = "ATVA3GMCAL"
+BITBUCKET_PROJECT = "AURIXRC1MCAL"
 BITBUCKET_BASE_URL = "https://bitbucket.vih.infineon.com"
 
+# Device subfamily — RC1 uses RC1S16 (vs A3G's TC4xx)
+RC1_SFR_DEVICE = "RC1S16"
+
 # ---------------------------------------------------------------------------
-# Cross-module dependency manifest
+# Cross-module dependency manifest for RC1
 # Maps  repo_slug → { path_in_repo: [header_filenames] }
 #
-# Every header here is a *real* production file fetched from Bitbucket.
-# Paths were verified via the Bitbucket browse API.
+# RC1 has different repo naming than A3G — headers come from:
+#   - aurix_rc1_sw_mcal_dev_generictypes  (Std_Types.h, Platform_Types.h)
+#   - aurix_rc1_sw_mcal_dev_rma           (Rma.h)
+#   - aurix_rc1_sw_mcal_dev_dma           (Dma.h)
+#   - aurix_rc1_sw_mcal_dev_mcu           (Mcu.h) [if needed]
+#   - aurix_rc1_sw_mcal_dev_tinfra        (TInfra.h)
 # ---------------------------------------------------------------------------
 DEPENDENCY_MANIFEST: Dict[str, Dict[str, List[str]]] = {
-    "aurix3g_sw_mcal_tc4xx_platform": {
+    "aurix_rc1_sw_mcal_dev_generictypes": {
         # AUTOSAR platform type headers
-        "": [
+        "ssc/inc": [
             "Std_Types.h",
             "Platform_Types.h",
-            "Mcal_ErrorTypes.h",
-            "Mcal_ExecutionContext.h",
         ],
     },
-    "aurix3g_sw_mcal_tc4xx_infra_integration": {
-        # Common infrastructure stubs / wrappers
-        "00_Common": [
-            "Det.h",
-            "Dem.h",
-            "Dem_cfg.h",
-            "Mcal_SafetyError.h",
-            "Mcal_OsStub.h",
-            "Os.h",
-            "Os_Compiler.h",
-            "Mcal_AppExecContext.h",
-        ],
+    "aurix_rc1_sw_mcal_dev_rma": {
+        # Resource Manager Abstraction
+        "ssc/inc": ["Rma.h"],
     },
-    "aurix3g_sw_mcal_tc4xx_mcalutil_src": {
-        # McalUtil — contains MCALUTIL_SFRREAD / SFRWRITE macros
-        "ssc/inc": ["McalUtil.h"],
-    },
-    "aurix3g_sw_mcal_tc4xx_mcu_src": {
-        "ssc/inc": ["Mcu_TimeDelay.h"],
-    },
-    "aurix3g_sw_mcal_tc4xx_dma_src": {
+    "aurix_rc1_sw_mcal_dev_dma": {
         "ssc/inc": ["Dma.h"],
     },
-    "aurix3g_sw_mcal_tc4xx_gtm_src": {
-        "ssc/inc": ["Gtm.h"],
-    },
-    "aurix3g_sw_mcal_tc4xx_cdsp_src": {
-        "ssc/inc": ["Cdsp.h", "Cdsp_Local.h"],
+    "aurix_rc1_sw_mcal_dev_tinfra": {
+        "ssc/inc": ["TInfra.h"],
     },
 }
 
-# Headers that are transitively included but contain nothing relevant
-# for clang parsing.  We create minimal empty files so clang doesn't
-# error on missing includes.
+# Headers that RC1 modules include but which are either generated
+# (by code generators from arxml) or conditionally present.
+# Create empty stubs so clang doesn't error on missing includes.
 EMPTY_STUBS: List[str] = [
-    "Test_Det.h",
-    "Test_Dem.h",
-    "Test_Mcal_SafetyError.h",
-    "Userconfig.h",
-    "McalUtil_MemMap.h",
-    "Cdsp_MemMap.h",
+    # AUTOSAR infrastructure stubs (not found in any RC1 repo)
+    "Det.h",
+    "Dem.h",
+    "Dem_Cfg.h",
+    "EcuM.h",
+    "EcuM_Cbk.h",
+    "Os.h",
+    "Os_Compiler.h",
     "Compiler.h",
+    "Compiler_Cfg.h",
+    # McalErrHndlr — RC1-specific error handling (may not exist as standalone)
+    "McalErrHndlr_ErrorTypes.h",
+    "McalErrHndlr_SafetyError.h",
+    # MemMap — generated per-module
+    "Gpt_MemMap.h",
+    # SchM — generated per-module
+    "SchM_Gpt.h",
+    # Cfg headers — generated from arxml by code generators
+    "Gpt_Cfg.h",
+    "Gpt_PBcfg.h",
+    "Gpt_Data.h",
+    "Gpt_Externals.h",
 ]
 
-# Sum configuration defaults (ADC module, TC499N device)
-SUM_BASE_PATH = "00_Arxml/Sum"
+# Sum configuration defaults (GPT module, RC1S16 device)
+SUM_BASE_PATH = "cfg/Compile"
 DEFAULT_SUM_CONFIGS: List[str] = [
-    "AS460_TC499N_STD_Host_Config1",
-    "AS460_TC499N_STD_Host_Config2",
-    "AS460_TC499N_STD_Host_Config3",
-    "AS460_TC499N_STD_Host_Config4",
+    "AS4100_RC1S16_529_Bcc_Config1",
+    "AS4100_RC1S16_529_Bcc_Config2",
+    "AS4100_RC1S16_529_Bcc_Config3",
+    "AS4100_RC1S16_529_Bcc_Config4",
+    "AS4100_RC1S16_529_Bcc_Config5",
+    "AS4100_RC1S16_529_Bcc_Config6",
+    "AS4100_RC1S16_529_Bcc_Config7",
 ]
 
 
@@ -114,16 +114,14 @@ def _load_env() -> None:
     """Load .env from the repo's ``env/`` directory if present."""
     env_path = Path(__file__).resolve().parents[4] / "env" / ".env"
     if env_path.exists():
-        try:
-            from dotenv import load_dotenv  # type: ignore[import-untyped]
-            load_dotenv(env_path)
-        except ImportError:
-            pass
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                os.environ[k.strip()] = v.strip().strip('"').strip("'")
 
 
 def _make_connector(repo: str):
-    """Create a ``BitbucketConnector`` for a given repo slug."""
-    # Lazy import — avoid hard dependency when this module is not used
+    """Create a ``BitbucketConnector`` for a given RC1 repo slug."""
     from src.IngestionPipeline.Connectors.BitbucketConnector import (
         BitbucketConnector,
     )
@@ -140,19 +138,49 @@ def _make_connector(repo: str):
     )
 
 
+def _module_stubs(module: str) -> List[str]:
+    """Return module-specific stub headers.
+
+    Some stubs are module-specific (e.g. ``Gpt_MemMap.h``).
+    This function generates them from the base EMPTY_STUBS list,
+    replacing ``Gpt`` with the target module name.
+    """
+    mod_cap = module.capitalize()  # e.g. "Gpt"
+    if mod_cap == "Gpt":
+        return list(EMPTY_STUBS)  # Already GPT-specific
+
+    # Replace Gpt-specific stubs with module-specific ones
+    stubs = []
+    for stub in EMPTY_STUBS:
+        if stub.startswith("Gpt_"):
+            stubs.append(stub.replace("Gpt_", f"{mod_cap}_"))
+        elif stub.startswith("SchM_Gpt"):
+            stubs.append(stub.replace("SchM_Gpt", f"SchM_{mod_cap}"))
+        else:
+            stubs.append(stub)
+    return stubs
+
+
 # ---------------------------------------------------------------------------
-# DependencyFetcher
+# RC1DependencyFetcher
 # ---------------------------------------------------------------------------
 
-class DependencyFetcher:
-    """Download real cross-module dependency headers from Bitbucket.
+class RC1DependencyFetcher:
+    """Download real cross-module dependency headers from RC1 Bitbucket repos.
 
     All files land in a single flat directory (no subdirectories) so it
     can be passed directly as a ``-I`` include path to clang.
     """
 
-    def __init__(self, output_dir: Path, *, force: bool = False) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        module: str = "GPT",
+        *,
+        force: bool = False,
+    ) -> None:
         self.output_dir = Path(output_dir)
+        self.module = module.upper()
         self.force = force
         self._connectors: Dict[str, object] = {}
 
@@ -160,8 +188,6 @@ class DependencyFetcher:
         if repo not in self._connectors:
             self._connectors[repo] = _make_connector(repo)
         return self._connectors[repo]
-
-    # -- public API --------------------------------------------------------
 
     def fetch_all(self) -> Path:
         """Download every dependency header + create empty stubs.
@@ -175,7 +201,7 @@ class DependencyFetcher:
         if marker.exists() and not self.force:
             count = sum(1 for f in self.output_dir.iterdir() if f.suffix == ".h")
             logger.info(
-                "Dependencies already present (%d headers) in %s "
+                "RC1 dependencies already present (%d headers) in %s "
                 "(use --force-fetch to refresh)",
                 count,
                 self.output_dir,
@@ -197,57 +223,64 @@ class DependencyFetcher:
                     try:
                         fc = conn.get_file_content(remote)
                         local.write_text(fc.content, encoding="utf-8")
-                        logger.info("  fetched  %-30s  from %s", fname, repo_slug)
+                        logger.info("  fetched  %-35s  from %s", fname, repo_slug)
                         fetched += 1
                     except Exception as exc:
                         logger.error(
-                            "  FAILED   %-30s  from %s/%s: %s",
+                            "  FAILED   %-35s  from %s/%s: %s",
                             fname, repo_slug, remote, exc,
                         )
                         failed.append(fname)
 
-        # Create empty stubs for transitive includes
-        for stub in EMPTY_STUBS:
+        # Create empty stubs for generated / missing includes
+        stubs = _module_stubs(self.module)
+        for stub in stubs:
             path = self.output_dir / stub
             if not path.exists() or self.force:
                 path.write_text(
-                    f"/* Auto-generated empty stub for {stub} */\n",
+                    f"/* Auto-generated empty stub for {stub} (RC1) */\n",
                     encoding="utf-8",
                 )
-                logger.info("  created  %-30s  (empty stub)", stub)
+                logger.info("  created  %-35s  (empty stub)", stub)
             fetched += 1
 
         marker.write_text(f"{fetched}\n", encoding="utf-8")
 
         if failed:
             logger.warning(
-                "Dependencies: %d fetched, %d FAILED: %s",
+                "RC1 Dependencies: %d fetched, %d FAILED: %s",
                 fetched,
                 len(failed),
                 ", ".join(failed),
             )
         else:
-            logger.info("Dependencies: all %d files ready in %s", fetched, self.output_dir)
+            logger.info(
+                "RC1 Dependencies: all %d files ready in %s",
+                fetched,
+                self.output_dir,
+            )
 
         return self.output_dir
 
 
 # ---------------------------------------------------------------------------
-# SumConfigFetcher
+# RC1SumConfigFetcher
 # ---------------------------------------------------------------------------
 
-class SumConfigFetcher:
-    """Download Sum configuration directories from Bitbucket.
+class RC1SumConfigFetcher:
+    """Download Sum compile configurations from RC1 Bitbucket.
 
-    Each Sum config is a fully generated build variant containing
-    CfgMcal, MemMap, and SchM files.  These are fetched recursively
-    into local directories for clang to consume.
+    RC1 Sum configs live at ``cfg/Compile/`` in the module's ``*_ver``
+    repo.  Unlike A3G, they currently only contain ``.arxml`` files
+    (no pre-generated C headers).  This fetcher downloads whatever is
+    available — when generated headers appear in the repo, they'll be
+    fetched automatically.
     """
 
     def __init__(
         self,
         output_dir: Path,
-        module: str = "ADC",
+        module: str = "GPT",
         *,
         force: bool = False,
     ) -> None:
@@ -259,33 +292,30 @@ class SumConfigFetcher:
     @property
     def _connector(self):
         if self._conn is None:
-            repo = f"aurix3g_sw_mcal_tc4xx_dev_{self.module.lower()}_ver"
+            repo = f"aurix_rc1_sw_mcal_dev_{self.module.lower()}_ver"
             self._conn = _make_connector(repo)
         return self._conn
-
-    # -- public API --------------------------------------------------------
 
     def discover_configs(self) -> List[str]:
         """List available Sum config names from Bitbucket.
 
-        Returns bare directory names (e.g. ``AS460_TC4D9_COM_Host_Config1``),
-        **not** full Bitbucket paths.
+        Returns bare directory names (e.g. ``AS4100_RC1S16_529_Bcc_Config1``).
         """
         try:
             entries = self._connector.list_directory(SUM_BASE_PATH)
-            # e.path is repo-relative ("00_Arxml/Sum/ConfigX") — keep only the
-            # last component so callers can pass it straight to fetch_config().
             names = sorted(
                 e.path.rsplit("/", 1)[-1]
                 for e in entries
                 if e.entry_type == "DIRECTORY"
             )
-            logger.info("Discovered %d Sum configs for %s: %s",
-                        len(names), self.module, names)
+            logger.info(
+                "Discovered %d RC1 Sum configs for %s: %s",
+                len(names), self.module, names,
+            )
             return names
         except Exception as exc:
             logger.warning(
-                "Could not list Sum configs from Bitbucket: %s "
+                "Could not list RC1 Sum configs from Bitbucket: %s "
                 "-- falling back to defaults",
                 exc,
             )
@@ -296,18 +326,16 @@ class SumConfigFetcher:
         config_dir = self.output_dir / config_name
         marker = config_dir / ".config_fetched"
         if marker.exists() and not self.force:
-            logger.info("Sum config already fetched: %s", config_name)
+            logger.info("RC1 Sum config already fetched: %s", config_name)
             return config_dir
 
         remote_root = f"{SUM_BASE_PATH}/{config_name}"
-        logger.info("Fetching Sum config %s from Bitbucket ...", config_name)
+        logger.info("Fetching RC1 Sum config %s from Bitbucket ...", config_name)
         total = self._download_tree(remote_root, config_dir)
         marker.write_text(f"{total}\n", encoding="utf-8")
         logger.info(
-            "Sum config %s: %d files downloaded to %s",
-            config_name,
-            total,
-            config_dir,
+            "RC1 Sum config %s: %d files downloaded to %s",
+            config_name, total, config_dir,
         )
         return config_dir
 
@@ -322,16 +350,10 @@ class SumConfigFetcher:
         config_names:
             Specific config names to fetch.  ``None`` = discover and
             fetch all available configs.
-
-        Returns
-        -------
-        dict mapping *config_name* -> local directory path.
         """
         if config_names is None:
             config_names = self.discover_configs()
         return {name: self.fetch_config(name) for name in config_names}
-
-    # -- internal helpers --------------------------------------------------
 
     def _download_tree(self, remote_dir: str, local_dir: Path) -> int:
         """Recursively download every file under *remote_dir*."""
@@ -346,8 +368,6 @@ class SumConfigFetcher:
         dirs = [e for e in entries if e.entry_type == "DIRECTORY"]
         total = 0
 
-        # Bulk-fetch all files in this directory
-        # entry.path is the full repo-relative path (e.g. "00_Arxml/Sum/.../Adc_Cfg.h")
         if files:
             paths = [e.path for e in files]
             try:
@@ -372,76 +392,65 @@ class SumConfigFetcher:
                     except Exception as exc2:
                         logger.warning("  Failed: %s: %s", fentry.path, exc2)
 
-        # Recurse into sub-directories
-        # entry.path is already the full path — use it directly
         for d in dirs:
             dir_name = Path(d.path).name
-            total += self._download_tree(
-                d.path,
-                local_dir / dir_name,
-            )
+            total += self._download_tree(d.path, local_dir / dir_name)
 
         return total
 
 
 # ---------------------------------------------------------------------------
-# SourceRepoFetcher — shallow-clone repos from Bitbucket
+# RC1SourceRepoFetcher — shallow-clone repos from Bitbucket
 # ---------------------------------------------------------------------------
 
-# Repos that are shared across all modules (clone once).
-_SHARED_REPOS: List[str] = [
-    "aurix3g_sw_mcal_tc4xx_infra_sfr",
-]
-
-
 def _repo_slug_for_module(module: str, kind: str) -> str:
-    """Derive the Bitbucket repo slug from a module name and repo kind.
+    """Derive the RC1 Bitbucket repo slug from a module name and repo kind.
 
     Parameters
     ----------
     module:
-        MCAL module name (e.g. ``"ADC"``, ``"DMA"``).
+        MCAL module name (e.g. ``"GPT"``, ``"DMA"``).
     kind:
-        One of ``"src"``, ``"val"``, ``"sfr"``.
+        One of ``"src"``, ``"ver"``, ``"sfr"``.
 
     Returns
     -------
     str
-        The Bitbucket repo slug, e.g. ``"aurix3g_sw_mcal_tc4xx_adc_src"``.
+        The Bitbucket repo slug, e.g. ``"aurix_rc1_sw_mcal_dev_gpt"``.
+
+    RC1 naming patterns:
+        src:  aurix_rc1_sw_mcal_dev_{mod}           (source code)
+        ver:  aurix_rc1_sw_mcal_dev_{mod}_ver       (verification / Sum configs)
+        sfr:  aurix_rc1_sw_mcal_sfr                 (shared SFR repo)
     """
     mod = module.lower()
     if kind == "src":
-        return f"aurix3g_sw_mcal_tc4xx_{mod}_src"
-    elif kind == "val":
-        return f"aurix3g_sw_mcal_tc4xx_val_{mod}"
+        return f"aurix_rc1_sw_mcal_dev_{mod}"
+    elif kind == "ver":
+        return f"aurix_rc1_sw_mcal_dev_{mod}_ver"
     elif kind == "sfr":
-        return "aurix3g_sw_mcal_tc4xx_infra_sfr"
+        return "aurix_rc1_sw_mcal_sfr"
     raise ValueError(f"Unknown repo kind: {kind!r}")
 
 
-class SourceRepoFetcher:
-    """Shallow-clone Bitbucket repos needed for module ingestion.
-
-    Replaces the manual ``git clone`` step — given a module name, this
-    fetches the source, SFR, and validation repos automatically via
-    ``git clone --depth 1``.
+class RC1SourceRepoFetcher:
+    """Shallow-clone RC1 Bitbucket repos needed for module ingestion.
 
     Parameters
     ----------
     output_dir:
         Base directory for cloned repos (typically ``TEMP_DATA_DIR``).
     module:
-        MCAL module name (e.g. ``"ADC"``).
+        MCAL module name (e.g. ``"GPT"``).
     ref:
         Git ref to clone (branch, tag, or commit). Default ``"master"``.
 
     Usage
     -----
-    >>> fetcher = SourceRepoFetcher(TEMP_DATA_DIR, "ADC")
+    >>> fetcher = RC1SourceRepoFetcher(TEMP_DATA_DIR, "GPT")
     >>> paths = fetcher.fetch_all()
     >>> paths["src"]    # Path to cloned source repo
     >>> paths["sfr"]    # Path to cloned SFR repo
-    >>> paths["val"]    # Path to cloned validation repo
     """
 
     def __init__(
@@ -463,15 +472,11 @@ class SourceRepoFetcher:
         )
 
     def _clone_or_update(self, repo_slug: str) -> Path:
-        """Shallow-clone a repo, or pull if it already exists.
-
-        Returns the local directory path.
-        """
+        """Shallow-clone a repo, or pull if it already exists."""
         local_dir = self.output_dir / repo_slug
         clone_url = self._clone_url(repo_slug)
 
         if local_dir.exists() and (local_dir / ".git").is_dir():
-            # Already cloned — fetch latest for the target ref
             logger.info("Repo already cloned: %s — pulling latest ...", repo_slug)
             try:
                 subprocess.run(
@@ -541,27 +546,31 @@ class SourceRepoFetcher:
     # -- Public API --------------------------------------------------------
 
     def fetch_source(self) -> Path:
-        """Clone/update the module source repo.
+        """Clone/update the RC1 module source repo.
 
-        Returns path like ``output_dir/aurix3g_sw_mcal_tc4xx_adc_src``.
+        Returns path like ``output_dir/aurix_rc1_sw_mcal_dev_gpt``.
         """
         slug = _repo_slug_for_module(self.module, "src")
         return self._clone_or_update(slug)
 
     def fetch_sfr(self) -> Path:
-        """Clone/update the shared SFR infrastructure repo.
+        """Clone/update the shared RC1 SFR repo.
 
-        Returns path like ``output_dir/aurix3g_sw_mcal_tc4xx_infra_sfr``.
+        Returns path like ``output_dir/aurix_rc1_sw_mcal_sfr``.
+
+        Note: RC1 SFR headers are at ``ssc/RC1S16/inc/`` (not ``ssc/inc/``
+        like A3G). The pipeline must use the correct subdirectory.
         """
         slug = _repo_slug_for_module(self.module, "sfr")
         return self._clone_or_update(slug)
 
-    def fetch_val(self) -> Path:
-        """Clone/update the module validation/test-spec repo.
+    def fetch_ver(self) -> Path:
+        """Clone/update the RC1 module verification repo.
 
-        Returns path like ``output_dir/aurix3g_sw_mcal_tc4xx_val_adc``.
+        Returns path like ``output_dir/aurix_rc1_sw_mcal_dev_gpt_ver``.
+        Contains Sum compile configs under ``cfg/Compile/``.
         """
-        slug = _repo_slug_for_module(self.module, "val")
+        slug = _repo_slug_for_module(self.module, "ver")
         return self._clone_or_update(slug)
 
     def fetch_all(self) -> Dict[str, Path]:
@@ -569,10 +578,46 @@ class SourceRepoFetcher:
 
         Returns a dict mapping repo kind → local path::
 
-            {"src": Path(...), "sfr": Path(...), "val": Path(...)}
+            {"src": Path(…), "sfr": Path(…), "ver": Path(…)}
         """
         return {
             "src": self.fetch_source(),
             "sfr": self.fetch_sfr(),
-            "val": self.fetch_val(),
+            "ver": self.fetch_ver(),
         }
+
+    @staticmethod
+    def sfr_include_dir(sfr_repo_path: Path) -> Path:
+        """Return the actual SFR header directory within the cloned repo.
+
+        RC1 SFR headers live at ``ssc/RC1S16/inc/`` (vs A3G ``ssc/inc/``).
+        """
+        return sfr_repo_path / "ssc" / RC1_SFR_DEVICE / "inc"
+
+    @staticmethod
+    def sfr_repo_dir(sfr_repo_path: Path) -> Path:
+        """Return the SFR device directory (parent of inc/).
+
+        For ``sfr_parsers.py`` which expects a directory containing
+        device subdirectories.  RC1 layout is:
+
+            aurix_rc1_sw_mcal_sfr/ssc/RC1S16/inc/Ifx*.h
+
+        We return ``ssc/`` so that ``discover_devices()`` can be called
+        with ``devices=["RC1S16"]`` (the device subfolder is ``RC1S16/inc/``).
+
+        However, sfr_parsers.py expects ``{device}/Ifx*.h`` directly — so
+        we return the ``ssc/`` directory and the device folder must contain
+        the .h files directly.  Since RC1 puts them under ``RC1S16/inc/``,
+        we return ``ssc/RC1S16`` as the pseudo repo root.
+        """
+        return sfr_repo_path / "ssc"
+
+    def source_dir(self) -> Path:
+        """Return the source repo root directory.
+
+        Returns path like ``output_dir/aurix_rc1_sw_mcal_dev_gpt``.
+        Source headers: ``ssc/inc/``, source code: ``ssc/src/``.
+        """
+        slug = _repo_slug_for_module(self.module, "src")
+        return self.output_dir / slug

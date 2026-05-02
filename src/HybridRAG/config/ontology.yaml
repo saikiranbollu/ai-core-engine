@@ -20,12 +20,14 @@
 # -----------------------------------------------------------------------------
 metadata:
   name: "Automotive Embedded Software Ontology"
-  version: "2.0.0"
+  version: "3.0.0"
   domain: "automotive_embedded_software"
   description: >
-    Unified ontology covering both MCAL productive-software requirements
-    (Jama-based) and ILLD reference-software artefacts (code, HW specs,
-    architecture, tests).  Activate a profile via storage_config.yaml.
+    Unified ontology covering MCAL productive-software requirements
+    (Jama-based), EA-extracted architecture/design (QEAX), and ILLD
+    reference-software artefacts (code, HW specs, tests).
+    v3.0: SWA_*/SWUD_* node types replaced by EA_* (QEAX extraction).
+    Activate a profile via storage_config.yaml.
   compliance:
     - "ASPICE"
     - "ISO 26262"
@@ -1016,2166 +1018,915 @@ profiles:
             description: "Whether this module is an AUTOSAR standardised BSW module"
 
       # =====================================================================
-      #  SWA (Software Architecture) — Exported SW Interface Node Types
+      #  EA (Enterprise Architect) — QEAX-Extracted Node Types
       # =====================================================================
-      # Extracted from SWA PDF/DOCX documents, section "Exported SW interfaces"
-      # (e.g. section 3.1.8 in TC4xx_SW_MCAL_SWA_Adc).
+      # Extracted directly from the QEAX model file (EA SQLite repository)
+      # via ea_graph_builder.py and ea_diagram_extractor.py.
       #
-      # These capture the *architectural specification* of the module's public
-      # interface — data types, macros, API functions, callbacks, and interrupt
-      # handlers — as authored in the SWA document.  Each element carries
-      # explicit traceability back to PRQ requirements via parentID tags
-      # embedded in the source document.
+      # These capture the complete architectural and detailed design data
+      # authored in Enterprise Architect — functions, data types, config
+      # parameters, error codes, design decisions, requirements, registers,
+      # memory sections, diagrams, and more.
       #
-      # Source format: AUTOSAR-style specification tables rendered as
-      # structured Markdown after PDF/DOCX conversion.
+      # Each node carries an ea_id (unique EA Object_ID) and dynamic
+      # tagged values (tv_*) and operation tags (op_*) from the EA model.
+      #
+      # Source: QEAX file → SQLite → ea_graph_builder.py / ea_diagram_extractor.py
+      # Replaces: SWA_* and SWUD_* node types (PDF-parsed equivalents)
       # =====================================================================
 
-      # -- SWA_DataType  —  Architectural data-type specification ------------
-      - name: "SWA_DataType"
+      # -- EA_Function  —  API and local functions ---------------------------
+      - name: "EA_Function"
         jama_item_type: null
         description: >
-          Data-type definition from the SWA "Exported SW interfaces >
-          Data types" section.  Each entry specifies an AUTOSAR / Infineon
-          type used in the module's API surface — with its base type,
-          declared file, valid range, description, and design decisions.
-          Examples: Adc_ChannelType, Adc_GroupType, Adc_StatusType.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
+          Function element extracted from the QEAX model.  Covers both
+          API-level functions (generic_interface stereotype, kind=api)
+          and local/internal functions (local_function_interface, kind=local).
+          Replaces SWA_Function and SWUD_Function from PDF-based extraction.
+          Each function carries its full signature (return type, parameters),
+          tagged values from EA, and operation-level tags.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
         properties:
-          - name: "type_name"
-            data_type: "string"
+          - name: "ea_id"
+            data_type: "integer"
             required: true
             unique: true
-            description: "Canonical type name (e.g. Adc_ChannelType)"
-          - name: "base_type"
+            description: "Enterprise Architect Object_ID (unique within the QEAX model)"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Function name (e.g. Adc_Init, Adc_StartGroupConversion)"
+          - name: "object_type"
             data_type: "string"
             required: false
-            description: "Underlying C type (e.g. uint8, uint16, sint32, Enumeration, Structure)"
-          - name: "type_category"
+            description: "EA Object_Type (e.g. Class, Interface)"
+          - name: "stereotype"
             data_type: "string"
             required: false
-            description: "Category of the data type"
-            validation_rules:
-              allowed_values:
-                - "simple_type"       # Scalar typedef (e.g. Adc_ChannelType = uint8)
-                - "enumeration"       # Enum with named literals (e.g. Adc_StatusType)
-                - "structure"         # C struct (e.g. Adc_ConfigType)
-                - "function_pointer"  # Callback typedef (e.g. Adc_NotifyFnPtrType)
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Header file where the type is declared (e.g. Adc.h)"
-          - name: "range_min"
-            data_type: "string"
-            required: false
-            description: "Minimum valid value / label"
-          - name: "range_max"
-            data_type: "string"
-            required: false
-            description: "Maximum valid value / label"
-          - name: "description"
+            description: "EA stereotype (generic_interface or local_function_interface)"
+          - name: "note"
             data_type: "text"
             required: false
-            description: "Full textual description of the type and its semantics"
-          - name: "design_decisions"
-            data_type: "text"
+            description: "HTML-stripped Note field from EA element"
+          - name: "package_id"
+            data_type: "integer"
             required: false
-            description: "Architectural design decisions associated with this type"
-          - name: "source"
-            data_type: "string"
-            required: false
-            description: "Origin of the type (AUTOSAR, Infineon, etc.)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: >
-              PRQ requirement IDs traced from the SWA document via
-              [req parentID=...] tags (e.g. AU3GM-PRQ-39613)
+            description: "EA Package_ID for scoping"
           - name: "module"
             data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC, SPI)"
-          - name: "section_number"
+            required: false
+            description: "MCAL module name (e.g. Adc, Can, Spi)"
+          - name: "kind"
             data_type: "string"
             required: false
-            description: "SWA document section number (e.g. 3.1.8.1)"
-          - name: "source_document"
-            data_type: "string"
+            description: "Function kind: 'api' (generic_interface) or 'local' (local_function_interface)"
+          - name: "classifier_id"
+            data_type: "integer"
             required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWA_Macro  —  Architectural macro definition ----------------------
-      - name: "SWA_Macro"
-        jama_item_type: null
-        description: >
-          Macro definition from the SWA "Exported SW interfaces > Macros"
-          section.  Specifies a preprocessor macro that is part of the
-          module's public interface — with its value, declared file,
-          description, and design decisions.
-          Example: ADC_SR_COUNT (number of service request nodes per kernel).
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "macro_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Macro identifier (e.g. ADC_SR_COUNT)"
-          - name: "value"
-            data_type: "string"
-            required: false
-            description: "Macro value or expression"
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Header file where the macro is defined (e.g. Adc.h)"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Full textual description of the macro's purpose"
-          - name: "design_decisions"
-            data_type: "text"
-            required: false
-            description: "Architectural design decisions related to this macro"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: >
-              PRQ requirement IDs traced from the SWA document via
-              [req parentID=...] tags
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC, SPI)"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.1.8.2)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWA_Function  —  Architectural function specification -------------
-      - name: "SWA_Function"
-        jama_item_type: null
-        description: >
-          Function specification from the SWA "Exported SW interfaces"
-          section.  Covers four categories of functions — API functions,
-          notification/callback handlers, scheduled functions, and interrupt
-          handlers — all of which share the same AUTOSAR-style specification
-          table format.  Each entry includes the full function signature,
-          service ID, ASIL level, sync/async behaviour, reentrancy
-          constraints, parameter list, return type, description, design
-          decisions, and error handling.
-          Examples: Adc_Init, Adc_StartGroupConversion,
-          Adc_DmaTransferCompletionHandler, Adc_ValidResultEventHandler.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "function_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Function identifier (e.g. Adc_Init)"
-          - name: "function_category"
-            data_type: "string"
-            required: true
-            description: "Functional category within the SWA exported interfaces"
-            validation_rules:
-              allowed_values:
-                - "api"                 # 3.1.8.7   API functions
-                - "callback"            # 3.1.8.8   Notifications and callbacks
-                - "scheduled"           # 3.1.8.9   Scheduled functions
-                - "interrupt_handler"   # 3.1.8.10  Interrupt handlers
-          - name: "syntax"
-            data_type: "text"
-            required: false
-            description: >
-              Full C function signature as written in the SWA spec table
-              (e.g. "void Adc_Init(const Adc_ConfigType * const ConfigPtr)")
+            description: "EA Classifier field (links to parent type)"
           - name: "return_type"
             data_type: "string"
             required: false
-            description: "Return type of the function (e.g. void, Std_ReturnType)"
-          - name: "parameters_in"
-            data_type: "list[object]"
-            required: false
-            description: >
-              List of input parameters, each with name, type, description,
-              and optional range [MIN, MAX]
-          - name: "parameters_out"
-            data_type: "list[object]"
-            required: false
-            description: "List of output parameters"
-          - name: "parameters_inout"
-            data_type: "list[object]"
-            required: false
-            description: "List of in-out parameters"
-          - name: "service_id"
+            description: "Return type extracted from t_operation.Type"
+          - name: "parameters"
             data_type: "string"
             required: false
-            description: "AUTOSAR service ID (hex, e.g. 0x00)"
-          - name: "asil_level"
-            data_type: "string"
-            required: false
-            description: "ASIL classification (e.g. D, B, QM)"
-            validation_rules:
-              allowed_values: ["QM", "A", "B", "C", "D"]
-          - name: "sync_async"
-            data_type: "string"
-            required: false
-            description: "Synchronous or Asynchronous execution"
-            validation_rules:
-              allowed_values: ["Synchronous", "Asynchronous"]
-          - name: "function_type"
-            data_type: "string"
-            required: false
-            description: "AUTOSAR function type classification"
-            validation_rules:
-              allowed_values: ["Standard", "Non-Standard"]
-          - name: "reentrancy"
-            data_type: "string"
-            required: false
-            description: >
-              Reentrancy classification (e.g. Non Reentrant, Reentrant,
-              Conditionally Reentrant)
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Full textual description of the function's behaviour"
-          - name: "design_decisions"
-            data_type: "text"
-            required: false
-            description: >
-              Architectural design decisions, rationale, and source
-              associated with this function
-          - name: "error_handling"
-            data_type: "text"
-            required: false
-            description: >
-              Error codes reported by this function
-              (e.g. ADC_E_UNINIT, ADC_E_PARAM_POINTER)
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Header/source file where the function is declared"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: >
-              PRQ requirement IDs traced from the SWA document via
-              [req parentID=...] tags
-          - name: "configuration_dependencies"
-            data_type: "list[string]"
-            required: false
-            description: >
-              Configuration parameter names that gate this function's
-              availability (e.g. AdcDeInitApi, AdcHwTriggerApi)
-          - name: "memory_section"
-            data_type: "string"
-            required: false
-            description: "Memory section for the function (e.g. ADC_SEC_CODE_ASIL_D)"
-          - name: "user_hints"
-            data_type: "text"
-            required: false
-            description: "Usage hints and preconditions documented in the SWA spec"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC, SPI)"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.1.8.7.1)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
+            description: "Semicolon-joined 'name: type' parameter list from t_operationparams"
           - name: "embedding"
             data_type: "vector"
             dimensions: 1536
             required: false
 
-      # -- SWA_EnumLiteral  —  Enumeration literal / value -------------------
-      - name: "SWA_EnumLiteral"
+      # -- EA_DataType  —  Structs, enums, typedefs, function pointers ------
+      - name: "EA_DataType"
         jama_item_type: null
         description: >
-          Individual enumeration literal belonging to an SWA_DataType of
-          category "enumeration".  Each literal has a symbolic name,
-          numeric value, and a description of its semantics.
-          Examples: ADC_IDLE (0), ADC_BUSY (1), ADC_TRIGG_SRC_SW (0),
-          ADC_HW_TRIG_RISING_EDGE (1), ADC_CONV_MODE_ONESHOT (0).
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
+          Data type element from the QEAX model.  Covers structures
+          (kind=struct), enumerations (kind=enum), typedefs (kind=typedef),
+          and function pointers (kind=function_pointer).  Replaces
+          SWA_DataType, SWA_EnumLiteral, and SWUD_TypeDefinition.
+          Enum literals and struct members are stored in the 'attributes'
+          property as semicolon-delimited strings.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
         properties:
-          - name: "literal_name"
-            data_type: "string"
-            required: true
-            description: "Symbolic name of the enum literal (e.g. ADC_IDLE)"
-          - name: "value"
-            data_type: "string"
-            required: false
-            description: "Numeric value (e.g. 0, 1, 0x10)"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Textual description of the literal's meaning"
-          - name: "parent_type"
-            data_type: "string"
-            required: true
-            description: "Name of the parent SWA_DataType (e.g. Adc_StatusType)"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWA_DesignDecision  —  Architectural design decision --------------
-      - name: "SWA_DesignDecision"
-        jama_item_type: null
-        description: >
-          Inline design decision documented within the SWA specification
-          tables for data types, functions, or macros.  Each decision
-          carries a featureID (GUID), one or more parentID references
-          to PRQ requirements, a title, description, rationale, and
-          source (AUTOSAR or Infineon).
-          Examples: "ADC: Start-up calibration",
-          "ADC: ADC_HW_TRIG_NO_EDGE as an additional literal",
-          "ADC: ADC_STREAM_COMPLETED_IDLE internal state".
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "decision_id"
-            data_type: "string"
+          - name: "ea_id"
+            data_type: "integer"
             required: true
             unique: true
-            description: "Feature GUID from the [req featureID=...] tag"
-          - name: "title"
+            description: "Enterprise Architect Object_ID"
+          - name: "name"
             data_type: "string"
             required: true
-            description: "Short title of the design decision"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Full description of the design decision"
-          - name: "rationale"
-            data_type: "text"
-            required: false
-            description: "Rationale justifying the decision"
-          - name: "source"
+            description: "Type name (e.g. Adc_ChannelType, Adc_ConfigType)"
+          - name: "object_type"
             data_type: "string"
             required: false
-            description: "Origin (AUTOSAR, Infineon, etc.)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: >
-              PRQ requirement IDs from [req parentID=...] tags
-              (e.g. AU3GM-PRQ-39606)
-          - name: "parent_element"
-            data_type: "string"
-            required: false
-            description: >
-              Name of the SWA element this decision belongs to
-              (e.g. Adc_Init, Adc_HwTriggerSignalType)
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWA_ErrorCode  —  Error code reported by SWA functions ------------
-      - name: "SWA_ErrorCode"
-        jama_item_type: null
-        description: >
-          Error code that can be reported by one or more SWA functions.
-          These are development errors (DET) or production / runtime
-          errors defined in the module's error handling section.
-          Multiple functions may share the same error code, making this a
-          reusable node that links to all reporting functions.
-          Examples: ADC_E_UNINIT, ADC_E_PARAM_GROUP, ADC_E_BUSY,
-          ADC_E_CDSP_RESET_FAILURE, ADC_E_DMA_TRANSFER_FAILURE.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "error_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Error code macro name (e.g. ADC_E_UNINIT)"
-          - name: "error_category"
-            data_type: "string"
-            required: false
-            description: "Error category classification"
-            validation_rules:
-              allowed_values:
-                - "development"   # DET errors (e.g. ADC_E_UNINIT)
-                - "runtime"       # Runtime / production errors
-                - "safety"        # Safety-relevant errors
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the error condition"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWA_ConfigParameter  —  Configuration gating parameter ------------
-      - name: "SWA_ConfigParameter"
-        jama_item_type: null
-        description: >
-          Configuration parameter that controls the availability of one
-          or more SWA functions.  When configured as TRUE, the gated
-          API is available; when FALSE, the API is excluded from the
-          build.  These map to ECUC configuration parameters in the
-          AUTOSAR configuration tool.
-          Examples: AdcDeInitApi, AdcEnableStartStopGroupApi,
-          AdcHwTriggerApi, AdcGrpNotifCapability, AdcReadGroupApi,
-          AdcInitCheckApi, AdcEnableDiagnostics, AdcEnableMissedHwTrigger.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "param_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Configuration parameter name (e.g. AdcDeInitApi)"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the configuration parameter"
-          - name: "default_value"
-            data_type: "string"
-            required: false
-            description: "Default value (TRUE / FALSE)"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWA_PropertyVariable  —  Property file variable -------------------
-      - name: "SWA_PropertyVariable"
-        jama_item_type: null
-        description: >
-          Property file variable from the SWA "Exported SW Interfaces"
-          section (typically preceding the data types).  These variables
-          are defined in device-specific .properties files and describe
-          hardware configuration parameters like available input
-          connections, clock sources, etc.
-          Example: Eru.InputConnectionErs[x] in AURIX3G_TC4[X]_[Y].properties.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "variable_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Property variable name (e.g. Eru.InputConnectionErs[x])"
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Properties file (e.g. AURIX3G_TC4[X]_[Y].properties)"
-          - name: "range"
-            data_type: "string"
-            required: false
-            description: "Valid range or format pattern"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Full description of the variable's purpose"
-          - name: "details"
-            data_type: "text"
-            required: false
-            description: "Detailed information about the variable's values and format"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC, ERU)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # =====================================================================
-      #  SWA Section 3.1.3 — Architectural Decisions
-      # =====================================================================
-      # Standalone architectural decisions from SWA section 3.1.3.
-      # Each decision documents a specific design choice, its rationale,
-      # context, and traceability to PRQ requirements.  These are distinct
-      # from the inline SWA_DesignDecision nodes extracted from the
-      # specification tables in section 3.1.8.
-      # =====================================================================
-
-      - name: "SWA_ArchitecturalDecision"
-        jama_item_type: null
-        description: >
-          Standalone architectural decision from SWA section 3.1.3.
-          Each entry documents a specific design choice made for the
-          module — covering hardware feature support, trigger mechanisms,
-          result handling modes, broken wire detection, on-chip signal
-          monitoring, configuration structure, and resource sharing.
-          Contains a feature GUID, traceability to PRQ requirements,
-          a stereotype (design_decision or information), rationale,
-          context, and hierarchical sub-decisions.
-          Examples: "ADC: Hardware feature support",
-          "ADC: DMA based result handling",
-          "ADC: On-chip signal monitoring, Core-self diagnostic".
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "decision_id"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Feature GUID from the [req featureID=...] tag"
-          - name: "title"
-            data_type: "string"
-            required: true
-            description: "Short title (e.g. 'ADC: Hardware trigger mechanisms')"
           - name: "stereotype"
             data_type: "string"
             required: false
-            description: "UML stereotype classifying the entry"
-            validation_rules:
-              allowed_values:
-                - "design_decision"   # Architectural design choice
-                - "information"       # Informational / contextual note
-                - "context"           # Background context
-          - name: "description"
+            description: "EA stereotype (structure, enum, type, function_pointer)"
+          - name: "note"
             data_type: "text"
             required: false
-            description: "Full description of the architectural decision"
-          - name: "rationale"
-            data_type: "text"
-            required: false
-            description: "Rationale justifying the decision"
-          - name: "context"
-            data_type: "text"
-            required: false
-            description: "Background context for the decision"
-          - name: "benefits"
-            data_type: "text"
-            required: false
-            description: "Listed benefits of the chosen approach"
-          - name: "limitations"
-            data_type: "text"
-            required: false
-            description: "Listed limitations or constraints"
-          - name: "notes"
-            data_type: "text"
-            required: false
-            description: "Additional notes or caveats"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.1.3.5.2)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "feature_id_references"
-            data_type: "list[string]"
-            required: false
-            description: "Feature GUID references from parentID (non-PRQ GUIDs)"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # =====================================================================
-      #  SWA Section 3.1.5 — HW-SW Interface
-      # =====================================================================
-      # Hardware peripherals the module depends on, as documented in
-      # SWA section 3.1.5.  Each peripheral specifies functional features,
-      # users of the hardware, diagnostic features, and HW events used.
-      # =====================================================================
-
-      - name: "SWA_HwPeripheral"
-        jama_item_type: null
-        description: >
-          Hardware peripheral dependency from SWA section 3.1.5
-          (HW-SW Interface).  Each entry describes a hardware IP block
-          that the module depends on — its functional features, which
-          driver configures it, diagnostic features (SMU alarms), and
-          hardware events consumed by the module.
-          Examples: TMADC (primary), CDSP (post-processing),
-          ERU (external triggers), DMA (result transfer),
-          eGTM/GTM (timer triggers), DSADC (carrier signal trigger).
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "peripheral_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Hardware peripheral / IP block name (e.g. TMADC, ERU, CDSP)"
-          - name: "peripheral_type"
-            data_type: "string"
-            required: false
-            description: "Classification of the peripheral relationship"
-            validation_rules:
-              allowed_values:
-                - "primary"           # Core peripheral (e.g. TMADC for ADC)
-                - "dependent"         # Dependent peripheral (e.g. DMA, ERU)
-                - "shared"            # Shared with other drivers
-          - name: "functional_features"
-            data_type: "text"
-            required: false
-            description: "Hardware functional features used by the module"
-          - name: "unsupported_features"
-            data_type: "text"
-            required: false
-            description: "Hardware features NOT supported by the driver"
-          - name: "users_of_hardware"
-            data_type: "text"
-            required: false
-            description: "Which driver(s) configure and access the peripheral"
-          - name: "diagnostic_features"
-            data_type: "text"
-            required: false
-            description: "Supported diagnostic features (CSD, BWD, monitoring)"
-          - name: "hw_events"
-            data_type: "list[string]"
-            required: false
-            description: "Hardware events consumed (result, boundary, error events)"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.1.5.3)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module that depends on this peripheral"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # =====================================================================
-      #  SWA Section 3.1.6 — SW-SW Interface
-      # =====================================================================
-      # External software dependencies (APIs called by the module),
-      # as documented in SWA section 3.1.6.  Each dependency specifies
-      # the external function/macro name, provider module, and purpose.
-      # =====================================================================
-
-      - name: "SWA_SwDependency"
-        jama_item_type: null
-        description: >
-          External software dependency from SWA section 3.1.6
-          (SW-SW Interface).  Each entry represents an API function
-          or macro from another module that the current module calls.
-          Captures the full dependency graph between MCAL modules.
-          Examples: Cdsp_Setup, Dma_ChUpdate, Det_ReportError,
-          SchM_Enter_Adc_RuntimeProtWriteSeq, Mcu_GetStmTicks.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "api_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "External API/function/macro name (e.g. Cdsp_Setup)"
-          - name: "provider_module"
-            data_type: "string"
-            required: false
-            description: "Module that provides this API (e.g. Cdsp, Dma, Det)"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Why the module uses this external API"
-          - name: "dependency_type"
-            data_type: "string"
-            required: false
-            description: "Type of dependency"
-            validation_rules:
-              allowed_values:
-                - "function_call"     # Direct function call (e.g. Cdsp_Setup)
-                - "macro"             # Macro usage (e.g. MCALUTIL_SFRREAD)
-                - "callback"          # Callback invocation (e.g. Dem_SetEventStatus)
-                - "protection"        # Exclusive area (e.g. SchM_Enter_*)
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module that calls this API (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # =====================================================================
-      #  SWA Section 3.1.7 — Configuration
-      # =====================================================================
-      # ECUC configuration containers and parameters from SWA section 3.1.7.
-      # The configuration hierarchy follows the AUTOSAR ECUC model:
-      #   Module (Adc) → ConfigSet → Containers → Parameters
-      # =====================================================================
-
-      - name: "SWA_ConfigContainer"
-        jama_item_type: null
-        description: >
-          ECUC configuration container from SWA section 3.1.7
-          (Configuration).  Each container groups related configuration
-          parameters in the AUTOSAR ECUC model.  Containers can be
-          nested (sub-containers) and carry multiplicity constraints.
-          Examples: Adc, AdcGeneral, AdcConfigSet, AdcHwUnit, AdcGroup,
-          AdcChannel, AdcTimerTriggerConfig, AdcEruTriggerConfig,
-          AdcPostProcessingConfig, AdcCdspConfigSet.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "container_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Container name (e.g. AdcHwUnit, AdcGroup)"
-          - name: "container_type"
-            data_type: "string"
-            required: false
-            description: "ECUC container type"
-            validation_rules:
-              allowed_values:
-                - "EcucModuleDef"
-                - "EcucParamConfContainerDef"
-                - "EcucChoiceContainerDef"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the configuration container"
-          - name: "multiplicity_min"
+          - name: "package_id"
             data_type: "integer"
             required: false
-            description: "Lower multiplicity (e.g. 0, 1)"
-          - name: "multiplicity_max"
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "kind"
+            data_type: "string"
+            required: false
+            description: "Data type kind: struct, enum, typedef, function_pointer"
+          - name: "classifier_id"
             data_type: "integer"
             required: false
-            description: "Upper multiplicity (e.g. 1, 7, 1024)"
-          - name: "post_build_variant_multiplicity"
-            data_type: "boolean"
-            required: false
-            description: "Whether multiplicity is variant-dependent"
-          - name: "multiplicity_config_class"
+          - name: "attributes"
             data_type: "string"
             required: false
-            description: "Configuration class for multiplicity (Pre-Compile / Post-Build)"
-          - name: "origin"
-            data_type: "string"
-            required: false
-            description: "Origin of the container definition (AUTOSAR_ECUC, Infineon)"
-          - name: "scope"
-            data_type: "string"
-            required: false
-            description: "Scope of the container (Local, ECU)"
-          - name: "dependencies"
-            data_type: "list[string]"
-            required: false
-            description: "Dependencies on other containers or modules"
-          - name: "sub_containers"
-            data_type: "list[string]"
-            required: false
-            description: "Names of child sub-containers"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.1.7.1.1)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
+            description: "Semicolon-joined 'name: type = default' from t_attribute (struct members or enum literals)"
           - name: "embedding"
             data_type: "vector"
             dimensions: 1536
             required: false
 
-      - name: "SWA_ConfigParam"
+      # -- EA_ConfigParameter  —  ECUC configuration parameters -------------
+      - name: "EA_ConfigParameter"
         jama_item_type: null
         description: >
-          ECUC configuration parameter from SWA section 3.1.7
-          (Configuration).  Each parameter has a full AUTOSAR-style
-          specification: name, type, range, default value, multiplicity,
-          post-build variant support, origin, and dependencies.
-          Covers boolean, enumeration, integer, float, string, and
-          reference parameter types.
-          Examples: AdcDeInitApi (boolean), AdcPriorityImplementation
-          (enum), AdcSamplingTime (float), AdcGroupConversionMode (enum).
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
+          Configuration parameter from the QEAX model
+          (ifx_config_parameter stereotype).  Replaces SWA_ConfigParameter,
+          SWA_ConfigParam, and SWUD_DerivedConfigParam.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
         properties:
-          - name: "param_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Configuration parameter name (e.g. AdcDeInitApi)"
-          - name: "param_type"
-            data_type: "string"
-            required: false
-            description: "ECUC parameter type definition"
-            validation_rules:
-              allowed_values:
-                - "EcucBooleanParamDef"
-                - "EcucEnumerationParamDef"
-                - "EcucIntegerParamDef"
-                - "EcucFloatParamDef"
-                - "EcucStringParamDef"
-                - "EcucReferenceDef"
-                - "EcucFunctionNameDef"
-                - "EcucLinkerSymbolDef"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the parameter and its effect"
-          - name: "range_min"
-            data_type: "string"
-            required: false
-            description: "Minimum value or enumeration list"
-          - name: "range_max"
-            data_type: "string"
-            required: false
-            description: "Maximum value"
-          - name: "range_values"
-            data_type: "text"
-            required: false
-            description: "Enumeration values or valid range description"
-          - name: "default_value"
-            data_type: "string"
-            required: false
-            description: "Default value (e.g. TRUE, FALSE, 0, enum literal)"
-          - name: "multiplicity_min"
+          - name: "ea_id"
             data_type: "integer"
-            required: false
-            description: "Lower multiplicity"
-          - name: "multiplicity_max"
-            data_type: "integer"
-            required: false
-            description: "Upper multiplicity"
-          - name: "multiplicity"
-            data_type: "string"
-            required: false
-            description: >
-              Raw multiplicity string from the specification table
-              (e.g. '0..8', '1', '0..1').  Stored alongside the parsed
-              multiplicity_min / multiplicity_max integer fields.
-          - name: "post_build_variant_value"
-            data_type: "boolean"
-            required: false
-            description: "Whether the value can vary across post-build variants"
-          - name: "value_config_class"
-            data_type: "string"
-            required: false
-            description: "Configuration class (Pre-Compile / Post-Build / Link)"
-          - name: "origin"
-            data_type: "string"
-            required: false
-            description: "Origin (AUTOSAR_ECUC, Infineon)"
-          - name: "scope"
-            data_type: "string"
-            required: false
-            description: "Scope (LOCAL, ECU)"
-          - name: "dependencies"
-            data_type: "list[string]"
-            required: false
-            description: "Dependencies on other parameters or containers"
-          - name: "design_decisions"
-            data_type: "text"
-            required: false
-            description: "Inline design decisions from specification table"
-          - name: "parent_container"
-            data_type: "string"
-            required: false
-            description: "Name of the parent SWA_ConfigContainer"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.1.7.1.5.3)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # =====================================================================
-      #  SWA Section 3.1.9 — File Structure
-      # =====================================================================
-      # Source files (C sources, headers, generated files, plugin files)
-      # from SWA section 3.1.9.  Each file carries a description,
-      # traceability to PRQ requirements, and classification.
-      # =====================================================================
-
-      - name: "SWA_SourceFile"
-        jama_item_type: null
-        description: >
-          Source file specification from SWA section 3.1.9
-          (File Structure).  Each entry describes a C source file,
-          header file, or code generator plugin file that belongs to
-          the module — with its description, classification (static,
-          generated, plugin), and PRQ traceability.
-          Examples: Adc.h (static header), Adc.c (static source),
-          Adc_Cfg.h (generated), Adc_PBcfg.c (generated post-build),
-          Adc.m (plugin macro), Adc.xdm (plugin schema).
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "file_name"
-            data_type: "string"
             required: true
             unique: true
-            description: "File name (e.g. Adc.h, Adc_PBcfg.c)"
-          - name: "file_category"
-            data_type: "string"
-            required: false
-            description: "Classification of the file"
-            validation_rules:
-              allowed_values:
-                - "header_static"     # Static header (e.g. Adc.h)
-                - "header_generated"  # Generated header (e.g. Adc_Cfg.h)
-                - "source_static"     # Static source (e.g. Adc.c)
-                - "source_generated"  # Generated source (e.g. Adc_Data.c)
-                - "plugin"            # Code generator plugin (e.g. Adc.m)
-                - "sfr_header"        # SFR register header (e.g. IfxAdc_bf.h)
-                - "external_header"   # External dependency header (e.g. Dem.h)
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the file's purpose and contents"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.1.9.1)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "module"
+          - name: "name"
             data_type: "string"
             required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
+          - name: "object_type"
             data_type: "string"
             required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # =====================================================================
-      #  SWA Section 3.2 — Call Sequence Diagrams
-      # =====================================================================
-      # Call sequence (sequence diagram) descriptions from SWA section 3.2.
-      # Each entry documents the interaction flow between software
-      # components (Application, Adc, DMA, CDSP, etc.) for a specific
-      # operational scenario — initialization, conversion modes, result
-      # handling, diagnostics, and error paths.  The diagrams show the
-      # ordered sequence of API calls, callbacks, and internal operations
-      # that occur during each scenario.
-      #
-      # Source: SWA PDF section 3.2, LLM-extracted Markdown
-      # =====================================================================
-
-      - name: "SWA_CallSequence"
-        jama_item_type: null
-        description: >
-          Call sequence diagram from SWA section 3.2.  Each entry
-          documents the step-by-step interaction flow between software
-          components for a specific operational scenario such as
-          initialization, de-initialization, SW/HW triggered conversions,
-          DMA result handling modes, CDSP post-processing, and
-          broken-wire detection.  Captures the ordered sequence of API
-          calls, callbacks, notifications, and internal operations that
-          occur during the scenario.
-          Examples: "Initialization", "SW triggered one-shot conversion",
-          "HW triggered conversion linear streaming",
-          "DMA result handling for single access HW triggered conversion",
-          "Post-processing using CDSP", "Broken-wire detection".
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "sequence_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: >
-              Name of the call sequence scenario
-              (e.g. "Initialization", "SW triggered one-shot conversion")
-          - name: "scenario_category"
-            data_type: "string"
-            required: false
-            description: "High-level category of the call sequence"
-            validation_rules:
-              allowed_values:
-                - "initialization"          # Init / DeInit flows
-                - "sw_triggered_conversion" # Software-triggered conversions
-                - "hw_triggered_conversion" # Hardware-triggered conversions
-                - "dma_result_handling"     # DMA-based result transfer flows
-                - "post_processing"         # CDSP post-processing flows
-                - "diagnostics"            # Diagnostic / broken-wire flows
-                - "error_handling"         # Error and recovery flows
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: >
-              Full textual description of the call sequence scenario,
-              including the sequence of steps, participating components,
-              and the flow of control between them
-          - name: "actors"
-            data_type: "list[string]"
-            required: false
-            description: >
-              Software components / modules participating in the
-              sequence (e.g. Application, Adc, Dma, Cdsp, SchM, Det)
-          - name: "steps"
-            data_type: "text"
-            required: false
-            description: >
-              Ordered sequence of interaction steps extracted from
-              the call sequence diagram, preserving caller → callee
-              direction and any return values or conditions
-          - name: "preconditions"
-            data_type: "text"
-            required: false
-            description: >
-              Preconditions or assumptions before the call sequence
-              begins (e.g. "ADC module is initialized", "Group is idle")
-          - name: "postconditions"
-            data_type: "text"
-            required: false
-            description: >
-              Postconditions or resulting state after the call sequence
-              completes (e.g. "Group status = ADC_IDLE")
-          - name: "related_functions"
-            data_type: "list[string]"
-            required: false
-            description: >
-              Names of SWA_Function nodes referenced in this call
-              sequence (e.g. Adc_Init, Adc_StartGroupConversion,
-              Adc_ReadGroup)
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.2.1, 3.2.8)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # =====================================================================
-      #  SWA Section 3.1.10 — Memory Sections
-      # =====================================================================
-      # Memory section allocations from SWA section 3.1.10.  Each entry
-      # maps a memory section name to its purpose and requirement tracing.
-      # Note: This section often appears at the boundary of section 3.2
-      # in the PDF and may bleed into the dynamic view raw extraction.
-      # =====================================================================
-
-      - name: "SWA_MemorySection"
-        jama_item_type: null
-        description: >
-          Memory section allocation from SWA section 3.1.10.  Each entry
-          defines a named memory section (e.g. ADC_SEC_CODE_ASIL_D) used
-          by the module for code, data, or configuration placement, along
-          with traceability to PRQ requirements.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "section_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Memory section name (e.g. ADC_SEC_CODE_ASIL_D)"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Purpose / usage description of the memory section"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.1.10)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # =====================================================================
-      #  SWA Section 3.3 — Safety View
-      # =====================================================================
-      # Safety measures and Assumptions of Use (AoU) from SWA section 3.3.
-      # Section 3.3.1 contains safety measures categorised as:
-      #   3.3.1.1 — against SW faults
-      #   3.3.1.2 — against HW faults
-      #   3.3.1.3 — review-based
-      # Section 3.3.2 contains Assumptions of Use (AoU).
-      # Each entry carries a feature GUID, stereotype (design_decision),
-      # rationale, and traceability to PRQ requirements.
-      # =====================================================================
-
-      - name: "SWA_SafetyMeasure"
-        jama_item_type: null
-        description: >
-          Safety measure from SWA section 3.3.1.  Each entry documents
-          a specific safety mechanism implemented by the module to
-          mitigate faults — covering error detection, error reporting
-          (DET/DEM/safety errors), and recovery actions.  Categorised
-          as SW fault mitigation (3.3.1.1), HW fault mitigation (3.3.1.2),
-          or review-based measures (3.3.1.3).
-          Examples: "ADC: No nominal functionality in error scenario",
-          "ADC: CLC module enable check",
-          "ADC: Interrupt handler plausibility check".
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "decision_id"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Feature GUID from the [req featureID=...] tag"
-          - name: "title"
-            data_type: "string"
-            required: true
-            description: "Short title of the safety measure"
           - name: "stereotype"
             data_type: "string"
             required: false
-            description: "UML stereotype (typically design_decision)"
-            validation_rules:
-              allowed_values:
-                - "design_decision"
-                - "information"
-          - name: "description"
+          - name: "note"
             data_type: "text"
             required: false
-            description: "Full description of the safety measure"
-          - name: "rationale"
-            data_type: "text"
+          - name: "package_id"
+            data_type: "integer"
             required: false
-            description: "Rationale justifying the safety measure"
-          - name: "measure_category"
-            data_type: "string"
-            required: true
-            description: "Category of safety measure"
-            validation_rules:
-              allowed_values:
-                - "sw_fault"        # 3.3.1.1 — against software faults
-                - "hw_fault"        # 3.3.1.2 — against hardware faults
-                - "review_based"    # 3.3.1.3 — review-based measures
-          - name: "error_codes"
-            data_type: "list[string]"
-            required: false
-            description: >
-              Error codes reported by this measure
-              (e.g. ADC_E_BUSY, ADC_E_INVALID_ISR)
-          - name: "error_type"
-            data_type: "string"
-            required: false
-            description: "Type of error: development, runtime, production, safety"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.3.1.1.5)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "feature_id_references"
-            data_type: "list[string]"
-            required: false
-            description: "Feature GUID references from parentID (non-PRQ GUIDs)"
           - name: "module"
             data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
             required: false
-            description: "Source SWA document filename"
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
           - name: "embedding"
             data_type: "vector"
             dimensions: 1536
             required: false
 
-      - name: "SWA_SafetyAoU"
+      # -- EA_ConfigContainer  —  ECUC configuration containers -------------
+      - name: "EA_ConfigContainer"
         jama_item_type: null
         description: >
-          Assumption of Use from SWA section 3.3.2.  Each entry
-          documents a safety-related constraint or obligation that
-          the integrator / user of the module MUST observe for correct
-          and safe operation.  Typically carries a design_decision
-          stereotype with rationale and PRQ traceability.
-          Examples: "ADC: Adequate sampling time for software-triggered
-          continuous AdcGroups",
-          "ADC: Clearing of ICCM and DCCM".
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
+          Configuration container (config_struct stereotype) from the QEAX
+          model.  Replaces SWA_ConfigContainer and SWUD_ConfigStructure.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
         properties:
-          - name: "decision_id"
-            data_type: "string"
+          - name: "ea_id"
+            data_type: "integer"
             required: true
             unique: true
-            description: "Feature GUID from the [req featureID=...] tag"
-          - name: "title"
+          - name: "name"
             data_type: "string"
             required: true
-            description: "Short title of the assumption of use"
+          - name: "object_type"
+            data_type: "string"
+            required: false
           - name: "stereotype"
             data_type: "string"
             required: false
-            description: "UML stereotype (typically design_decision)"
-          - name: "description"
+          - name: "note"
             data_type: "text"
             required: false
-            description: "Full description of the assumption / obligation"
-          - name: "rationale"
-            data_type: "text"
+          - name: "package_id"
+            data_type: "integer"
             required: false
-            description: "Rationale explaining why this assumption must hold"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.3.2.1)"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "feature_id_references"
-            data_type: "list[string]"
-            required: false
-            description: "Feature GUID references from parentID (non-PRQ GUIDs)"
           - name: "module"
             data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "attributes"
             data_type: "string"
             required: false
-            description: "Source SWA document filename"
+            description: "Semicolon-joined struct members from t_attribute"
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_ConfigMacro  —  Configuration and codegen macros ---------------
+      - name: "EA_ConfigMacro"
+        jama_item_type: null
+        description: >
+          Configuration macro from the QEAX model.  Covers derived config
+          macros (kind=derived, config_macros stereotype) and code-generation
+          macros (kind=codegen, code_gen_macros_interface).
+          Replaces SWA_Macro and SWUD_CodeGenMacro.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "kind"
+            data_type: "string"
+            required: false
+            description: "Macro kind: 'derived' (config_macros) or 'codegen' (code_gen_macros_interface)"
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_ErrorCode  —  DET / module error codes -------------------------
+      - name: "EA_ErrorCode"
+        jama_item_type: null
+        description: >
+          Error code element from the QEAX model (error_code stereotype).
+          Replaces SWA_ErrorCode.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Error code name (e.g. ADC_E_UNINIT, ADC_E_PARAM_POINTER)"
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_Requirement  —  EA-internal requirement references -------------
+      - name: "EA_Requirement"
+        jama_item_type: null
+        description: >
+          Requirement element from the QEAX model (ifx_requirement
+          stereotype).  These are EA-internal requirement proxies that
+          typically carry an rID tagged value matching Jama PRQ/SHRQ IDs,
+          enabling graph-native traceability via EA_IMPLEMENTS edges.
+          No SWA/SWUD equivalent — this is a new node type.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Requirement name or title from EA"
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_DesignDecision  —  Architecture and design decisions -----------
+      - name: "EA_DesignDecision"
+        jama_item_type: null
+        description: >
+          Design decision from the QEAX model (design_decision stereotype).
+          Replaces SWA_DesignDecision, SWA_ArchitecturalDecision, and
+          SWUD_DesignDecision — all merged into a single type.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+            description: "Decision description / rationale"
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_Information  —  Informational / annotation elements ------------
+      - name: "EA_Information"
+        jama_item_type: null
+        description: >
+          Informational element from the QEAX model (information stereotype).
+          Used for safety measures, security measures, assumptions of use,
+          and other annotative content in the EA model.
+          No direct SWA/SWUD equivalent — partially replaces SWA_SafetyMeasure,
+          SWA_SafetyAoU, SWA_SecurityMeasure, SWA_SecurityAoU.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_CoverTag  —  Traceability cover tags ---------------------------
+      - name: "EA_CoverTag"
+        jama_item_type: null
+        description: >
+          Cover tag element from the QEAX model (cover_tag stereotype).
+          Represents traceability / coverage markers in the EA model.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_GlobalVariable  —  Global / file-scope variables ---------------
+      - name: "EA_GlobalVariable"
+        jama_item_type: null
+        description: >
+          Global variable from the QEAX model (global_variable stereotype).
+          Replaces SWUD_DataVariable.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_PropertyVariable  —  Module property variables -----------------
+      - name: "EA_PropertyVariable"
+        jama_item_type: null
+        description: >
+          Property variable from the QEAX model (property_variable stereotype).
+          Replaces SWA_PropertyVariable.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_MemorySection  —  Memory section allocations -------------------
+      - name: "EA_MemorySection"
+        jama_item_type: null
+        description: >
+          Memory section from the QEAX model (memory_section stereotype).
+          Replaces SWA_MemorySection and SWUD_MemorySection.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_SourceFile  —  Header and source files -------------------------
+      - name: "EA_SourceFile"
+        jama_item_type: null
+        description: >
+          Source file from the QEAX model (header or source stereotype).
+          kind=header for .h files, kind=source for .c files.
+          Replaces SWA_SourceFile.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "File name (e.g. Adc.h, Adc_Irq.c)"
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "kind"
+            data_type: "string"
+            required: false
+            description: "File kind: 'header' or 'source'"
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_TrustDomain  —  Threat analysis trust domains ------------------
+      - name: "EA_TrustDomain"
+        jama_item_type: null
+        description: >
+          Trust domain / untrusted boundary from the QEAX model
+          (untrusted stereotype).  Used in threat analysis.
+          Replaces SWA_ThreatAnalysis.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_Register  —  HW register definitions ---------------------------
+      - name: "EA_Register"
+        jama_item_type: null
+        description: >
+          Hardware register from the QEAX model (register stereotype).
+          Represents individual SFR registers accessed by the module.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
+          - name: "attributes"
+            data_type: "string"
+            required: false
+            description: "Register bitfields as semicolon-joined 'name: type = default'"
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- EA_HwPeripheral  —  HW peripheral / register blocks ---------------
+      - name: "EA_HwPeripheral"
+        jama_item_type: null
+        description: >
+          Hardware peripheral / register block from the QEAX model
+          (registerblock stereotype).  Replaces SWA_HwPeripheral.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
+        properties:
+          - name: "ea_id"
+            data_type: "integer"
+            required: true
+            unique: true
+          - name: "name"
+            data_type: "string"
+            required: true
+          - name: "object_type"
+            data_type: "string"
+            required: false
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "note"
+            data_type: "text"
+            required: false
+          - name: "package_id"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: false
+          - name: "classifier_id"
+            data_type: "integer"
+            required: false
           - name: "embedding"
             data_type: "vector"
             dimensions: 1536
             required: false
 
       # =====================================================================
-      #  SWA Section 3.4 — Trusted View
+      #  EA DIAGRAM Node Types  (from ea_diagram_extractor.py)
       # =====================================================================
-      # Security / trust analysis from SWA section 3.4.  The trusted view
-      # identifies untrusted attack surfaces (users of the IP, dependent
-      # peripherals, external signals, application buffers), their
-      # exploitation mechanisms, and potential impact.
-      # Section 3.4.1 contains security measures (may be empty).
-      # Section 3.4.2 contains security AoU (may be empty).
+      # Structural diagram data extracted from the QEAX model's t_diagram,
+      # t_diagramobjects, and t_diagramlinks tables.  Provides traversable
+      # graph representation of Activity, Sequence, Statechart, and
+      # Logical diagrams.
       # =====================================================================
 
-      - name: "SWA_ThreatAnalysis"
+      # -- EA_Diagram  —  Diagram container ----------------------------------
+      - name: "EA_Diagram"
         jama_item_type: null
         description: >
-          Threat analysis entry from SWA section 3.4 (Trusted View).
-          Each entry identifies an untrusted attack surface, the
-          resource that could be exploited, the exploitation mechanism,
-          and the potential impact on the module.  Derived from the
-          trusted-view block diagram and accompanying text.
-          Examples: "Global configuration tampering via Users of ADC IP",
-          "DMA channel config via Dependent peripherals",
-          "HW trigger event tampering via External signal".
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
+          Diagram container from the QEAX model.  Represents Activity,
+          Sequence, Statechart, or Logical diagrams.  Each diagram has
+          structural child nodes (EA_ActivityNode, EA_SeqParticipant,
+          EA_State) connected via PART_OF, and references to existing
+          EA_* element nodes via APPEARS_IN.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
         properties:
-          - name: "threat_name"
-            data_type: "string"
+          - name: "ea_id"
+            data_type: "integer"
             required: true
             unique: true
-            description: >
-              Name of the threatened resource
-              (e.g. "Global configuration", "DMA channel config")
-          - name: "trust_category"
+            description: "EA Diagram_ID"
+          - name: "name"
             data_type: "string"
             required: true
-            description: "Untrusted domain category"
-            validation_rules:
-              allowed_values:
-                - "users_of_ip"            # Users of the ADC IP
-                - "dependent_peripherals"  # Dependent peripheral configs
-                - "external_signal"        # External analog/trigger signals
-                - "application_buffer"     # Application result buffers
-          - name: "exploitation_mechanism"
-            data_type: "text"
-            required: false
-            description: "How the attack surface could be exploited"
-          - name: "potential_impact"
-            data_type: "text"
-            required: false
-            description: >
-              Potential impact if the threat materialises
-              (e.g. undefined behavior, data corruption, data loss)
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Full description of the threat entry"
-          - name: "section_number"
+            description: "Diagram name"
+          - name: "diagram_type"
             data_type: "string"
+            required: true
+            description: "One of: Activity, Sequence, Statechart, Logical"
+          - name: "package_id"
+            data_type: "integer"
             required: false
-            description: "SWA document section number (e.g. 3.4)"
+          - name: "width"
+            data_type: "integer"
+            required: false
+          - name: "height"
+            data_type: "integer"
+            required: false
+          - name: "element_count"
+            data_type: "integer"
+            required: false
+            description: "Number of elements (diagram objects) in this diagram"
+          - name: "link_count"
+            data_type: "integer"
+            required: false
+            description: "Number of links (connectors) in this diagram"
           - name: "module"
             data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
             required: false
 
-      - name: "SWA_SecurityMeasure"
+      # -- EA_ActivityNode  —  Activity diagram nodes ------------------------
+      - name: "EA_ActivityNode"
         jama_item_type: null
         description: >
-          Security measure from SWA section 3.4.1.  Each entry
-          documents a cybersecurity mechanism implemented by the module.
-          Categorised as: against SW faults (3.4.1.1), against HW faults
-          (3.4.1.2), or review-based (3.4.1.3).  May be empty for
-          modules with no identified security measures.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
+          Node in an Activity diagram.  Includes actions, decisions,
+          merge nodes, initial/final states, activity partitions, loop
+          nodes, and conditional nodes.  Connected by EA_CONTROL_FLOW
+          edges with optional Yes/No labels for decision branches.
+          Replaces SWA_CallSequence (which stored activity flows as flat text).
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
         properties:
-          - name: "decision_id"
-            data_type: "string"
+          - name: "ea_id"
+            data_type: "integer"
             required: true
             unique: true
-            description: "Feature GUID from the [req featureID=...] tag"
-          - name: "title"
+          - name: "name"
+            data_type: "string"
+            required: false
+            description: "Node label (e.g. activity action text)"
+          - name: "node_type"
             data_type: "string"
             required: true
-            description: "Short title of the security measure"
-          - name: "measure_category"
-            data_type: "string"
-            required: true
-            description: "Category of security measure"
-            validation_rules:
-              allowed_values:
-                - "sw_fault"
-                - "hw_fault"
-                - "review_based"
-          - name: "description"
-            data_type: "text"
+            description: "One of: Action, Decision, MergeNode, StateNode, ActivityPartition, LoopNode, Activity, ConditionalNode"
+          - name: "sequence"
+            data_type: "integer"
             required: false
-            description: "Full description of the security measure"
-          - name: "rationale"
-            data_type: "text"
+            description: "Display ordering sequence"
+          - name: "diagram_id"
+            data_type: "integer"
             required: false
-            description: "Rationale justifying the security measure"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWA document section number (e.g. 3.4.1.1)"
+            description: "Parent EA_Diagram ea_id"
           - name: "module"
             data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
             required: false
 
-      - name: "SWA_SecurityAoU"
+      # -- EA_SeqParticipant  —  Sequence diagram participants ---------------
+      - name: "EA_SeqParticipant"
         jama_item_type: null
         description: >
-          Security Assumption of Use from SWA section 3.4.2.  Each entry
-          documents a cybersecurity-related constraint or obligation the
-          integrator must observe.  May be empty for modules with no
-          identified security AoUs.
-        extraction_strategy: "swa_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
+          Participant (lifeline) in a Sequence diagram.  Connected to
+          other participants via EA_SEQ_MESSAGE edges that carry message
+          text and sequence ordering numbers.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
         properties:
-          - name: "decision_id"
-            data_type: "string"
+          - name: "ea_id"
+            data_type: "integer"
             required: true
             unique: true
-            description: "Feature GUID from the [req featureID=...] tag"
-          - name: "title"
+          - name: "name"
             data_type: "string"
             required: true
-            description: "Short title of the security AoU"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Full description of the security assumption"
-          - name: "rationale"
-            data_type: "text"
-            required: false
-            description: "Rationale for the security assumption"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement IDs from [req parentID=...] tags"
-          - name: "section_number"
+            description: "Participant / lifeline name"
+          - name: "participant_type"
             data_type: "string"
             required: false
-            description: "SWA document section number (e.g. 3.4.2)"
+            description: "EA Object_Type of the participant element"
+          - name: "stereotype"
+            data_type: "string"
+            required: false
+          - name: "sequence"
+            data_type: "integer"
+            required: false
+          - name: "diagram_id"
+            data_type: "integer"
+            required: false
+            description: "Parent EA_Diagram ea_id"
           - name: "module"
             data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWA document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
             required: false
 
-      # =====================================================================
-      #  SWUD (Software Design Specification) — Detailed Design Node Types
-      # =====================================================================
-      # Extracted from SWUD PDF/DOCX documents (e.g. TC4xx_SW_MCAL_SWUD_Adc).
-      # The SWUD is the detailed design document in the ASPICE V-model,
-      # generated from Enterprise Architect.  It captures implementation-level
-      # design: design decisions, derived config parameters, configuration
-      # structure variables, code-generation macros, internal type definitions,
-      # API / local / callback / interrupt functions with activity-diagram
-      # algorithms, runtime data variables, critical sections, and memory
-      # section allocations.
-      #
-      # Each element carries traceability to PRQ requirements via
-      # [req parentID=...] tags embedded in the source document, as well as
-      # featureID GUIDs from Enterprise Architect.
-      #
-      # Prefix: SWUD_  (to distinguish from SWA_ architectural nodes)
-      # Source: SWUD PDF → LLM-based Markdown → structured extraction
-      # =====================================================================
-
-      # -- SWUD_DesignDecision  —  Section 2: Design Decisions ---------------
-      - name: "SWUD_DesignDecision"
+      # -- EA_State  —  Statechart diagram states ----------------------------
+      - name: "EA_State"
         jama_item_type: null
         description: >
-          Design decision documented in the SWUD (section 2).  Each decision
-          captures a specific implementation-level design choice with its
-          rationale, sequence of operations, and traceability to PRQ
-          requirements.  These are distinct from SWA_ArchitecturalDecision
-          nodes which capture architecture-level decisions.
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
+          State in a Statechart diagram.  Includes regular states,
+          initial/final pseudo-states, and composite state machines.
+          Connected by EA_STATE_TRANSITION edges.
+        extraction_strategy: "qeax_extraction"
+        source_formats: ["qeax"]
         properties:
-          - name: "decision_id"
-            data_type: "string"
+          - name: "ea_id"
+            data_type: "integer"
             required: true
             unique: true
-            description: "Feature ID GUID from Enterprise Architect"
-          - name: "title"
+          - name: "name"
+            data_type: "string"
+            required: false
+            description: "State name"
+          - name: "state_type"
             data_type: "string"
             required: true
-            description: "Decision title (e.g. 'ADC: Sequence for starting/stopping…')"
-          - name: "description"
-            data_type: "text"
+            description: "One of: State, StateNode, StateMachine"
+          - name: "sequence"
+            data_type: "integer"
             required: false
-            description: "Full description of the design decision"
-          - name: "rationale"
-            data_type: "text"
+          - name: "diagram_id"
+            data_type: "integer"
             required: false
-            description: "Rationale / justification for the decision"
-          - name: "decision_type"
-            data_type: "string"
-            required: false
-            description: "Type: 'design_decision' or 'design_information'"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '2.1')"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "List of PRQ requirement IDs traced via [req parentID=...] tags"
-          - name: "feature_id_references"
-            data_type: "list[string]"
-            required: false
-            description: "List of featureID GUIDs from EA traceability tags"
+            description: "Parent EA_Diagram ea_id"
           - name: "module"
             data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWUD_DerivedConfigParam  —  Section 3.2.1: Derived Config Params --
-      - name: "SWUD_DerivedConfigParam"
-        jama_item_type: null
-        description: >
-          Derived configuration parameter (preprocessor macro) generated by
-          the code-generation tool.  Documented in SWUD section 3.2.1.
-          Each parameter has a name, type (#define), file, description,
-          value range, generation algorithm, and dependencies on ECUC
-          configuration containers/parameters.
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "param_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Macro name (e.g. 'ADC_VENDOR_ID', 'ADC_DEINIT_API')"
-          - name: "param_type"
-            data_type: "string"
-            required: false
-            description: "Type (typically '#define')"
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Header file where the macro is generated (e.g. 'Adc_Cfg.h')"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the parameter"
-          - name: "range"
-            data_type: "text"
-            required: false
-            description: "Value range or allowed values"
-          - name: "algorithm"
-            data_type: "text"
-            required: false
-            description: "Generation algorithm / logic"
-          - name: "design_decisions"
-            data_type: "text"
-            required: false
-            description: "Inline design decisions"
-          - name: "dependencies"
-            data_type: "list[string]"
-            required: false
-            description: "ECUC parameter/container dependencies"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '3.2.1.1')"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement references from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWUD_ConfigStructure  —  Section 3.2.2: Config Structure Vars -----
-      - name: "SWUD_ConfigStructure"
-        jama_item_type: null
-        description: >
-          Configuration structure variable documented in SWUD section 3.2.2.
-          Each structure has a name pattern (often parameterised with
-          <PartitionName>, <HwUnitId>, etc.), a C type, file location,
-          memory section, generation algorithm (with activity diagrams),
-          and dependencies on ECUC configuration.
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "structure_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Structure variable name or name pattern"
-          - name: "c_type"
-            data_type: "string"
-            required: false
-            description: "C type (e.g. 'static const Adc_PartitionConfigType')"
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Source file (e.g. 'Adc_PBcfg.c')"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the structure variable"
-          - name: "memory_section"
-            data_type: "string"
-            required: false
-            description: "Memory section for allocation"
-          - name: "algorithm"
-            data_type: "text"
-            required: false
-            description: "Generation algorithm (activity diagram reference)"
-          - name: "design_decisions"
-            data_type: "text"
-            required: false
-            description: "Inline design decisions"
-          - name: "dependencies"
-            data_type: "list[string]"
-            required: false
-            description: "ECUC parameter/container dependencies"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '3.2.2.1')"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement references"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWUD_CodeGenMacro  —  Section 3.2.3: Code Gen Macros -------------
-      - name: "SWUD_CodeGenMacro"
-        jama_item_type: null
-        description: >
-          Code generation macro documented in SWUD section 3.2.3.  These
-          are x-path macros executed by the code generation tool (e.g. in
-          .m template files) to produce derived configuration code.  Each
-          macro has input/output parameters, an algorithm (with activity
-          diagrams), and dependencies.
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "macro_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Macro name (e.g. 'ADC_CGM_MemmapAlignment')"
-          - name: "macro_type"
-            data_type: "string"
-            required: false
-            description: "Type (e.g. 'Code generation x-path macro')"
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Template file (e.g. 'Adc.m')"
-          - name: "parameters_in"
-            data_type: "list[object]"
-            required: false
-            description: "Input parameters with names and descriptions"
-          - name: "parameters_out"
-            data_type: "list[object]"
-            required: false
-            description: "Output parameters with names and descriptions"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the macro"
-          - name: "algorithm"
-            data_type: "text"
-            required: false
-            description: "Algorithm / activity diagram reference"
-          - name: "design_decisions"
-            data_type: "text"
-            required: false
-            description: "Inline design decisions"
-          - name: "dependencies"
-            data_type: "list[string]"
-            required: false
-            description: "Configuration dependencies"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '3.2.3.1')"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement references"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWUD_TypeDefinition  —  Section 4.2: Type Definitions -------------
-      - name: "SWUD_TypeDefinition"
-        jama_item_type: null
-        description: >
-          Internal type definition documented in SWUD section 4.2.
-          These are the C struct/enum/typedef definitions used internally
-          by the module.  Each type has a name, members/fields with their
-          ranges and descriptions, the file where it's defined, and
-          design decisions.  Distinct from SWA_DataType which captures
-          the architectural (public API) types.
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "type_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Type name (e.g. 'Adc_GrpInfoType', 'Adc_TransitionType')"
-          - name: "type_category"
-            data_type: "string"
-            required: false
-            description: "Category: 'structure', 'enumeration', 'typedef', 'function_pointer'"
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Header file where the type is defined"
-          - name: "members"
-            data_type: "list[object]"
-            required: false
-            description: "List of struct members / enum values with name, type, range, description"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the type"
-          - name: "design_decisions"
-            data_type: "text"
-            required: false
-            description: "Inline design decisions"
-          - name: "source"
-            data_type: "string"
-            required: false
-            description: "Origin: 'IFX' or 'AUTOSAR'"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '4.2.1')"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement references"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWUD_Function  —  Sections 4.3-4.7: All Function Specifications --
-      - name: "SWUD_Function"
-        jama_item_type: null
-        description: >
-          Function specification in the SWUD covering API functions (4.3),
-          notifications/callbacks (4.4), scheduled functions (4.5),
-          interrupt handlers (4.6), and local/internal functions (4.7).
-          Each function has a full AUTOSAR-style specification table
-          (syntax, service ID, ASIL, sync/async, reentrancy, parameters,
-          return type, error handling, algorithm with activity diagrams,
-          memory section, HSI constituents).  The function_category
-          distinguishes the function type.
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "function_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Function name (e.g. 'Adc_Init', 'Adc_lGetPartitionIndex')"
-          - name: "function_category"
-            data_type: "string"
-            required: true
-            description: >
-              Category: 'api' (4.3), 'callback' (4.4), 'scheduled' (4.5),
-              'interrupt_handler' (4.6), 'local' (4.7)
-          - name: "syntax"
-            data_type: "text"
-            required: false
-            description: "Full function signature / prototype"
-          - name: "return_type"
-            data_type: "string"
-            required: false
-            description: "Return type (e.g. 'void', 'Std_ReturnType')"
-          - name: "parameters_in"
-            data_type: "list[object]"
-            required: false
-            description: "Input parameters with name, type, and description"
-          - name: "parameters_out"
-            data_type: "list[object]"
-            required: false
-            description: "Output parameters with name, type, and description"
-          - name: "parameters_inout"
-            data_type: "list[object]"
-            required: false
-            description: "In-out parameters with name, type, and description"
-          - name: "service_id"
-            data_type: "string"
-            required: false
-            description: "AUTOSAR Service ID (e.g. '0x00')"
-          - name: "asil_level"
-            data_type: "string"
-            required: false
-            description: "ASIL level: 'QM', 'A', 'B', 'C', 'D'"
-          - name: "sync_async"
-            data_type: "string"
-            required: false
-            description: "'Synchronous' or 'Asynchronous'"
-          - name: "function_type"
-            data_type: "string"
-            required: false
-            description: "'Standard' or 'Non-Standard'"
-          - name: "reentrancy"
-            data_type: "string"
-            required: false
-            description: "Reentrancy info (e.g. 'Reentrant', 'Non Reentrant', 'Conditionally Reentrant')"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Functional description"
-          - name: "algorithm"
-            data_type: "text"
-            required: false
-            description: "Algorithm description with [req] tags and activity diagram references"
-          - name: "error_handling"
-            data_type: "text"
-            required: false
-            description: "Error codes reported (DET, runtime, safety, DEM)"
-          - name: "configuration_dependencies"
-            data_type: "list[string]"
-            required: false
-            description: "Configuration parameters that gate this function"
-          - name: "file"
-            data_type: "string"
-            required: false
-            description: "Source file(s) (e.g. 'Adc.c, Adc.h')"
-          - name: "memory_section"
-            data_type: "string"
-            required: false
-            description: "Memory section (e.g. 'ADC_SEC_CODE_ASIL_D')"
-          - name: "design_decisions"
-            data_type: "text"
-            required: false
-            description: "Inline design decisions"
-          - name: "feature_id"
-            data_type: "string"
-            required: false
-            description: >
-              Feature identifier (GUID) extracted from [feature]...[/feature]
-              tags in the SWUD document.  Links this function to an external
-              feature tracking system.
-          - name: "source"
-            data_type: "string"
-            required: false
-            description: "Origin: 'AUTOSAR' or 'IFX'"
-          - name: "hsi_constituents"
-            data_type: "text"
-            required: false
-            description: "HSI (Hardware-Software Interface) specification — SFRs, events, shared memory"
-          - name: "comments"
-            data_type: "text"
-            required: false
-            description: "Additional comments"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '4.3.1')"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement references from [req parentID=...] tags"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWUD_DataVariable  —  Section 5: Data Description ----------------
-      - name: "SWUD_DataVariable"
-        jama_item_type: null
-        description: >
-          Runtime data variable documented in SWUD section 5.  These are
-          the module's global/static RAM and ROM variables: TCS data arrays,
-          group data, HW unit data, partition data, config pointers,
-          active resource maps, and DMA channel maps.  Each variable has
-          a name pattern, C type, dimensions, scope (partition-specific
-          or global), memory section, and purpose.
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "variable_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Variable name or name pattern"
-          - name: "c_type"
-            data_type: "string"
-            required: false
-            description: "C type (e.g. 'Adc_GrpDataType', 'const Adc_DmaChIdMapType')"
-          - name: "scope"
-            data_type: "string"
-            required: false
-            description: "Scope: 'partition', 'global', 'per_hw_unit', 'per_group'"
-          - name: "memory_category"
-            data_type: "string"
-            required: false
-            description: "Category: 'ram', 'rom', 'const'"
-          - name: "dimensions"
-            data_type: "text"
-            required: false
-            description: "Array dimensions / size description"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Purpose and content description"
-          - name: "memory_section"
-            data_type: "string"
-            required: false
-            description: "Memory section for allocation"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '5.1')"
-          - name: "prq_references"
-            data_type: "list[string]"
-            required: false
-            description: "PRQ requirement references"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWUD_CriticalSection  —  Section 6: Critical Section Info ---------
-      - name: "SWUD_CriticalSection"
-        jama_item_type: null
-        description: >
-          Critical section information documented in SWUD section 6.
-          Each critical section specifies the SchM (Scheduler Manager)
-          Enter/Exit functions, the shared resources protected, which
-          functions use the critical section, and the protection scope
-          (partition-level or global).
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "critical_section_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Critical section name (e.g. 'MutualData<PartitionName>', 'RuntimeProtWriteSeq')"
-          - name: "enter_function"
-            data_type: "string"
-            required: false
-            description: "SchM Enter function name"
-          - name: "exit_function"
-            data_type: "string"
-            required: false
-            description: "SchM Exit function name"
-          - name: "protected_resources"
-            data_type: "text"
-            required: false
-            description: "List of shared resources / variables protected"
-          - name: "using_functions"
-            data_type: "list[string]"
-            required: false
-            description: "Functions that use this critical section"
-          - name: "protection_scope"
-            data_type: "string"
-            required: false
-            description: "Scope: 'partition' or 'global'"
-          - name: "description"
-            data_type: "text"
-            required: false
-            description: "Description of the critical section purpose"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '6.1')"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
-            required: false
-
-      # -- SWUD_MemorySection  —  Section 7: Memory Sections -----------------
-      - name: "SWUD_MemorySection"
-        jama_item_type: null
-        description: >
-          Memory section allocation documented in SWUD section 7.
-          Each entry maps a memory section name to an AUTOSAR MemMap
-          category, ASIL classification, content description, and
-          typical mapping (RAM, ROM, Flash, etc.).
-        extraction_strategy: "swud_pdf_ingestion"
-        source_formats: ["pdf", "docx", "md"]
-        properties:
-          - name: "section_name"
-            data_type: "string"
-            required: true
-            unique: true
-            description: "Memory section name (e.g. 'ADC_SEC_CODE_ASIL_D')"
-          - name: "memmap_category"
-            data_type: "string"
-            required: false
-            description: "MemMap category (e.g. 'CODE', 'VAR', 'CONST', 'CONFIG_DATA')"
-          - name: "asil_level"
-            data_type: "string"
-            required: false
-            description: "ASIL level: 'QM', 'A', 'B', 'C', 'D'"
-          - name: "content_description"
-            data_type: "text"
-            required: false
-            description: "What is allocated in this section"
-          - name: "typical_mapping"
-            data_type: "string"
-            required: false
-            description: "Target memory (e.g. 'Flash', 'RAM', 'DSPR')"
-          - name: "section_number"
-            data_type: "string"
-            required: false
-            description: "SWUD section number (e.g. '7')"
-          - name: "module"
-            data_type: "string"
-            required: true
-            description: "MCAL module name (e.g. ADC)"
-          - name: "source_document"
-            data_type: "string"
-            required: false
-            description: "Source SWUD document filename"
-          - name: "embedding"
-            data_type: "vector"
-            dimensions: 1536
             required: false
 
       # ================================================================
@@ -3192,7 +1943,7 @@ profiles:
         description: >
           A functional / behavioural test case from the main "Test cases"
           sheet of the MCAL test specification.  Each row verifies one or
-          more product requirements (PRQ) and/or SWA elements through a
+          more product requirements (PRQ) and/or EA elements through a
           concrete test procedure that exercises the driver API on HW.
           Test categories include Unit, Integration, and Software-level
           tests as defined by ASPICE SWE.4 / SWE.5 / SWE.6.
@@ -3595,7 +2346,7 @@ profiles:
       #  SOURCE CODE  –  C Implementation Artefacts
       # =====================================================================
       # These node types capture the actual C source code that implements
-      # the MCAL driver.  They sit between SWUD (detailed design) and
+      # the MCAL driver.  They sit between EA (architecture/design) and
       # Test Specification in the V-Model, representing the **implementation**
       # layer.  Extracted from .c/.h files in the module source repo using
       # the C parser (regex or clang backend).
@@ -3676,7 +2427,7 @@ profiles:
         description: >
           A C function definition extracted from a MCAL module source file.
           Captures both public API functions (e.g. Adc_Init) and internal
-          static helper functions (e.g. Adc_lInit).  Linked to SWA_Function
+          static helper functions (e.g. Adc_lInit).  Linked to EA_Function
           nodes when name matches, and to ProductRequirement via traceability
           GUIDs embedded in the documentation block.
         extraction_strategy: "c_source_ingestion"
@@ -4276,631 +3027,367 @@ profiles:
           - name: "confidence"
             data_type: "float"
 
-      # SWA Exported SW Interface Traceability
-      - name: "ARCHITECTURALLY_REALIZES"
+      # ================================================================
+      #  EA (Enterprise Architect) — QEAX-Extracted Relationships
+      # ================================================================
+      # Connector-based relationships from ea_graph_builder.py
+      # (CONNECTOR_MAP) and structural diagram relationships from
+      # ea_diagram_extractor.py.
+      #
+      # Replaces all SWA_* and SWUD_* relationship types.
+      # ================================================================
+
+      # -- EA element → EA_Requirement traceability --
+
+      - name: "EA_IMPLEMENTS"
         description: >
-          SWA exported-interface element (function, data type, or macro)
-          architecturally realizes a product requirement (PRQ).  Extracted
-          from the [req parentID=AU3GM-PRQ-xxxxx] tags embedded in the SWA
-          document specification tables.
-        from_types: ["SWA_Function", "SWA_DataType", "SWA_Macro"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
+          An EA element (typically EA_Function) implements an EA_Requirement.
+          Extracted from Dependency connectors with 'implements' stereotype
+          in the QEAX model.  This is the primary in-model traceability
+          link, replacing ARCHITECTURALLY_REALIZES and SWUD_TRACES_TO.
+        from_types:
+          - "EA_Function"
+          - "EA_DataType"
+          - "EA_ConfigMacro"
+          - "EA_ConfigParameter"
+          - "EA_ConfigContainer"
+        to_types: ["EA_Requirement"]
+        extraction_source: "qeax_connector"
         properties:
-          - name: "feature_id"
+          - name: "name"
             data_type: "string"
-            description: "SWA feature GUID from [req featureID=...] tag"
-
-      - name: "SWA_BELONGS_TO_MODULE"
-        description: >
-          SWA exported-interface element belongs to a MCAL module.
-          Derived from the module context of the SWA document.
-        from_types: ["SWA_Function", "SWA_DataType", "SWA_Macro"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
-
-      - name: "SWA_USES_TYPE"
-        description: >
-          SWA function uses an SWA data type as a parameter, return type,
-          or in its internal logic — linking the function specification
-          to the type specification within the same SWA document.
-        from_types: ["SWA_Function"]
-        to_types: ["SWA_DataType"]
-        extraction_source: "swa_signature_analysis"
-        properties:
-          - name: "usage_context"
-            data_type: "string"
-            description: "How the type is used (parameter_in, parameter_out, return, internal)"
-            validation_rules:
-              allowed_values: ["parameter_in", "parameter_out", "parameter_inout", "return", "internal"]
-
-      # SWA Enumeration Literals
-      - name: "SWA_HAS_LITERAL"
-        description: >
-          SWA enumeration data type contains an enumeration literal.
-          Links an SWA_DataType (of type_category "enumeration") to
-          each of its defined SWA_EnumLiteral values.
-        from_types: ["SWA_DataType"]
-        to_types: ["SWA_EnumLiteral"]
-        extraction_source: "swa_pdf_ingestion"
-        properties:
-          - name: "ordinal"
+          - name: "seq_no"
             data_type: "integer"
-            description: "Position of the literal within the enum definition"
-
-      # SWA Error Reporting
-      - name: "SWA_REPORTS_ERROR"
-        description: >
-          SWA function reports a specific error code.  Extracted from the
-          "Error Handling" section of each function's specification table.
-          Enables cross-referencing which functions share error conditions.
-        from_types: ["SWA_Function"]
-        to_types: ["SWA_ErrorCode"]
-        extraction_source: "swa_error_handling_section"
-        properties: []
-
-      # SWA Design Decision Traceability
-      - name: "SWA_HAS_DESIGN_DECISION"
-        description: >
-          SWA exported-interface element has an associated inline design
-          decision.  Links the element (function, data type, or macro)
-          to a SWA_DesignDecision node.
-        from_types: ["SWA_Function", "SWA_DataType", "SWA_Macro"]
-        to_types: ["SWA_DesignDecision"]
-        extraction_source: "swa_design_decision_tags"
-        properties: []
-
-      - name: "SWA_DESIGN_DECISION_TRACES_TO"
-        description: >
-          SWA design decision traces to one or more product requirements
-          (PRQs) via [req parentID=AU3GM-PRQ-xxxxx] tags embedded in the
-          design decision text.  This is a finer-grained traceability
-          link than ARCHITECTURALLY_REALIZES, capturing the rationale and
-          justification for specific architectural choices.
-        from_types: ["SWA_DesignDecision"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
-        properties:
-          - name: "feature_id"
+          - name: "connector_stereotype"
             data_type: "string"
-            description: "SWA feature GUID from [req featureID=...] tag"
 
-      # SWA Configuration Gating
-      - name: "SWA_GATED_BY_CONFIG"
+      # -- EA function calls --
+
+      - name: "EA_CALLS"
         description: >
-          SWA function's availability is gated by a configuration parameter.
-          When the parameter is configured as TRUE, the API is included;
-          when FALSE, the API is excluded from the build.  Extracted from
-          the "Configuration Dependencies" section of each function's
-          specification table.
-        from_types: ["SWA_Function"]
-        to_types: ["SWA_ConfigParameter"]
-        extraction_source: "swa_config_dependencies_section"
-        properties: []
-
-      # SWA Property Variable Traceability
-      - name: "SWA_PROPERTY_BELONGS_TO_MODULE"
-        description: >
-          SWA property file variable belongs to a MCAL module.
-          Derived from the module context of the SWA document.
-        from_types: ["SWA_PropertyVariable"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
-
-      # =================================================================
-      # SWA Section 3.1.3 — Architectural Decision Relationships
-      # =================================================================
-
-      - name: "SWA_ARCH_DECISION_TRACES_TO"
-        description: >
-          Architectural decision traces to one or more product
-          requirements (PRQs) via [req parentID=AU3GM-PRQ-xxxxx] tags.
-        from_types: ["SWA_ArchitecturalDecision"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
+          An EA_Function calls another EA_Function.
+          From Dependency connectors with 'call' stereotype.
+          Replaces SWUD_CALLS.
+        from_types: ["EA_Function"]
+        to_types: ["EA_Function"]
+        extraction_source: "qeax_connector"
         properties:
-          - name: "feature_id"
+          - name: "name"
             data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
-
-      - name: "SWA_ARCH_DECISION_BELONGS_TO_MODULE"
-        description: >
-          Architectural decision belongs to a MCAL module.
-        from_types: ["SWA_ArchitecturalDecision"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
-
-      - name: "SWA_ARCH_DECISION_PARENT"
-        description: >
-          Hierarchical parent-child relationship between architectural
-          decisions in section 3.1.3.  Sub-decisions refine or constrain
-          a parent decision (e.g. 3.1.3.5 → 3.1.3.5.1 → 3.1.3.5.2).
-        from_types: ["SWA_ArchitecturalDecision"]
-        to_types: ["SWA_ArchitecturalDecision"]
-        extraction_source: "swa_section_hierarchy"
-        properties: []
-
-      # =================================================================
-      # SWA Section 3.1.5 — HW-SW Interface Relationships
-      # =================================================================
-
-      - name: "SWA_DEPENDS_ON_HW"
-        description: >
-          MCAL module depends on a hardware peripheral.  Links the
-          module to each HW IP block it requires for its operation,
-          as documented in SWA section 3.1.5.
-        from_types: ["MCALModule"]
-        to_types: ["SWA_HwPeripheral"]
-        extraction_source: "swa_hw_sw_interface_section"
-        properties:
-          - name: "dependency_role"
-            data_type: "string"
-            description: "Role of the HW dependency (primary, trigger, result_transfer, clock, diagnostics)"
-
-      - name: "SWA_HW_PERIPHERAL_CONFIGURED_BY"
-        description: >
-          Hardware peripheral is configured/accessed by another MCAL
-          module.  E.g. CLOCK is configured by MCU, DMA channels are
-          managed by DMA driver.
-        from_types: ["SWA_HwPeripheral"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_hw_sw_interface_section"
-        properties: []
-
-      # =================================================================
-      # SWA Section 3.1.6 — SW-SW Interface Relationships
-      # =================================================================
-
-      - name: "SWA_CALLS_EXTERNAL"
-        description: >
-          MCAL module calls an external API/macro from another module,
-          as documented in SWA section 3.1.6 (SW-SW Interface).
-        from_types: ["MCALModule"]
-        to_types: ["SWA_SwDependency"]
-        extraction_source: "swa_sw_sw_interface_section"
-        properties: []
-
-      - name: "SWA_DEPENDENCY_PROVIDED_BY"
-        description: >
-          External SW dependency (API/macro) is provided by another
-          MCAL module.  Enables dependency-graph queries like
-          "which modules does ADC depend on?" or "which modules
-          call Cdsp_Setup?".
-        from_types: ["SWA_SwDependency"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_sw_sw_interface_section"
-        properties: []
-
-      # =================================================================
-      # SWA Section 3.1.7 — Configuration Relationships
-      # =================================================================
-
-      - name: "SWA_CONTAINS_CONTAINER"
-        description: >
-          Configuration container contains a sub-container.
-          Models the ECUC container hierarchy from SWA section 3.1.7
-          (e.g. Adc → AdcConfigSet → AdcHwUnit → AdcGroup).
-        from_types: ["SWA_ConfigContainer"]
-        to_types: ["SWA_ConfigContainer"]
-        extraction_source: "swa_config_hierarchy"
-        properties: []
-
-      - name: "SWA_CONTAINS_PARAM"
-        description: >
-          Configuration container contains a configuration parameter.
-          Links an SWA_ConfigContainer to each of its child
-          SWA_ConfigParam nodes.
-        from_types: ["SWA_ConfigContainer"]
-        to_types: ["SWA_ConfigParam"]
-        extraction_source: "swa_config_hierarchy"
-        properties:
-          - name: "ordinal"
+          - name: "seq_no"
             data_type: "integer"
-            description: "Position of the parameter within the container"
-
-      - name: "SWA_CONFIG_TRACES_TO"
-        description: >
-          Configuration container or parameter traces to one or more
-          product requirements (PRQs) via [req parentID=...] tags.
-        from_types: ["SWA_ConfigContainer", "SWA_ConfigParam"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
-        properties:
-          - name: "feature_id"
+          - name: "connector_stereotype"
             data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
 
-      - name: "SWA_CONFIG_BELONGS_TO_MODULE"
+      # -- EA general dependency --
+
+      - name: "EA_DEPENDS_ON"
         description: >
-          Configuration container belongs to a MCAL module.
-        from_types: ["SWA_ConfigContainer"]
+          General dependency between EA elements.
+          From Dependency connectors with no stereotype.
+          Covers type usage, configuration gating, and other
+          unstereotyped dependencies.
+        from_types:
+          - "EA_Function"
+          - "EA_DataType"
+          - "EA_ConfigParameter"
+          - "EA_ConfigContainer"
+          - "EA_ConfigMacro"
+          - "EA_GlobalVariable"
+        to_types:
+          - "EA_DataType"
+          - "EA_ConfigParameter"
+          - "EA_ConfigContainer"
+          - "EA_ErrorCode"
+          - "EA_GlobalVariable"
+          - "EA_MemorySection"
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA external dependency (cross-module) --
+
+      - name: "EA_EXTERNAL_DEP"
+        description: >
+          Cross-module external dependency.
+          From Dependency connectors with 'external' stereotype.
+          Replaces SWA_SwDependency nodes and SWA_CALLS_EXTERNAL rel.
+        from_types: ["EA_Function"]
+        to_types: ["EA_Function"]
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA optional dependency --
+
+      - name: "EA_OPTIONAL_DEP"
+        description: >
+          Optional dependency between EA elements.
+          From Dependency connectors with 'optional' stereotype.
+        from_types:
+          - "EA_Function"
+          - "EA_ConfigParameter"
+          - "EA_ConfigContainer"
+        to_types:
+          - "EA_Function"
+          - "EA_ConfigParameter"
+          - "EA_ConfigContainer"
+          - "EA_DataType"
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA file includes --
+
+      - name: "EA_INCLUDES"
+        description: >
+          File include relationship.
+          From Dependency connectors with 'includes' stereotype.
+        from_types: ["EA_SourceFile"]
+        to_types: ["EA_SourceFile"]
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA register access --
+
+      - name: "EA_ACCESSES_REGISTER"
+        description: >
+          An EA_Function accesses an EA_Register (HW register).
+          From Dependency connectors with 'sw_access' stereotype.
+        from_types: ["EA_Function"]
+        to_types: ["EA_Register"]
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA threat/information flow --
+
+      - name: "EA_THREAT_REACHES"
+        description: >
+          Information flow from an untrusted domain.
+          From InformationFlow connectors in the QEAX model.
+        from_types: ["EA_TrustDomain"]
+        to_types:
+          - "EA_Function"
+          - "EA_DataType"
+          - "EA_ConfigParameter"
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA realisation --
+
+      - name: "EA_REALISES"
+        description: >
+          Realisation (implementation) relationship between EA elements.
+          From Realisation connectors in the QEAX model.
+        from_types:
+          - "EA_Function"
+          - "EA_DataType"
+          - "EA_ConfigContainer"
+        to_types:
+          - "EA_Function"
+          - "EA_DataType"
+          - "EA_Requirement"
+          - "EA_DesignDecision"
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA aggregation --
+
+      - name: "EA_AGGREGATES"
+        description: >
+          Aggregation (composition) relationship between EA elements.
+          Typically: EA_ConfigContainer aggregates EA_ConfigParameter,
+          EA_HwPeripheral aggregates EA_Register.
+        from_types:
+          - "EA_ConfigContainer"
+          - "EA_HwPeripheral"
+          - "EA_DataType"
+        to_types:
+          - "EA_ConfigParameter"
+          - "EA_ConfigContainer"
+          - "EA_Register"
+          - "EA_DataType"
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA generalisation --
+
+      - name: "EA_GENERALISES"
+        description: >
+          Generalisation (inheritance) between EA_DataType elements.
+        from_types: ["EA_DataType"]
+        to_types: ["EA_DataType"]
+        extraction_source: "qeax_connector"
+        properties:
+          - name: "name"
+            data_type: "string"
+          - name: "seq_no"
+            data_type: "integer"
+          - name: "connector_stereotype"
+            data_type: "string"
+
+      # -- EA module grouping --
+
+      - name: "EA_BELONGS_TO_MODULE"
+        description: >
+          Any EA_* element or diagram belongs to a MCAL module.
+          Replaces SWA_BELONGS_TO_MODULE, SWUD_BELONGS_TO_MODULE,
+          and SWA_*_BELONGS_TO_MODULE variants.
+        from_types:
+          - "EA_Function"
+          - "EA_DataType"
+          - "EA_ConfigParameter"
+          - "EA_ConfigContainer"
+          - "EA_ConfigMacro"
+          - "EA_ErrorCode"
+          - "EA_Requirement"
+          - "EA_DesignDecision"
+          - "EA_Information"
+          - "EA_CoverTag"
+          - "EA_GlobalVariable"
+          - "EA_PropertyVariable"
+          - "EA_MemorySection"
+          - "EA_SourceFile"
+          - "EA_TrustDomain"
+          - "EA_Register"
+          - "EA_HwPeripheral"
+          - "EA_Diagram"
         to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
+        extraction_source: "qeax_module_context"
         properties: []
 
-      # =================================================================
-      # SWA Section 3.1.9 — File Structure Relationships
-      # =================================================================
+      # ================================================================
+      #  EA DIAGRAM Relationships
+      # ================================================================
 
-      - name: "SWA_FILE_BELONGS_TO_MODULE"
-        description: >
-          Source file belongs to a MCAL module.
-        from_types: ["SWA_SourceFile"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
+      # -- Activity diagram control flow --
 
-      - name: "SWA_FILE_TRACES_TO"
+      - name: "EA_CONTROL_FLOW"
         description: >
-          Source file traces to one or more product requirements
-          (PRQs) via [req parentID=...] tags.
-        from_types: ["SWA_SourceFile"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
+          Control flow edge in an Activity diagram.  Connects
+          EA_ActivityNode elements.  Decision branches carry
+          Yes/No labels.
+        from_types: ["EA_ActivityNode"]
+        to_types: ["EA_ActivityNode"]
+        extraction_source: "qeax_diagram"
         properties:
-          - name: "feature_id"
+          - name: "label"
             data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
+            description: "Branch label (e.g. 'Yes', 'No') for decision nodes"
 
-      - name: "SWA_FUNCTION_DECLARED_IN"
+      # -- Sequence diagram messages --
+
+      - name: "EA_SEQ_MESSAGE"
         description: >
-          SWA function is declared/defined in a source file.
-          Links SWA_Function nodes to their SWA_SourceFile.
-        from_types: ["SWA_Function"]
-        to_types: ["SWA_SourceFile"]
-        extraction_source: "swa_file_field"
-        properties: []
-
-      - name: "SWA_DATATYPE_DECLARED_IN"
-        description: >
-          SWA data type is declared in a source file.
-          Links SWA_DataType nodes to their SWA_SourceFile.
-        from_types: ["SWA_DataType"]
-        to_types: ["SWA_SourceFile"]
-        extraction_source: "swa_file_field"
-        properties: []
-
-      # =================================================================
-      # SWA Section 3.2 — Call Sequence Relationships
-      # =================================================================
-
-      - name: "SWA_CALL_SEQUENCE_INVOLVES"
-        description: >
-          Call sequence diagram references an SWA function as one of
-          the interaction participants.  Links an SWA_CallSequence to
-          each SWA_Function that appears in the sequence flow.  Enables
-          queries like "which call sequences involve Adc_Init?" or
-          "show all interaction flows for Adc_StartGroupConversion".
-        from_types: ["SWA_CallSequence"]
-        to_types: ["SWA_Function"]
-        extraction_source: "swa_call_sequence_extraction"
+          Message between participants in a Sequence diagram.
+          Carries the message text and sequence ordering number.
+        from_types: ["EA_SeqParticipant"]
+        to_types: ["EA_SeqParticipant"]
+        extraction_source: "qeax_diagram"
         properties:
-          - name: "role"
+          - name: "message"
             data_type: "string"
-            description: "Role of the function in the sequence (caller, callee, callback, handler)"
-            validation_rules:
-              allowed_values: ["caller", "callee", "callback", "handler", "notification"]
+            description: "Message text on the sequence arrow"
+          - name: "seq_no"
+            data_type: "integer"
+            description: "Sequence ordering number for message ordering"
 
-      - name: "SWA_CALL_SEQUENCE_BELONGS_TO_MODULE"
-        description: >
-          Call sequence belongs to a MCAL module.  Derived from the
-          module context of the SWA document.
-        from_types: ["SWA_CallSequence"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
+      # -- Statechart diagram transitions --
 
-      - name: "SWA_CALL_SEQUENCE_TRACES_TO"
+      - name: "EA_STATE_TRANSITION"
         description: >
-          Call sequence traces to one or more product requirements
-          (PRQs) via [req parentID=AU3GM-PRQ-xxxxx] tags embedded
-          in the call sequence section.
-        from_types: ["SWA_CallSequence"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
+          State transition in a Statechart diagram.
+          Connects EA_State nodes with optional guard/trigger labels.
+        from_types: ["EA_State"]
+        to_types: ["EA_State"]
+        extraction_source: "qeax_diagram"
         properties:
-          - name: "feature_id"
+          - name: "label"
             data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
+            description: "Transition guard or trigger label"
 
-      # =================================================================
-      # SWA Safety & Security View Relationships
-      # =================================================================
-      # Relationships for SWA safety (3.3), trusted/security (3.4),
-      # and memory section (3.1.10) node types — traceability to PRQ
-      # and module membership.
-      # =================================================================
+      # -- Diagram membership: structural child → diagram --
 
-      # -- SWA Memory Section --
-
-      - name: "SWA_MEMORY_SECTION_TRACES_TO"
+      - name: "PART_OF"
         description: >
-          Memory section traces to one or more product requirements
-          (PRQs) via [req parentID=AU3GM-PRQ-xxxxx] tags.
-        from_types: ["SWA_MemorySection"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
-        properties:
-          - name: "feature_id"
-            data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
-
-      - name: "SWA_MEMORY_SECTION_BELONGS_TO_MODULE"
-        description: >
-          Memory section belongs to a MCAL module.
-        from_types: ["SWA_MemorySection"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
+          A diagram-internal node (EA_ActivityNode, EA_SeqParticipant,
+          EA_State) is part of an EA_Diagram.
+        from_types:
+          - "EA_ActivityNode"
+          - "EA_SeqParticipant"
+          - "EA_State"
+        to_types: ["EA_Diagram"]
+        extraction_source: "qeax_diagram"
         properties: []
 
-      # -- SWA Safety Measures (3.3.1) --
+      # -- Diagram appearance: existing element → diagram --
 
-      - name: "SWA_SAFETY_MEASURE_TRACES_TO"
+      - name: "APPEARS_IN"
         description: >
-          Safety measure traces to one or more product requirements
-          (PRQs) via [req parentID=AU3GM-PRQ-xxxxx] tags embedded
-          in the safety measures section (3.3.1).
-        from_types: ["SWA_SafetyMeasure"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
-        properties:
-          - name: "feature_id"
-            data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
-
-      - name: "SWA_SAFETY_MEASURE_BELONGS_TO_MODULE"
-        description: >
-          Safety measure belongs to a MCAL module.
-        from_types: ["SWA_SafetyMeasure"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
-
-      # -- SWA Safety AoU (3.3.2) --
-
-      - name: "SWA_SAFETY_AOU_TRACES_TO"
-        description: >
-          Safety Assumption of Use traces to one or more product
-          requirements (PRQs) via [req parentID=AU3GM-PRQ-xxxxx] tags
-          embedded in the AoU section (3.3.2).
-        from_types: ["SWA_SafetyAoU"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
-        properties:
-          - name: "feature_id"
-            data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
-
-      - name: "SWA_SAFETY_AOU_BELONGS_TO_MODULE"
-        description: >
-          Safety AoU belongs to a MCAL module.
-        from_types: ["SWA_SafetyAoU"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
-
-      # -- SWA Trusted View / Security (3.4) --
-
-      - name: "SWA_THREAT_BELONGS_TO_MODULE"
-        description: >
-          Threat analysis entry belongs to a MCAL module.
-        from_types: ["SWA_ThreatAnalysis"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
-
-      - name: "SWA_SECURITY_MEASURE_TRACES_TO"
-        description: >
-          Security measure traces to one or more product requirements
-          (PRQs) via [req parentID=AU3GM-PRQ-xxxxx] tags.
-        from_types: ["SWA_SecurityMeasure"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
-        properties:
-          - name: "feature_id"
-            data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
-
-      - name: "SWA_SECURITY_MEASURE_BELONGS_TO_MODULE"
-        description: >
-          Security measure belongs to a MCAL module.
-        from_types: ["SWA_SecurityMeasure"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
-
-      - name: "SWA_SECURITY_AOU_TRACES_TO"
-        description: >
-          Security AoU traces to one or more product requirements
-          (PRQs) via [req parentID=AU3GM-PRQ-xxxxx] tags.
-        from_types: ["SWA_SecurityAoU"]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swa_req_tags"
-        properties:
-          - name: "feature_id"
-            data_type: "string"
-            description: "Feature GUID from [req featureID=...] tag"
-
-      - name: "SWA_SECURITY_AOU_BELONGS_TO_MODULE"
-        description: >
-          Security AoU belongs to a MCAL module.
-        from_types: ["SWA_SecurityAoU"]
-        to_types: ["MCALModule"]
-        extraction_source: "swa_document_context"
-        properties: []
-
-      # =================================================================
-      # SWUD (Software Design Specification) Relationships
-      # =================================================================
-      # Relationships for SWUD nodes — traceability to PRQ, module
-      # membership, cross-references between design elements, HSI
-      # constituents, and memory allocation.
-      # =================================================================
-
-      # -- SWUD Traceability to PRQ --
-
-      - name: "SWUD_TRACES_TO"
-        description: >
-          SWUD element traces to a Product Requirement (PRQ).
-          Extracted from [req parentID=AU3GM-PRQ-xxxxx] tags embedded
-          in the SWUD document.  Applies to all SWUD node types.
-        from_types: [
-          "SWUD_DesignDecision", "SWUD_DerivedConfigParam",
-          "SWUD_ConfigStructure", "SWUD_CodeGenMacro",
-          "SWUD_TypeDefinition", "SWUD_Function",
-          "SWUD_DataVariable", "SWUD_CriticalSection",
-          "SWUD_MemorySection"
-        ]
-        to_types: ["ProductRequirement"]
-        extraction_source: "swud_req_tags"
-        properties:
-          - name: "feature_id"
-            data_type: "string"
-            description: "Enterprise Architect featureID GUID"
-
-      # -- SWUD Module Membership --
-
-      - name: "SWUD_BELONGS_TO_MODULE"
-        description: >
-          SWUD element belongs to a MCAL module.
-          All SWUD nodes carry a module property; this relationship
-          materialises that link in the graph.
-        from_types: [
-          "SWUD_DesignDecision", "SWUD_DerivedConfigParam",
-          "SWUD_ConfigStructure", "SWUD_CodeGenMacro",
-          "SWUD_TypeDefinition", "SWUD_Function",
-          "SWUD_DataVariable", "SWUD_CriticalSection",
-          "SWUD_MemorySection"
-        ]
-        to_types: ["MCALModule"]
-        extraction_source: "swud_document_context"
-        properties: []
-
-      # -- SWUD Function uses Type --
-
-      - name: "SWUD_USES_TYPE"
-        description: >
-          SWUD function uses a SWUD type definition as a parameter
-          type, return type, or internal variable.  Also links
-          configuration structures to their C types.
-        from_types: ["SWUD_Function", "SWUD_ConfigStructure", "SWUD_DataVariable"]
-        to_types: ["SWUD_TypeDefinition"]
-        extraction_source: "swud_type_analysis"
-        properties:
-          - name: "usage_context"
-            data_type: "string"
-            description: "'parameter_in', 'parameter_out', 'parameter_inout', 'return', 'internal', 'declaration'"
-
-      # -- SWUD Function calls Function --
-
-      - name: "SWUD_CALLS"
-        description: >
-          One SWUD function calls another SWUD function.
-          Extracted from algorithm descriptions and activity diagrams
-          where function calls are explicitly named (e.g.
-          'Adc_lReportError::Adc_lReportError' in activity diagrams).
-        from_types: ["SWUD_Function"]
-        to_types: ["SWUD_Function"]
-        extraction_source: "swud_algorithm_analysis"
-        properties: []
-
-      # -- SWUD Function allocated in Memory Section --
-
-      - name: "SWUD_ALLOCATED_IN"
-        description: >
-          SWUD function, data variable, or config structure is allocated
-          in a specific memory section.  Extracted from the 'Memory
-          Section' field of each SWUD element.
-        from_types: ["SWUD_Function", "SWUD_DataVariable", "SWUD_ConfigStructure"]
-        to_types: ["SWUD_MemorySection"]
-        extraction_source: "swud_memory_field"
-        properties: []
-
-      # -- SWUD Function uses Critical Section --
-
-      - name: "SWUD_USES_CRITICAL_SECTION"
-        description: >
-          SWUD function enters/exits a critical section.
-          Extracted from algorithm descriptions and HSI specifications
-          where SchM_Enter / SchM_Exit calls are documented.
-        from_types: ["SWUD_Function"]
-        to_types: ["SWUD_CriticalSection"]
-        extraction_source: "swud_algorithm_analysis"
-        properties: []
-
-      # -- SWUD Function reports Error --
-
-      - name: "SWUD_REPORTS_ERROR"
-        description: >
-          SWUD function reports a DET, runtime, safety, or DEM error.
-          Links to SWA_ErrorCode nodes (reusing SWA error definitions)
-          when the same error codes appear in both documents.
-        from_types: ["SWUD_Function"]
-        to_types: ["SWA_ErrorCode"]
-        extraction_source: "swud_error_field"
-        properties: []
-
-      # -- SWUD Design Decision applies to Function --
-
-      - name: "SWUD_DECISION_APPLIES_TO"
-        description: >
-          SWUD design decision applies to / governs the implementation
-          of specific SWUD functions, config structures, or macros.
-          Inferred from references in design decision descriptions.
-        from_types: ["SWUD_DesignDecision"]
-        to_types: ["SWUD_Function", "SWUD_ConfigStructure", "SWUD_CodeGenMacro"]
-        extraction_source: "swud_cross_reference"
-        properties: []
-
-      # -- SWUD Config Param gates Function --
-
-      - name: "SWUD_CONFIG_GATES"
-        description: >
-          A derived configuration parameter controls the availability
-          or behaviour of a SWUD function.  Extracted from the
-          'Configuration Dependencies' field of function specifications.
-        from_types: ["SWUD_DerivedConfigParam"]
-        to_types: ["SWUD_Function"]
-        extraction_source: "swud_config_dep_field"
-        properties: []
-
-      # -- SWUD Critical Section protects Data Variable --
-
-      - name: "SWUD_PROTECTS"
-        description: >
-          A critical section protects a data variable from concurrent
-          access.  Extracted from the 'Protected Resources' field in
-          the critical section specification.
-        from_types: ["SWUD_CriticalSection"]
-        to_types: ["SWUD_DataVariable"]
-        extraction_source: "swud_critical_section_spec"
-        properties: []
-
-      # -- SWUD to SWA cross-link: DetailedDesign realizes Architecture --
-
-      - name: "SWUD_REALIZES_SWA"
-        description: >
-          SWUD function provides the detailed design / implementation
-          for an SWA function specification.  Linked by matching
-          function names between SWA_Function and SWUD_Function nodes.
-        from_types: ["SWUD_Function"]
-        to_types: ["SWA_Function"]
-        extraction_source: "swud_swa_name_matching"
-        properties: []
-
-      # -- SWUD CodeGenMacro generates ConfigStructure --
-
-      - name: "SWUD_GENERATES"
-        description: >
-          A code generation macro produces a configuration structure
-          variable or derived configuration parameter.  Inferred from
-          algorithm descriptions and naming patterns.
-        from_types: ["SWUD_CodeGenMacro"]
-        to_types: ["SWUD_ConfigStructure", "SWUD_DerivedConfigParam"]
-        extraction_source: "swud_codegen_analysis"
+          An existing EA_* element node appears in a Logical or other
+          diagram.  This links the element-level graph to the
+          diagram-level graph.
+        from_types:
+          - "EA_Function"
+          - "EA_DataType"
+          - "EA_ConfigParameter"
+          - "EA_ConfigContainer"
+          - "EA_ConfigMacro"
+          - "EA_ErrorCode"
+          - "EA_Requirement"
+          - "EA_DesignDecision"
+          - "EA_Information"
+          - "EA_GlobalVariable"
+          - "EA_SourceFile"
+          - "EA_Register"
+          - "EA_HwPeripheral"
+        to_types: ["EA_Diagram"]
+        extraction_source: "qeax_diagram"
         properties: []
 
       # ================================================================
@@ -4929,27 +3416,28 @@ profiles:
               The TS feature tag from the traceability markup (e.g.
               'TS_ADC_AS460_PRQ_FT_001').
 
-      # -- Test Spec → SWA traceability --
+      # -- Test Spec → EA architecture traceability --
 
-      - name: "TS_VALIDATES_SWA"
+      - name: "TS_VALIDATES_EA"
         description: >
-          A test case validates an SWA architectural element (function,
+          A test case validates an EA architectural element (function,
           data type, config param, etc.).  Extracted from the
           [req featureID=…_SWA_… parentID={GUID}] tags in the
           Traceability column.  Links the right side of the V-Model
           (test spec) to the left side (architecture).
+          Replaces TS_VALIDATES_SWA.
         from_types:
           - "TS_FunctionalTestCase"
           - "TS_ConfigTestCase"
           - "TS_StaticInterfaceTestCase"
         to_types:
-          - "SWA_Function"
-          - "SWA_DataType"
-          - "SWA_Macro"
-          - "SWA_ConfigContainer"
-          - "SWA_ConfigParam"
-          - "SWA_SourceFile"
-          - "SWA_HwPeripheral"
+          - "EA_Function"
+          - "EA_DataType"
+          - "EA_ConfigMacro"
+          - "EA_ConfigContainer"
+          - "EA_ConfigParameter"
+          - "EA_SourceFile"
+          - "EA_HwPeripheral"
         extraction_source: "testspec_traceability_tags"
         properties:
           - name: "feature_id"
@@ -4957,28 +3445,28 @@ profiles:
             description: >
               The TS feature tag (e.g. 'TS_ADC_AS460_SWA_FT_001').
 
-      # -- Config Test → SWA_ConfigParam / SWA_ConfigContainer --
+      # -- Config Test → EA_ConfigParameter / EA_ConfigContainer --
 
       - name: "TS_TESTS_CONFIG_ELEMENT"
         description: >
-          A configuration test case directly tests an SWA configuration
+          A configuration test case directly tests an EA configuration
           parameter or container.  Derived by matching the config_path
-          property of TS_ConfigTestCase against SWA_ConfigParam.param_name
-          or SWA_ConfigContainer.container_name.
+          property of TS_ConfigTestCase against EA_ConfigParameter.name
+          or EA_ConfigContainer.name.
         from_types: ["TS_ConfigTestCase"]
-        to_types: ["SWA_ConfigParam", "SWA_ConfigContainer"]
+        to_types: ["EA_ConfigParameter", "EA_ConfigContainer"]
         extraction_source: "testspec_config_path_matching"
         properties: []
 
-      # -- WCET Test → SWA_Function --
+      # -- WCET Test → EA_Function --
 
       - name: "TS_MEASURES_TIMING_OF"
         description: >
-          A WCET test case measures the execution time of an SWA
+          A WCET test case measures the execution time of an EA
           function / API.  Derived by matching TS_WCETTestCase.api_name
-          against SWA_Function.function_name.
+          against EA_Function.name.
         from_types: ["TS_WCETTestCase"]
-        to_types: ["SWA_Function"]
+        to_types: ["EA_Function"]
         extraction_source: "testspec_api_name_matching"
         properties:
           - name: "data_point"
@@ -5123,24 +3611,15 @@ profiles:
         extraction_source: "c_source_ingestion"
         properties: []
 
-      # Traceability: Source → SWA architecture
-      - name: "SRC_IMPLEMENTS_SWA"
+      # Traceability: Source → EA architecture/design
+      - name: "SRC_IMPLEMENTS_EA"
         description: >
-          A source code function implements an SWA (Software Architecture)
+          A source code function implements an EA (Enterprise Architect)
           function specification.  Linked by matching function name (e.g.
-          Adc_Init in source → Adc_Init SWA_Function node).
+          Adc_Init in source → Adc_Init EA_Function node).
+          Replaces SRC_IMPLEMENTS_SWA and SRC_IMPLEMENTS_SWUD.
         from_types: ["SRC_Function"]
-        to_types: ["SWA_Function"]
-        extraction_source: "c_source_name_matching"
-        properties: []
-
-      # Traceability: Source → SWUD design
-      - name: "SRC_IMPLEMENTS_SWUD"
-        description: >
-          A source code function implements an SWUD (Software Unit Design)
-          function specification.  Linked by matching function name.
-        from_types: ["SRC_Function"]
-        to_types: ["SWUD_Function"]
+        to_types: ["EA_Function"]
         extraction_source: "c_source_name_matching"
         properties: []
 
@@ -5386,322 +3865,144 @@ profiles:
         MATCH (r)-[:TARGETED_FOR]->(rel:SoftwareRelease {name: $version})
         RETURN r
 
-      # SWA Exported Interface Queries
-      swa_functions_for_module: |
-        MATCH (f:SWA_Function)-[:SWA_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN f ORDER BY f.function_category, f.function_name
+      # ================================================================
+      # EA (Enterprise Architect) Query Templates
+      # ================================================================
 
-      swa_function_error_codes: |
-        MATCH (f:SWA_Function {function_name: $func_name})-[:SWA_REPORTS_ERROR]->(e:SWA_ErrorCode)
-        RETURN e.error_name AS error_code, e.description AS description
+      ea_functions_for_module: |
+        MATCH (f:EA_Function)-[:EA_BELONGS_TO_MODULE]->(m:MCALModule {name: \})
+        RETURN f ORDER BY f.kind, f.name
 
-      swa_functions_sharing_error: |
-        MATCH (f:SWA_Function)-[:SWA_REPORTS_ERROR]->(e:SWA_ErrorCode {error_name: $error_code})
-        RETURN f.function_name AS function_name, f.function_category AS category
+      ea_function_detail: |
+        MATCH (f:EA_Function {name: \})
+        OPTIONAL MATCH (f)-[:EA_IMPLEMENTS]->(req:EA_Requirement)
+        OPTIONAL MATCH (f)-[:EA_DEPENDS_ON]->(dep)
+        OPTIONAL MATCH (f)-[:EA_CALLS]->(callee:EA_Function)
+        OPTIONAL MATCH (f)-[:EA_ACCESSES_REGISTER]->(reg:EA_Register)
+        RETURN f, collect(DISTINCT req.name) AS requirements,
+               collect(DISTINCT dep.name) AS dependencies,
+               collect(DISTINCT callee.name) AS calls,
+               collect(DISTINCT reg.name) AS registers_accessed
 
-      swa_enum_literals: |
-        MATCH (dt:SWA_DataType {type_name: $type_name})-[:SWA_HAS_LITERAL]->(lit:SWA_EnumLiteral)
-        RETURN lit.literal_name AS name, lit.value AS value, lit.description AS description
-        ORDER BY toInteger(lit.value)
+      ea_function_error_codes: |
+        MATCH (f:EA_Function {name: \})-[:EA_DEPENDS_ON]->(e:EA_ErrorCode)
+        RETURN e.name AS error_code, e.note AS description
 
-      swa_design_decisions_for_function: |
-        MATCH (f:SWA_Function {function_name: $func_name})-[:SWA_HAS_DESIGN_DECISION]->(dd:SWA_DesignDecision)
-        OPTIONAL MATCH (dd)-[:SWA_DESIGN_DECISION_TRACES_TO]->(prq:ProductRequirement)
-        RETURN dd.title AS decision, dd.rationale AS rationale, collect(prq.requirement_id) AS traced_prqs
+      ea_datatypes_for_module: |
+        MATCH (dt:EA_DataType)-[:EA_BELONGS_TO_MODULE]->(m:MCALModule {name: \})
+        RETURN dt.name AS type_name, dt.kind AS type_kind,
+               dt.attributes AS members, dt.note AS description
+        ORDER BY dt.kind, dt.name
 
-      swa_function_config_dependencies: |
-        MATCH (f:SWA_Function)-[:SWA_GATED_BY_CONFIG]->(cp:SWA_ConfigParameter {param_name: $config_param})
-        RETURN f.function_name AS function_name, f.function_category AS category
+      ea_config_for_module: |
+        MATCH (cc:EA_ConfigContainer)-[:EA_BELONGS_TO_MODULE]->(m:MCALModule {name: \})
+        OPTIONAL MATCH (cc)-[:EA_AGGREGATES]->(cp:EA_ConfigParameter)
+        RETURN cc.name AS container, collect(DISTINCT cp.name) AS parameters
+        ORDER BY cc.name
 
-      swa_full_traceability: |
-        MATCH (f:SWA_Function {function_name: $func_name})
-        OPTIONAL MATCH (f)-[:ARCHITECTURALLY_REALIZES]->(prq:ProductRequirement)
-        OPTIONAL MATCH (f)-[:SWA_USES_TYPE]->(dt:SWA_DataType)
-        OPTIONAL MATCH (f)-[:SWA_REPORTS_ERROR]->(err:SWA_ErrorCode)
-        OPTIONAL MATCH (f)-[:SWA_GATED_BY_CONFIG]->(cfg:SWA_ConfigParameter)
-        RETURN f, collect(DISTINCT prq.requirement_id) AS prqs,
-               collect(DISTINCT dt.type_name) AS types_used,
-               collect(DISTINCT err.error_name) AS errors,
-               collect(DISTINCT cfg.param_name) AS config_deps
+      ea_config_parameter_detail: |
+        MATCH (cp:EA_ConfigParameter {name: \})
+        OPTIONAL MATCH (cc)-[:EA_AGGREGATES]->(cp)
+        OPTIONAL MATCH (cp)-[:EA_IMPLEMENTS]->(req:EA_Requirement)
+        RETURN cp, cc.name AS parent_container,
+               collect(DISTINCT req.name) AS requirements
 
-      # -- Section 3.1.3: Architectural Decisions Queries --
+      ea_design_decisions_for_module: |
+        MATCH (dd:EA_DesignDecision)-[:EA_BELONGS_TO_MODULE]->(m:MCALModule {name: \})
+        RETURN dd.name AS decision, dd.note AS description
+        ORDER BY dd.name
 
-      swa_arch_decisions_for_module: |
-        MATCH (ad:SWA_ArchitecturalDecision)-[:SWA_ARCH_DECISION_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN ad.title AS decision, ad.stereotype AS type, ad.section_number AS section
-        ORDER BY ad.section_number
+      ea_files_for_module: |
+        MATCH (sf:EA_SourceFile)-[:EA_BELONGS_TO_MODULE]->(m:MCALModule {name: \})
+        RETURN sf.name AS file, sf.kind AS file_kind
+        ORDER BY sf.kind, sf.name
 
-      swa_arch_decision_traceability: |
-        MATCH (ad:SWA_ArchitecturalDecision {title: $title})
-        OPTIONAL MATCH (ad)-[:SWA_ARCH_DECISION_TRACES_TO]->(prq:ProductRequirement)
-        OPTIONAL MATCH (child:SWA_ArchitecturalDecision)-[:SWA_ARCH_DECISION_PARENT]->(ad)
-        RETURN ad, collect(DISTINCT prq.requirement_id) AS traced_prqs,
-               collect(DISTINCT child.title) AS sub_decisions
+      ea_memory_sections_for_module: |
+        MATCH (ms:EA_MemorySection)-[:EA_BELONGS_TO_MODULE]->(m:MCALModule {name: \})
+        RETURN ms.name AS section, ms.note AS description
+        ORDER BY ms.name
 
-      swa_arch_decision_hierarchy: |
-        MATCH path = (child:SWA_ArchitecturalDecision)-[:SWA_ARCH_DECISION_PARENT*1..5]->(root:SWA_ArchitecturalDecision)
-        WHERE root.module = $module AND NOT EXISTS {
-          MATCH (root)-[:SWA_ARCH_DECISION_PARENT]->()
-        }
-        RETURN path
+      ea_hw_peripherals_for_module: |
+        MATCH (m:MCALModule {name: \})<-[:EA_BELONGS_TO_MODULE]-(hw:EA_HwPeripheral)
+        OPTIONAL MATCH (hw)-[:EA_AGGREGATES]->(reg:EA_Register)
+        RETURN hw.name AS peripheral, collect(DISTINCT reg.name) AS registers
+        ORDER BY hw.name
 
-      # -- Section 3.1.5: HW-SW Interface Queries --
+      ea_call_graph: |
+        MATCH (caller:EA_Function)-[:EA_CALLS]->(callee:EA_Function)
+        WHERE caller.module =         RETURN caller.name AS caller, callee.name AS callee,
+               caller.kind AS caller_kind, callee.kind AS callee_kind
 
-      swa_hw_peripherals_for_module: |
-        MATCH (m:MCALModule {module_name: $module})-[:SWA_DEPENDS_ON_HW]->(hw:SWA_HwPeripheral)
-        RETURN hw.peripheral_name AS peripheral, hw.peripheral_type AS type,
-               hw.hw_events AS events, hw.diagnostic_features AS diagnostics
-        ORDER BY hw.peripheral_type, hw.peripheral_name
+      ea_external_dependencies: |
+        MATCH (f:EA_Function)-[:EA_EXTERNAL_DEP]->(ext:EA_Function)
+        WHERE f.module =         RETURN f.name AS function_name, ext.name AS external_dep,
+               ext.module AS provider_module
+        ORDER BY ext.module, ext.name
 
-      swa_hw_peripheral_users: |
-        MATCH (hw:SWA_HwPeripheral {peripheral_name: $peripheral})
-        OPTIONAL MATCH (m:MCALModule)-[:SWA_DEPENDS_ON_HW]->(hw)
-        OPTIONAL MATCH (hw)-[:SWA_HW_PERIPHERAL_CONFIGURED_BY]->(cfg_module:MCALModule)
-        RETURN hw, collect(DISTINCT m.module_name) AS dependent_modules,
-               collect(DISTINCT cfg_module.module_name) AS configuring_modules
+      ea_requirement_traceability: |
+        MATCH (n)-[:EA_IMPLEMENTS]->(req:EA_Requirement)
+        WHERE n.module =         RETURN labels(n)[0] AS element_type, n.name AS element_name,
+               req.name AS requirement
+        ORDER BY req.name
 
-      # -- Section 3.1.6: SW-SW Interface Queries --
-
-      swa_sw_dependencies_for_module: |
-        MATCH (m:MCALModule {module_name: $module})-[:SWA_CALLS_EXTERNAL]->(dep:SWA_SwDependency)
-        OPTIONAL MATCH (dep)-[:SWA_DEPENDENCY_PROVIDED_BY]->(provider:MCALModule)
-        RETURN dep.api_name AS api, dep.dependency_type AS type,
-               provider.module_name AS provider_module, dep.description AS description
-        ORDER BY provider.module_name, dep.api_name
-
-      swa_module_dependency_graph: |
-        MATCH (caller:MCALModule)-[:SWA_CALLS_EXTERNAL]->(dep:SWA_SwDependency)-[:SWA_DEPENDENCY_PROVIDED_BY]->(provider:MCALModule)
-        WHERE caller.module_name = $module
-        RETURN caller.module_name AS caller, provider.module_name AS provider,
-               collect(dep.api_name) AS apis
-        ORDER BY provider
-
-      # -- Section 3.1.7: Configuration Queries --
-
-      swa_config_containers_for_module: |
-        MATCH (cc:SWA_ConfigContainer)-[:SWA_CONFIG_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN cc.container_name AS container, cc.container_type AS type,
-               cc.multiplicity_min AS min_mult, cc.multiplicity_max AS max_mult,
-               cc.sub_containers AS sub_containers
-        ORDER BY cc.section_number
-
-      swa_config_container_hierarchy: |
-        MATCH path = (root:SWA_ConfigContainer {container_name: $container})-[:SWA_CONTAINS_CONTAINER*0..5]->(child:SWA_ConfigContainer)
-        OPTIONAL MATCH (child)-[:SWA_CONTAINS_PARAM]->(p:SWA_ConfigParam)
-        RETURN child.container_name AS container, child.container_type AS type,
-               collect(p.param_name) AS parameters
-
-      swa_config_params_in_container: |
-        MATCH (cc:SWA_ConfigContainer {container_name: $container})-[:SWA_CONTAINS_PARAM]->(p:SWA_ConfigParam)
-        RETURN p.param_name AS parameter, p.param_type AS type,
-               p.default_value AS default_val, p.range_values AS range,
-               p.origin AS origin, p.description AS description
-        ORDER BY p.param_name
-
-      swa_config_param_traceability: |
-        MATCH (p:SWA_ConfigParam {param_name: $param_name})
-        OPTIONAL MATCH (p)-[:SWA_CONFIG_TRACES_TO]->(prq:ProductRequirement)
-        OPTIONAL MATCH (cc:SWA_ConfigContainer)-[:SWA_CONTAINS_PARAM]->(p)
-        RETURN p, cc.container_name AS parent_container,
-               collect(DISTINCT prq.requirement_id) AS traced_prqs
-
-      # -- Section 3.1.9: File Structure Queries --
-
-      swa_files_for_module: |
-        MATCH (sf:SWA_SourceFile)-[:SWA_FILE_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN sf.file_name AS file, sf.file_category AS category, sf.description AS description
-        ORDER BY sf.file_category, sf.file_name
-
-      swa_file_traceability: |
-        MATCH (sf:SWA_SourceFile {file_name: $file_name})
-        OPTIONAL MATCH (sf)-[:SWA_FILE_TRACES_TO]->(prq:ProductRequirement)
-        OPTIONAL MATCH (f:SWA_Function)-[:SWA_FUNCTION_DECLARED_IN]->(sf)
-        OPTIONAL MATCH (dt:SWA_DataType)-[:SWA_DATATYPE_DECLARED_IN]->(sf)
-        RETURN sf, collect(DISTINCT prq.requirement_id) AS traced_prqs,
-               collect(DISTINCT f.function_name) AS functions,
-               collect(DISTINCT dt.type_name) AS data_types
-
-      # -- Section 3.2: Call Sequence Queries --
-
-      swa_call_sequences_for_module: |
-        MATCH (cs:SWA_CallSequence)-[:SWA_CALL_SEQUENCE_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN cs.sequence_name AS sequence, cs.scenario_category AS category,
-               cs.section_number AS section, cs.related_functions AS functions
-        ORDER BY cs.section_number
-
-      swa_call_sequence_detail: |
-        MATCH (cs:SWA_CallSequence {sequence_name: $sequence_name})
-        OPTIONAL MATCH (cs)-[:SWA_CALL_SEQUENCE_INVOLVES]->(f:SWA_Function)
-        OPTIONAL MATCH (cs)-[:SWA_CALL_SEQUENCE_TRACES_TO]->(prq:ProductRequirement)
-        RETURN cs, collect(DISTINCT f.function_name) AS involved_functions,
-               collect(DISTINCT prq.requirement_id) AS traced_prqs
-
-      swa_call_sequences_for_function: |
-        MATCH (cs:SWA_CallSequence)-[:SWA_CALL_SEQUENCE_INVOLVES]->(f:SWA_Function {function_name: $func_name})
-        RETURN cs.sequence_name AS sequence, cs.scenario_category AS category,
-               cs.description AS description, cs.section_number AS section
-        ORDER BY cs.section_number
-
-      swa_call_sequences_by_category: |
-        MATCH (cs:SWA_CallSequence)-[:SWA_CALL_SEQUENCE_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        WHERE cs.scenario_category = $category
-        RETURN cs.sequence_name AS sequence, cs.description AS description,
-               cs.actors AS actors, cs.section_number AS section
-        ORDER BY cs.section_number
-
-      # -- Cross-Section: Complete Module SWA Overview --
-
-      swa_module_overview: |
-        MATCH (m:MCALModule {module_name: $module})
-        OPTIONAL MATCH (ad:SWA_ArchitecturalDecision)-[:SWA_ARCH_DECISION_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (m)-[:SWA_DEPENDS_ON_HW]->(hw:SWA_HwPeripheral)
-        OPTIONAL MATCH (m)-[:SWA_CALLS_EXTERNAL]->(dep:SWA_SwDependency)
-        OPTIONAL MATCH (cc:SWA_ConfigContainer)-[:SWA_CONFIG_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (f:SWA_Function)-[:SWA_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (sf:SWA_SourceFile)-[:SWA_FILE_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (cs:SWA_CallSequence)-[:SWA_CALL_SEQUENCE_BELONGS_TO_MODULE]->(m)
-        RETURN m.module_name AS module,
-               count(DISTINCT ad) AS arch_decisions,
-               count(DISTINCT hw) AS hw_peripherals,
-               count(DISTINCT dep) AS sw_dependencies,
+      ea_module_overview: |
+        MATCH (m:MCALModule {name: \})
+        OPTIONAL MATCH (f:EA_Function)-[:EA_BELONGS_TO_MODULE]->(m)
+        OPTIONAL MATCH (dt:EA_DataType)-[:EA_BELONGS_TO_MODULE]->(m)
+        OPTIONAL MATCH (cp:EA_ConfigParameter)-[:EA_BELONGS_TO_MODULE]->(m)
+        OPTIONAL MATCH (cc:EA_ConfigContainer)-[:EA_BELONGS_TO_MODULE]->(m)
+        OPTIONAL MATCH (dd:EA_DesignDecision)-[:EA_BELONGS_TO_MODULE]->(m)
+        OPTIONAL MATCH (sf:EA_SourceFile)-[:EA_BELONGS_TO_MODULE]->(m)
+        OPTIONAL MATCH (ms:EA_MemorySection)-[:EA_BELONGS_TO_MODULE]->(m)
+        OPTIONAL MATCH (diag:EA_Diagram)-[:EA_BELONGS_TO_MODULE]->(m)
+        RETURN m.name AS module,
+               count(DISTINCT f) AS functions,
+               count(DISTINCT dt) AS data_types,
+               count(DISTINCT cp) AS config_parameters,
                count(DISTINCT cc) AS config_containers,
-               count(DISTINCT f) AS functions,
-               count(DISTINCT sf) AS source_files,
-               count(DISTINCT cs) AS call_sequences
-
-      # -- SWUD Query Templates --
-
-      # Section 2: Design Decisions
-      swud_design_decisions_for_module: |
-        MATCH (dd:SWUD_DesignDecision)-[:SWUD_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN dd.decision_id AS id, dd.title AS title, dd.description AS description,
-               dd.rationale AS rationale, dd.decision_type AS type
-        ORDER BY dd.section_number
-
-      # Section 3: Configuration — derived params
-      swud_derived_config_params: |
-        MATCH (p:SWUD_DerivedConfigParam)-[:SWUD_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN p.param_name AS name, p.description AS description,
-               p.range AS range, p.file AS file, p.dependencies AS deps
-        ORDER BY p.section_number
-
-      # Section 3: Configuration — config structures
-      swud_config_structures: |
-        MATCH (cs:SWUD_ConfigStructure)-[:SWUD_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN cs.structure_name AS name, cs.c_type AS type,
-               cs.description AS description, cs.file AS file,
-               cs.memory_section AS mem_section
-        ORDER BY cs.section_number
-
-      # Section 3: Code gen macros
-      swud_codegen_macros: |
-        MATCH (cgm:SWUD_CodeGenMacro)-[:SWUD_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN cgm.macro_name AS name, cgm.description AS description,
-               cgm.file AS file
-        ORDER BY cgm.section_number
-
-      # Section 4: All functions by category
-      swud_functions_by_category: |
-        MATCH (f:SWUD_Function)-[:SWUD_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        WHERE f.function_category = $category
-        RETURN f.function_name AS name, f.description AS description,
-               f.syntax AS syntax, f.asil_level AS asil,
-               f.error_handling AS errors, f.memory_section AS mem_section
-        ORDER BY f.section_number
-
-      # Function detail with full traceability
-      swud_function_detail: |
-        MATCH (f:SWUD_Function {function_name: $function_name})
-        OPTIONAL MATCH (f)-[:SWUD_TRACES_TO]->(prq:ProductRequirement)
-        OPTIONAL MATCH (f)-[:SWUD_USES_TYPE]->(t:SWUD_TypeDefinition)
-        OPTIONAL MATCH (f)-[:SWUD_CALLS]->(callee:SWUD_Function)
-        OPTIONAL MATCH (f)-[:SWUD_ALLOCATED_IN]->(ms:SWUD_MemorySection)
-        OPTIONAL MATCH (f)-[:SWUD_USES_CRITICAL_SECTION]->(cs:SWUD_CriticalSection)
-        OPTIONAL MATCH (f)-[:SWUD_REALIZES_SWA]->(swa_f:SWA_Function)
-        RETURN f, collect(DISTINCT prq.requirement_id) AS traced_prqs,
-               collect(DISTINCT t.type_name) AS used_types,
-               collect(DISTINCT callee.function_name) AS calls,
-               collect(DISTINCT ms.section_name) AS memory_sections,
-               collect(DISTINCT cs.critical_section_name) AS critical_sections,
-               swa_f.function_name AS swa_counterpart
-
-      # Function call graph for a module
-      swud_call_graph: |
-        MATCH (caller:SWUD_Function)-[:SWUD_CALLS]->(callee:SWUD_Function)
-        WHERE caller.module = $module
-        RETURN caller.function_name AS caller, callee.function_name AS callee,
-               caller.function_category AS caller_cat, callee.function_category AS callee_cat
-
-      # PRQ traceability through SWUD — which SWUD elements implement a PRQ
-      swud_prq_traceability: |
-        MATCH (n)-[:SWUD_TRACES_TO]->(prq:ProductRequirement {requirement_id: $prq_id})
-        RETURN labels(n)[0] AS node_type, n.function_name AS function_name,
-               coalesce(n.function_name, n.param_name, n.structure_name,
-                        n.macro_name, n.type_name, n.variable_name,
-                        n.critical_section_name, n.section_name,
-                        n.title) AS element_name,
-               n.section_number AS section
-
-      # Cross-document: SWA → SWUD traceability for a function
-      swud_swa_to_swud_function: |
-        MATCH (swa_f:SWA_Function {function_name: $function_name})
-        OPTIONAL MATCH (swud_f:SWUD_Function)-[:SWUD_REALIZES_SWA]->(swa_f)
-        OPTIONAL MATCH (swud_f)-[:SWUD_CALLS]->(callee:SWUD_Function)
-        RETURN swa_f.function_name AS swa_function,
-               swud_f.function_name AS swud_function,
-               swud_f.algorithm AS algorithm,
-               collect(DISTINCT callee.function_name) AS internal_calls
-
-      # Section 5: Data variables
-      swud_data_variables: |
-        MATCH (dv:SWUD_DataVariable)-[:SWUD_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        RETURN dv.variable_name AS name, dv.c_type AS type,
-               dv.scope AS scope, dv.description AS description,
-               dv.memory_section AS mem_section
-        ORDER BY dv.section_number
-
-      # Section 6: Critical sections with protected resources
-      swud_critical_sections: |
-        MATCH (cs:SWUD_CriticalSection)-[:SWUD_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        OPTIONAL MATCH (f:SWUD_Function)-[:SWUD_USES_CRITICAL_SECTION]->(cs)
-        OPTIONAL MATCH (cs)-[:SWUD_PROTECTS]->(dv:SWUD_DataVariable)
-        RETURN cs.critical_section_name AS name, cs.description AS description,
-               cs.protection_scope AS scope,
-               collect(DISTINCT f.function_name) AS using_functions,
-               collect(DISTINCT dv.variable_name) AS protected_variables
-
-      # Section 7: Memory section allocation map
-      swud_memory_map: |
-        MATCH (ms:SWUD_MemorySection)-[:SWUD_BELONGS_TO_MODULE]->(m:MCALModule {module_name: $module})
-        OPTIONAL MATCH (f:SWUD_Function)-[:SWUD_ALLOCATED_IN]->(ms)
-        OPTIONAL MATCH (dv:SWUD_DataVariable)-[:SWUD_ALLOCATED_IN]->(ms)
-        RETURN ms.section_name AS section, ms.memmap_category AS category,
-               ms.asil_level AS asil, ms.typical_mapping AS target,
-               count(DISTINCT f) AS function_count,
-               count(DISTINCT dv) AS variable_count
-
-      # Complete SWUD module overview
-      swud_module_overview: |
-        MATCH (m:MCALModule {module_name: $module})
-        OPTIONAL MATCH (dd:SWUD_DesignDecision)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (dp:SWUD_DerivedConfigParam)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (cs_struct:SWUD_ConfigStructure)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (cgm:SWUD_CodeGenMacro)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (td:SWUD_TypeDefinition)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (f:SWUD_Function)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (dv:SWUD_DataVariable)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (cs:SWUD_CriticalSection)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        OPTIONAL MATCH (ms:SWUD_MemorySection)-[:SWUD_BELONGS_TO_MODULE]->(m)
-        RETURN m.module_name AS module,
                count(DISTINCT dd) AS design_decisions,
-               count(DISTINCT dp) AS derived_config_params,
-               count(DISTINCT cs_struct) AS config_structures,
-               count(DISTINCT cgm) AS codegen_macros,
-               count(DISTINCT td) AS type_definitions,
-               count(DISTINCT f) AS functions,
-               count(DISTINCT dv) AS data_variables,
-               count(DISTINCT cs) AS critical_sections,
-               count(DISTINCT ms) AS memory_sections
+               count(DISTINCT sf) AS source_files,
+               count(DISTINCT ms) AS memory_sections,
+               count(DISTINCT diag) AS diagrams
+
+      # EA Diagram Query Templates
+
+      ea_diagrams_for_module: |
+        MATCH (d:EA_Diagram)-[:EA_BELONGS_TO_MODULE]->(m:MCALModule {name: \})
+        RETURN d.name AS diagram, d.diagram_type AS type,
+               d.element_count AS elements, d.link_count AS links
+        ORDER BY d.diagram_type, d.name
+
+      ea_activity_diagram_flow: |
+        MATCH (d:EA_Diagram {name: \})
+        MATCH (node:EA_ActivityNode)-[:PART_OF]->(d)
+        OPTIONAL MATCH (node)-[cf:EA_CONTROL_FLOW]->(next:EA_ActivityNode)
+        RETURN node.name AS node_name, node.node_type AS node_type,
+               node.sequence AS seq,
+               collect({target: next.name, label: cf.label}) AS flows
+        ORDER BY node.sequence
+
+      ea_sequence_diagram: |
+        MATCH (d:EA_Diagram {name: \})
+        MATCH (p:EA_SeqParticipant)-[:PART_OF]->(d)
+        OPTIONAL MATCH (p)-[msg:EA_SEQ_MESSAGE]->(target:EA_SeqParticipant)
+        RETURN p.name AS participant, p.participant_type AS type,
+               collect({to: target.name, message: msg.message, seq: msg.seq_no}) AS messages
+        ORDER BY p.sequence
+
+      ea_statechart_diagram: |
+        MATCH (d:EA_Diagram {name: \})
+        MATCH (s:EA_State)-[:PART_OF]->(d)
+        OPTIONAL MATCH (s)-[t:EA_STATE_TRANSITION]->(next:EA_State)
+        RETURN s.name AS state, s.state_type AS type,
+               collect({target: next.name, label: t.label}) AS transitions
+        ORDER BY s.sequence
+
+      ea_diagram_elements: |
+        MATCH (elem)-[:APPEARS_IN]->(d:EA_Diagram {name: \})
+        RETURN labels(elem)[0] AS label, elem.name AS name,
+               elem.stereotype AS stereotype
+        ORDER BY labels(elem)[0], elem.name
 
       # ================================================================
       # Test Specification Query Templates
@@ -5721,11 +4022,9 @@ profiles:
       ts_functional_test_detail: |
         MATCH (tc:TS_FunctionalTestCase {test_case_id: $test_id})
         OPTIONAL MATCH (tc)-[:TS_VERIFIES]->(prq:ProductRequirement)
-        OPTIONAL MATCH (tc)-[:TS_VALIDATES_SWA]->(swa)
+        OPTIONAL MATCH (tc)-[:TS_VALIDATES_EA]->(ea)
         RETURN tc, collect(DISTINCT prq.requirement_id) AS verified_prqs,
-               collect(DISTINCT coalesce(swa.function_name, swa.type_name,
-                       swa.macro_name, swa.container_name,
-                       swa.param_name)) AS validated_swa_elements
+               collect(DISTINCT ea.name) AS validated_ea_elements
 
       # Which test cases verify a given PRQ
       ts_tests_for_prq: |
@@ -5745,18 +4044,18 @@ profiles:
                prq.status AS status
         ORDER BY prq.requirement_id
 
-      # Config test with linked SWA config element
+      # Config test with linked EA config element
       ts_config_test_traceability: |
         MATCH (tc:TS_ConfigTestCase {test_case_id: $test_id})
         OPTIONAL MATCH (tc)-[:TS_TESTS_CONFIG_ELEMENT]->(cfg)
         OPTIONAL MATCH (tc)-[:TS_VERIFIES]->(prq:ProductRequirement)
         RETURN tc.config_path AS config_path, tc.element_type AS element_type,
                collect(DISTINCT prq.requirement_id) AS verified_prqs,
-               collect(DISTINCT coalesce(cfg.param_name, cfg.container_name)) AS tested_config
+               collect(DISTINCT cfg.name) AS tested_config
 
       # WCET measurements for a function
       ts_wcet_for_function: |
-        MATCH (wc:TS_WCETTestCase)-[:TS_MEASURES_TIMING_OF]->(f:SWA_Function {function_name: $func_name})
+        MATCH (wc:TS_WCETTestCase)-[:TS_MEASURES_TIMING_OF]->(f:EA_Function {name: $func_name})
         RETURN wc.test_case_id AS test_id, wc.config_name AS config,
                wc.data_point AS data_point,
                wc.configuration_description AS config_desc,

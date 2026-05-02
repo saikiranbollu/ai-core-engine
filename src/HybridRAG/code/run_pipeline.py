@@ -4,17 +4,22 @@ HybridRAG Pipeline Orchestrator
 ================================
 Runs the full MCAL HybridRAG pipeline for a given module in sequence.
 
-Prerequisites (manual, one-time):
-  1. Activate venv:  & .venv\\Scripts\\Activate.ps1
-  2. Fetch Jama SHRQ/PRQ (interactive):  python testapi.py
-     → produces jama-req/jama_<module>_combined_requirements.json
+Steps:
+  0. Refresh LLM token
+  1. Fetch Jama SHRQ + PRQ requirements
+  2. Fetch Jama relationships
+  3. Build base KG (Jama → Neo4j)
+  4. KG ingestion (EA from QEAX → Neo4j)
+  5. KG ingestion (Test Spec → Neo4j)
+  6. KG ingestion (Source Code → Neo4j)
+  7. KG ingestion (SFR → Neo4j)
 
 Usage:
-  python run_pipeline.py --module DIO
-  python run_pipeline.py --module DIO --skip-docx2pdf --skip-token
-  python run_pipeline.py --module DIO --start-from 5
-  python run_pipeline.py --module DIO --only 7,8,9
-  python run_pipeline.py --module DIO --dry-run
+  python run_pipeline.py --module ADC --auto-fetch
+  python run_pipeline.py --module ADC --auto-fetch --ref feature/adc-fix
+  python run_pipeline.py --module ADC --skip-token --start-from 4
+  python run_pipeline.py --module ADC --only 4,5,6,7
+  python run_pipeline.py --module ADC --dry-run
 """
 from __future__ import annotations
 
@@ -32,14 +37,45 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 CODE_DIR = Path(__file__).resolve().parent
 HYBRIDRAG_DIR = CODE_DIR.parent
-SWA_DIR = HYBRIDRAG_DIR / "swa"
-SWUD_DIR = HYBRIDRAG_DIR / "swud"
 JAMA_REQ_DIR = HYBRIDRAG_DIR / "jama-req"
 TESTSPEC_DIR = HYBRIDRAG_DIR / "testspec"
 TEMP_DIR = HYBRIDRAG_DIR / "temp"
 TEMP_DATA_DIR = TEMP_DIR / "temporary_data"
+DEFAULT_QEAX = Path(r"C:\Users\NairSurajRet\Downloads\2.20.0_tc4xx_sw_mcal\2.20.0_tc4xx_sw_mcal.qeax")
+VALID_PROFILES = {"mcal", "test", "illd", "local"}
+
+# Reliable Python executable: prefer the venv that contains this script,
+# falling back to sys.executable only when no venv is found.
+_VENV_DIR = HYBRIDRAG_DIR.parents[1] / ".venv"          # ai-core-engine/.venv
+if sys.platform == "win32":
+    _VENV_PYTHON = _VENV_DIR / "Scripts" / "python.exe"
+else:
+    _VENV_PYTHON = _VENV_DIR / "bin" / "python"
+PYTHON = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else sys.executable
 
 logger = logging.getLogger("pipeline")
+
+
+def _ask_profile() -> str:
+    """Interactively ask which Neo4j instance to target."""
+    print("\n" + "=" * 64)
+    print("  Which Neo4j instance should the pipeline write to?")
+    print("  1. test   — Test instance (bolt-passthrough-neo4j-mcswai-test)")
+    print("  2. mcal   — Production MCAL (bolt-passthrough-neo4j-mcswai-mcal)")
+    print("  3. illd   — ILLD (bolt-passthrough-neo4j-mcswai-legato)")
+    print("  4. local  — Local Neo4j Desktop (127.0.0.1:7687)")
+    print("=" * 64)
+    while True:
+        choice = input("  Enter choice [1/2/3/4] (default=1 → test): ").strip()
+        if choice in ("", "1", "test"):
+            return "test"
+        if choice in ("2", "mcal"):
+            return "mcal"
+        if choice in ("3", "illd"):
+            return "illd"
+        if choice in ("4", "local"):
+            return "local"
+        print("  Invalid choice. Please enter 1, 2, 3, or 4.")
 
 
 # ---------------------------------------------------------------------------
@@ -152,60 +188,43 @@ def _find_file(directory: Path, glob_pattern: str, description: str) -> Path:
     return matches[0]
 
 
-def setup_working_dirs(module: str, dry_run: bool = False) -> None:
+def setup_working_dirs(module: str, dry_run: bool = False,
+                      auto_fetch: bool = False, ref: str = "master") -> None:
     """Create working directories and copy input files from temp/temporary_data/.
 
-    Creates ``swa/``, ``swud/``, ``jama-req/``, ``testspec/`` under
-    HYBRIDRAG_DIR and populates them with the required DOCX / XLSX files
-    from the cloned Bitbucket repos.
+    Creates ``jama-req/`` and ``testspec/`` under HYBRIDRAG_DIR and
+    populates them with the required XLSX files from the cloned Bitbucket repos.
+
+    When *auto_fetch* is True, missing repos are shallow-cloned from
+    Bitbucket automatically via :class:`SourceRepoFetcher`.
     """
     logger.info("=" * 64)
     logger.info("  SETUP — creating working directories for %s", module)
     logger.info("=" * 64)
 
+    # Auto-fetch repos from Bitbucket if requested or if TEMP_DATA_DIR is empty
+    if auto_fetch or not TEMP_DATA_DIR.exists():
+        if dry_run:
+            logger.info("  [DRY-RUN] Would auto-fetch repos from Bitbucket (ref=%s)", ref)
+        else:
+            # dependency_fetcher lives in code/KG/ — add to path for import
+            _kg_dir = str(CODE_DIR / "KG")
+            if _kg_dir not in sys.path:
+                sys.path.insert(0, _kg_dir)
+            from dependency_fetcher import SourceRepoFetcher
+            fetcher = SourceRepoFetcher(TEMP_DATA_DIR, module, ref=ref)
+            logger.info("  Auto-fetching repos from Bitbucket (ref=%s) ...", ref)
+            paths = fetcher.fetch_all()
+            for kind, path in paths.items():
+                logger.info("    %s → %s", kind, path)
+
     if not TEMP_DATA_DIR.exists():
         logger.error(
             "Input directory not found: %s\n"
-            "  → Clone the Bitbucket repos into temp/temporary_data/ first.",
+            "  → Use --auto-fetch or clone the repos manually.",
             TEMP_DATA_DIR,
         )
         sys.exit(1)
-
-    # --- SWA DOCX -----------------------------------------------------------
-    arch_dir = _resolve_repo_dir(module, "arch")
-    if arch_dir.exists():
-        if not dry_run:
-            SWA_DIR.mkdir(parents=True, exist_ok=True)
-        src_docx = _find_file(arch_dir, "TC4xx_SW_MCAL_SWA_*.docx", "SWA DOCX")
-        dst_docx = SWA_DIR / f"TC4xx_SW_MCAL_SWA_{module}.docx"
-        if not dst_docx.exists():
-            if dry_run:
-                logger.info("  [DRY-RUN] Would copy %s → %s", src_docx.name, dst_docx)
-            else:
-                shutil.copy2(src_docx, dst_docx)
-                logger.info("  Copied %s → %s", src_docx.name, dst_docx.name)
-        else:
-            logger.info("  SKIP (exists): %s", dst_docx.name)
-    else:
-        logger.warning("  Arch repo not found: %s — skipping SWA setup", arch_dir)
-
-    # --- SWUD DOCX ----------------------------------------------------------
-    design_dir = _resolve_repo_dir(module, "design")
-    if design_dir.exists():
-        if not dry_run:
-            SWUD_DIR.mkdir(parents=True, exist_ok=True)
-        src_docx = _find_file(design_dir, "TC4xx_SW_MCAL_SWUD_*.docx", "SWUD DOCX")
-        dst_docx = SWUD_DIR / f"TC4xx_SW_MCAL_SWUD_{module}.docx"
-        if not dst_docx.exists():
-            if dry_run:
-                logger.info("  [DRY-RUN] Would copy %s → %s", src_docx.name, dst_docx)
-            else:
-                shutil.copy2(src_docx, dst_docx)
-                logger.info("  Copied %s → %s", src_docx.name, dst_docx.name)
-        else:
-            logger.info("  SKIP (exists): %s", dst_docx.name)
-    else:
-        logger.warning("  Design repo not found: %s — skipping SWUD setup", design_dir)
 
     # --- TestSpec XLSX -------------------------------------------------------
     val_dir = _resolve_repo_dir(module, "val")
@@ -248,30 +267,6 @@ def cleanup_working_dirs(module: str, delete_temp: bool = False,
 
     archive.mkdir(parents=True, exist_ok=True)
 
-    # --- SWA sections → temp/{MODULE}/swa_sections/ -------------------------
-    swa_sections = archive / "swa_sections"
-    if SWA_DIR.exists():
-        swa_sections.mkdir(parents=True, exist_ok=True)
-        for f in sorted(SWA_DIR.glob("section_*_raw.md")):
-            shutil.move(str(f), str(swa_sections / f.name))
-        full_md = SWA_DIR / f"TC4xx_SW_MCAL_SWA_{module}.md"
-        if full_md.exists():
-            shutil.move(str(full_md), str(archive / full_md.name))
-        shutil.rmtree(SWA_DIR, ignore_errors=True)
-        logger.info("  swa/ → %s", swa_sections)
-
-    # --- SWUD sections → temp/{MODULE}/swud_sections/ -----------------------
-    swud_sections = archive / "swud_sections"
-    if SWUD_DIR.exists():
-        swud_sections.mkdir(parents=True, exist_ok=True)
-        for f in sorted(SWUD_DIR.glob("section_*_raw.md")):
-            shutil.move(str(f), str(swud_sections / f.name))
-        full_md = SWUD_DIR / f"TC4xx_SW_MCAL_SWUD_{module}.md"
-        if full_md.exists():
-            shutil.move(str(full_md), str(archive / full_md.name))
-        shutil.rmtree(SWUD_DIR, ignore_errors=True)
-        logger.info("  swud/ → %s", swud_sections)
-
     # --- jama-req/ → temp/{MODULE}/ -----------------------------------------
     if JAMA_REQ_DIR.exists():
         jama_archive = archive / "jama-req"
@@ -312,98 +307,14 @@ def cleanup_working_dirs(module: str, delete_temp: bool = False,
     logger.info("  Cleanup complete.\n")
 
 
-def _remove_md_artifacts(folder: Path, module: str, prefix: str) -> None:
-    """Delete generated MD files for *module* from *folder*.
-
-    Removes the main converted markdown and all ``section_*_raw.md`` files
-    so the pipeline can regenerate them from the PDF.  Files belonging to
-    other modules (e.g. PORT) are left untouched.
-    """
-    main_md = folder / f"TC4xx_SW_MCAL_{prefix}_{module}.md"
-    if main_md.exists():
-        main_md.unlink()
-        logger.info("Removed %s (--clear)", main_md.name)
-
-    for sect in sorted(folder.glob("section_*_raw.md")):
-        sect.unlink()
-        logger.info("Removed %s (--clear)", sect.name)
-
-
 # ---------------------------------------------------------------------------
 # Pipeline steps
 # ---------------------------------------------------------------------------
 
-def step0_docx2pdf(module: str, dry_run: bool, clear: bool = False) -> None:
-    """Unhide reference tags then convert SWA and SWUD DOCX → PDF.
-
-    If *clear* is True, existing PDFs are deleted first so they get
-    regenerated from the DOCX source.
-
-    Sub-steps:
-      0a. Run unhide_tags.py to clear hidden formatting on [req ...] tags,
-          producing *_tags.docx files.
-      0b. Convert the _tags.docx files to PDF via Word COM automation.
-    """
-    # --- Delete existing PDFs when --clear is set ----------------------------
-    if clear and not dry_run:
-        for folder, prefix in [(SWA_DIR, "SWA"), (SWUD_DIR, "SWUD")]:
-            pdf = folder / f"TC4xx_SW_MCAL_{prefix}_{module}.pdf"
-            if pdf.exists():
-                pdf.unlink()
-                logger.info("Removed existing PDF: %s (--clear)", pdf.name)
-
-    # --- 0a: Unhide reference tags -------------------------------------------
-    _run(
-        [sys.executable, "unhide_tags.py", "--module", module],
-        cwd=CODE_DIR / "references",
-        label="Step 0a: Unhide reference tags in DOCX",
-        dry_run=dry_run,
-    )
-
-    # --- 0b: Convert _tags.docx → PDF via Word COM ----------------------------
-    # Use the _tags.docx files produced by 0a.  The PDF keeps the original
-    # naming (without _tags) so downstream steps don't need to change.
-    if not dry_run:
-        import pythoncom, win32com.client          # noqa: E401
-        pythoncom.CoInitialize()
-        word = win32com.client.DispatchEx("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0  # wdAlertsNone — suppress all dialogs
-
-        try:
-            for folder, prefix in [(SWA_DIR, "SWA"), (SWUD_DIR, "SWUD")]:
-                pdf = folder / f"TC4xx_SW_MCAL_{prefix}_{module}.pdf"
-                if pdf.exists():
-                    logger.info("SKIP (PDF exists): %s", pdf)
-                    continue
-                tags_docx = folder / f"TC4xx_SW_MCAL_{prefix}_{module}_tags.docx"
-                orig_docx = folder / f"TC4xx_SW_MCAL_{prefix}_{module}.docx"
-                docx = tags_docx if tags_docx.exists() else orig_docx
-                if not docx.exists():
-                    logger.warning("SKIP (not found): %s", docx)
-                    continue
-                logger.info("Converting %s → %s …", docx.name, pdf.name)
-                doc = word.Documents.Open(
-                    str(docx.resolve()),
-                    ReadOnly=True,
-                    AddToRecentFiles=False,
-                    Visible=False,
-                )
-                doc.SaveAs2(str(pdf.resolve()), FileFormat=17)  # 17 = wdFormatPDF
-                doc.Close(0)  # 0 = wdDoNotSaveChanges
-                logger.info("OK: %s (%.1f MB)", pdf.name,
-                            pdf.stat().st_size / 1_048_576)
-        finally:
-            word.Quit()
-            pythoncom.CoUninitialize()
-    else:
-        logger.info("[DRY-RUN] Would convert DOCX → PDF for %s", module)
-
-
-def step1_token(dry_run: bool) -> None:
+def step0_token(dry_run: bool) -> None:
     """Refresh LLM token."""
     _run(
-        [sys.executable, "token_manager.py"],
+        [PYTHON, "token_manager.py"],
         cwd=CODE_DIR,
         label="Step 1: Refresh LLM token",
         dry_run=dry_run,
@@ -420,7 +331,7 @@ def step2_jama_fetch(module: str, dry_run: bool) -> None:
         logger.info("└─ Step 2 skipped (file exists)\n")
         return
     _run(
-        [sys.executable, "fetch_jama_requirements.py", "--module", module],
+        [PYTHON, "fetch_jama_requirements.py", "--module", module],
         cwd=CODE_DIR / "KG",
         label="Step 2: Fetch Jama SHRQ + PRQ + Safety + Cybersecurity requirements",
         dry_run=dry_run,
@@ -435,135 +346,107 @@ def step3_relationships(module: str, dry_run: bool) -> None:
             "Run Step 2 first or use: python KG/fetch_jama_requirements.py --module <MODULE>"
         )
     _run(
-        [sys.executable, "fetch_jama_relationships.py", "--module", module, "-v"],
+        [PYTHON, "fetch_jama_relationships.py", "--module", module, "-v"],
         cwd=CODE_DIR / "KG",
         label="Step 3: Fetch Jama relationships",
         dry_run=dry_run,
     )
 
 
-def step4_base_kg(module: str, dry_run: bool, clear: bool = False) -> None:
+def step4_base_kg(module: str, dry_run: bool, clear: bool = False, profile: str = "test", force: bool = False, project: str | None = None) -> None:
     """Build base KG from Jama data."""
-    cmd = [sys.executable, "build_knowledge_graph.py", "--profile", "mcal", "--module", module, "-v"]
+    cmd = [PYTHON, "build_knowledge_graph.py", "--profile", profile, "--module", module, "-v"]
     if clear:
         cmd.append("--clear")
+    if force:
+        cmd.append("--force")
+    if project:
+        cmd.extend(["--project", project])
     _run(
         cmd,
         cwd=CODE_DIR / "KG",
-        label="Step 4: Build base Knowledge Graph (Jama → Neo4j)",
+        label="Step 3: Build base Knowledge Graph (Jama → Neo4j)",
         dry_run=dry_run,
     )
 
 
-def step5_swa_markdown(module: str, dry_run: bool, clear: bool = False) -> None:
-    """Convert SWA PDF → Markdown sections."""
-    if clear and not dry_run:
-        _remove_md_artifacts(SWA_DIR, module, "SWA")
-    pdf = SWA_DIR / f"TC4xx_SW_MCAL_SWA_{module}.pdf"
-    if not dry_run:
-        _check_file(pdf, "Run Step 0 (DOCX → PDF) first, or place the PDF in swa/.")
-    _run(
-        [sys.executable, "prepare_markdowns.py",
-         "--input", str(pdf),
-         "--output-dir", str(SWA_DIR),
-         "--split-depth", "3",
-         "--reconvert", "-v"],
-        cwd=CODE_DIR / "RAG",
-        label="Step 5: SWA PDF → Markdown",
-        dry_run=dry_run,
-    )
-
-
-def step6_swud_markdown(module: str, dry_run: bool, clear: bool = False) -> None:
-    """Convert SWUD PDF → Markdown sections."""
-    if clear and not dry_run:
-        _remove_md_artifacts(SWUD_DIR, module, "SWUD")
-    pdf = SWUD_DIR / f"TC4xx_SW_MCAL_SWUD_{module}.pdf"
-    if not dry_run:
-        _check_file(pdf, "Run Step 0 (DOCX → PDF) first, or place the PDF in swud/.")
-    _run(
-        [sys.executable, "prepare_markdowns.py",
-         "--input", str(pdf),
-         "--output-dir", str(SWUD_DIR),
-         "--split-depth", "3",
-         "--reconvert", "-v"],
-        cwd=CODE_DIR / "RAG",
-        label="Step 6: SWUD PDF → Markdown",
-        dry_run=dry_run,
-    )
-
-
-def step7_rag_ingestion(module: str, dry_run: bool, clear: bool = False) -> None:
-    """Ingest SWA + SWUD sections into Qdrant."""
-    cmd = [sys.executable, "rag_ingestion.py", "--module", module, "-v"]
-    if clear:
-        cmd.append("--clear")
+def step_kg_ea(module: str, dry_run: bool, qeax_path: Path = DEFAULT_QEAX, profile: str = "test", project: str | None = None) -> None:
+    """Ingest EA architecture elements from QEAX into Neo4j KG."""
+    cmd = [
+        PYTHON, "build_knowledge_graph.py",
+        "--profile", profile, "--module", module,
+        "--ingest-ea", "--qeax-path", str(qeax_path), "-v",
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+    if project:
+        cmd.extend(["--project", project])
     _run(
         cmd,
-        cwd=CODE_DIR / "RAG",
-        label="Step 7: RAG ingestion (SWA + SWUD → Qdrant)",
-        dry_run=dry_run,
-    )
-
-
-def step8_kg_swa_swud(module: str, dry_run: bool) -> None:
-    """Ingest SWA + SWUD into Neo4j KG."""
-    _run(
-        [sys.executable, "build_knowledge_graph.py",
-         "--profile", "mcal", "--module", module,
-         "--ingest-swa", "--ingest-swud", "-v"],
         cwd=CODE_DIR / "KG",
-        label="Step 8: KG ingestion (SWA + SWUD → Neo4j)",
-        dry_run=dry_run,
+        label="Step 4: KG ingestion (EA → Neo4j)",
+        dry_run=False,
     )
 
 
-def step9_kg_testspec(module: str, dry_run: bool) -> None:
+def step9_kg_testspec(module: str, dry_run: bool, profile: str = "test", force: bool = False, project: str | None = None) -> None:
     """Ingest test spec into Neo4j KG."""
+    cmd = [PYTHON, "build_knowledge_graph.py",
+           "--profile", profile, "--module", module,
+           "--ingest-testspec", "-v"]
+    if force:
+        cmd.append("--force")
+    if project:
+        cmd.extend(["--project", project])
     _run(
-        [sys.executable, "build_knowledge_graph.py",
-         "--profile", "mcal", "--module", module,
-         "--ingest-testspec", "-v"],
+        cmd,
         cwd=CODE_DIR / "KG",
-        label="Step 9: KG ingestion (Test Spec → Neo4j)",
+        label="Step 5: KG ingestion (Test Spec → Neo4j)",
         dry_run=dry_run,
     )
 
 
-def step10_kg_source(module: str, dry_run: bool) -> None:
+def step10_kg_source(module: str, dry_run: bool, profile: str = "test", force: bool = False, project: str | None = None) -> None:
     """Ingest C source code into Neo4j KG."""
     source_dir = TEMP_DATA_DIR / f"aurix3g_sw_mcal_tc4xx_{module.lower()}_src"
-    cmd = [
-        sys.executable, "build_knowledge_graph.py",
-        "--profile", "mcal", "--module", module,
+    cmd = [PYTHON, "build_knowledge_graph.py",
+        "--profile", profile, "--module", module,
         "--ingest-source", "--source-dir", str(source_dir),
         "--sum-mode",           # auto-discovers configs from Bitbucket
         "-v",
     ]
     if dry_run:
         cmd.append("--dry-run")
+    if force:
+        cmd.append("--force")
+    if project:
+        cmd.extend(["--project", project])
     _run(
         cmd,
         cwd=CODE_DIR / "KG",
-        label="Step 10: KG ingestion (Source Code → Neo4j)",
+        label="Step 6: KG ingestion (Source Code → Neo4j)",
         dry_run=False,
     )
 
 
-def step11_kg_sfr(module: str, dry_run: bool) -> None:
+def step11_kg_sfr(module: str, dry_run: bool, profile: str = "test", force: bool = False, project: str | None = None) -> None:
     """Ingest SFR header files into Neo4j KG."""
     sfr_dir = TEMP_DATA_DIR / "aurix3g_sw_mcal_tc4xx_infra_sfr"
     cmd = [
-        sys.executable, "build_knowledge_graph.py",
-        "--profile", "mcal", "--module", module,
+        PYTHON, "build_knowledge_graph.py",
+        "--profile", profile, "--module", module,
         "--ingest-sfr", "--sfr-dir", str(sfr_dir), "-v",
     ]
     if dry_run:
         cmd.append("--dry-run")
+    if force:
+        cmd.append("--force")
+    if project:
+        cmd.extend(["--project", project])
     _run(
         cmd,
         cwd=CODE_DIR / "KG",
-        label="Step 11: KG ingestion (SFR → Neo4j)",
+        label="Step 7: KG ingestion (SFR → Neo4j)",
         dry_run=False,
     )
 
@@ -572,18 +455,14 @@ def step11_kg_sfr(module: str, dry_run: bool) -> None:
 # Registry
 # ---------------------------------------------------------------------------
 STEPS: dict[int, dict] = {
-    0:  {"fn": step0_docx2pdf,      "label": "DOCX → PDF conversion",         "needs_module": True},
-    1:  {"fn": step1_token,          "label": "Refresh LLM token",              "needs_module": False},
-    2:  {"fn": step2_jama_fetch,     "label": "Fetch Jama SHRQ + PRQ",          "needs_module": True},
-    3:  {"fn": step3_relationships,  "label": "Fetch Jama relationships",       "needs_module": True},
-    4:  {"fn": step4_base_kg,        "label": "Build base KG (Jama → Neo4j)",   "needs_module": True},
-    5:  {"fn": step5_swa_markdown,   "label": "SWA PDF → Markdown",             "needs_module": True,  "parallel_with": 6},
-    6:  {"fn": step6_swud_markdown,  "label": "SWUD PDF → Markdown",            "needs_module": True,  "parallel_with": 5},
-    7:  {"fn": step7_rag_ingestion,  "label": "RAG ingestion (Qdrant)",         "needs_module": True},
-    8:  {"fn": step8_kg_swa_swud,    "label": "KG ingestion (SWA + SWUD)",      "needs_module": True},
-    9:  {"fn": step9_kg_testspec,    "label": "KG ingestion (Test Spec)",       "needs_module": True},
-    10: {"fn": step11_kg_sfr,        "label": "KG ingestion (SFR → Neo4j)",      "needs_module": True},
-    11: {"fn": step10_kg_source,     "label": "KG ingestion (Source Code)",     "needs_module": True},
+    0:  {"fn": step0_token,          "label": "Refresh LLM token",              "needs_module": False},
+    1:  {"fn": step2_jama_fetch,     "label": "Fetch Jama SHRQ + PRQ",          "needs_module": True},
+    2:  {"fn": step3_relationships,  "label": "Fetch Jama relationships",       "needs_module": True},
+    3:  {"fn": step4_base_kg,        "label": "Build base KG (Jama → Neo4j)",   "needs_module": True},
+    4:  {"fn": step_kg_ea,           "label": "KG ingestion (EA → Neo4j)",      "needs_module": True,  "needs_qeax": True},
+    5:  {"fn": step9_kg_testspec,    "label": "KG ingestion (Test Spec)",       "needs_module": True},
+    6:  {"fn": step10_kg_source,     "label": "KG ingestion (Source Code)",     "needs_module": True},
+    7:  {"fn": step11_kg_sfr,        "label": "KG ingestion (SFR → Neo4j)",     "needs_module": True},
 }
 
 
@@ -596,27 +475,26 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python run_pipeline.py --module DIO\n"
-            "  python run_pipeline.py --module DIO --start-from 5\n"
-            "  python run_pipeline.py --module DIO --only 7,8,9\n"
-            "  python run_pipeline.py --module DIO --skip-docx2pdf\n"
-            "  python run_pipeline.py --module DIO --force-jama\n"
-            "  python run_pipeline.py --module DIO --dry-run\n"
+            "  python run_pipeline.py --module ADC\n"
+            "  python run_pipeline.py --module ADC --start-from 4\n"
+            "  python run_pipeline.py --module ADC --only 4,5,6,7\n"
+            "  python run_pipeline.py --module ADC --force-jama\n"
+            "  python run_pipeline.py --module ADC --dry-run\n"
         ),
     )
     parser.add_argument("--module", required=True, help="MCAL module name (e.g. DIO, ADC, GPT).")
+    parser.add_argument("--qeax-path", type=Path, default=DEFAULT_QEAX,
+                        help=f"Path to the QEAX model file. Default: {DEFAULT_QEAX}")
     parser.add_argument("--start-from", type=int, default=0, metavar="N",
                         help="Start from step N (skip earlier steps). Default: 0.")
     parser.add_argument("--only", type=str, default=None, metavar="3,5,7",
                         help="Run only these steps (comma-separated). Overrides --start-from.")
-    parser.add_argument("--skip-docx2pdf", action="store_true",
-                        help="Skip Step 0 (DOCX→PDF). Use if PDFs already exist.")
     parser.add_argument("--skip-token", action="store_true",
-                        help="Skip Step 1 (token refresh). Use if token is still valid.")
+                        help="Skip Step 0 (token refresh). Use if token is still valid.")
     parser.add_argument("--force-jama", action="store_true",
                         help="Re-fetch Jama requirements even if the file already exists.")
     parser.add_argument("--clear", action="store_true",
-                        help="Clean slate: delete PDFs, wipe Neo4j & Qdrant before rebuilding.")
+                        help="Clean slate: wipe Neo4j & Qdrant before rebuilding.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without executing them.")
     parser.add_argument("--delete-temp", action="store_true",
@@ -624,9 +502,20 @@ def main() -> None:
     parser.add_argument("--skip-setup", action="store_true",
                         help="Skip automatic working-dir setup (dirs must already exist).")
     parser.add_argument("--skip-cleanup", action="store_true",
-                        help="Skip post-pipeline cleanup (leave swa/, swud/ etc. in place).")
+                        help="Skip post-pipeline cleanup.")
+    parser.add_argument("--force", action="store_true",
+                        help="Force full re-ingestion (bypass incremental hash checks).")
+    parser.add_argument("--auto-fetch", action="store_true",
+                        help="Auto-clone repos from Bitbucket (no manual git clone needed).")
+    parser.add_argument("--ref", type=str, default="master",
+                        help="Git ref (branch/tag) to clone. Default: master.")
+    parser.add_argument("--profile", type=str, default=None,
+                        choices=["test", "mcal", "illd", "local"],
+                        help="Neo4j target profile. Skips interactive prompt.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable DEBUG logging.")
+    parser.add_argument("--project", type=str, default=None,
+                        help="Project tag to stamp on all nodes (e.g. A3G, RC1).")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -639,6 +528,18 @@ def main() -> None:
         logging.getLogger(_lib).setLevel(logging.WARNING)
 
     module = args.module.upper()
+    qeax_path = args.qeax_path
+
+    # Determine Neo4j profile (CLI flag or interactive)
+    if args.profile:
+        profile = args.profile
+    else:
+        profile = _ask_profile()
+    print(f"\n  → Target: {profile}\n")
+
+    # Validate QEAX path
+    if not qeax_path.exists():
+        logger.warning("QEAX file not found: %s — Step 4 (EA) will fail if selected.", qeax_path)
 
     # Determine which steps to run
     if args.only:
@@ -646,10 +547,8 @@ def main() -> None:
     else:
         selected = {k for k in STEPS if k >= args.start_from}
 
-    if args.skip_docx2pdf:
-        selected.discard(0)
     if args.skip_token:
-        selected.discard(1)
+        selected.discard(0)
 
     steps_to_run = sorted(s for s in selected if s in STEPS)
 
@@ -664,6 +563,7 @@ def main() -> None:
     # Print plan
     print("=" * 64)
     print(f"  HybridRAG Pipeline  |  Module: {module}")
+    print(f"  Target: {profile}")
     print(f"  Steps: {', '.join(str(s) for s in steps_to_run)}")
     if args.clear:
         print("  Mode: CLEAR (clean rebuild)")
@@ -676,24 +576,25 @@ def main() -> None:
 
     # --- Setup: create working dirs from temp/temporary_data/ ----------------
     if not args.skip_setup:
-        setup_working_dirs(module, dry_run=args.dry_run)
+        setup_working_dirs(module, dry_run=args.dry_run,
+                          auto_fetch=args.auto_fetch, ref=args.ref)
 
-    # Handle --force-jama: delete existing file so Step 2 re-fetches
+    # Handle --force-jama: delete existing file so Step 1 re-fetches
     if args.force_jama and not args.dry_run:
         jama_file = JAMA_REQ_DIR / f"jama_{module.lower()}_combined_requirements.json"
         if jama_file.exists():
             jama_file.unlink()
             logger.info("Removed existing %s (--force-jama)", jama_file.name)
 
-    # If steps 3-9 are selected but step 2 is not, check the Jama file exists
-    # Steps 10+ (source code, SFR) do not need Jama data.
-    jama_dependent_steps = {s for s in steps_to_run if 3 <= s <= 9}
-    if jama_dependent_steps and 2 not in steps_to_run and not args.dry_run:
+    # If steps 2-4 are selected but step 1 is not, check the Jama file exists
+    # Steps 5+ (testspec, source code, SFR) do not need Jama data.
+    jama_dependent_steps = {s for s in steps_to_run if 2 <= s <= 4}
+    if jama_dependent_steps and 1 not in steps_to_run and not args.dry_run:
         jama_file = JAMA_REQ_DIR / f"jama_{module.lower()}_combined_requirements.json"
         if not jama_file.exists():
             logger.error(
                 "Jama requirements file not found: %s\n"
-                "  → Include Step 2 or run:\n"
+                "  → Include Step 1 or run:\n"
                 "    python KG/fetch_jama_requirements.py --module %s",
                 jama_file, module,
             )
@@ -701,59 +602,28 @@ def main() -> None:
 
     # Execute
     pipeline_start = time.perf_counter()
-    executed = set()
 
     for step_num in steps_to_run:
-        if step_num in executed:
-            continue
-
         step = STEPS[step_num]
-        partner = step.get("parallel_with")
-
-        # If this step has a parallel partner and both are selected, run them together
-        if partner is not None and partner in steps_to_run and partner not in executed:
-            swa_pdf = SWA_DIR / f"TC4xx_SW_MCAL_SWA_{module}.pdf"
-            swud_pdf = SWUD_DIR / f"TC4xx_SW_MCAL_SWUD_{module}.pdf"
-            if not args.dry_run:
-                _check_file(swa_pdf, "Run Step 0 (DOCX → PDF) first, or place the PDF in swa/.")
-                _check_file(swud_pdf, "Run Step 0 (DOCX → PDF) first, or place the PDF in swud/.")
-
-            _run_parallel(
-                [
-                    {
-                        "label": "Step 5: SWA PDF → Markdown",
-                        "cmd": [sys.executable, "prepare_markdowns.py",
-                                "--input", str(swa_pdf),
-                                "--output-dir", str(SWA_DIR),
-                                "--reconvert", "-v"],
-                        "cwd": CODE_DIR / "RAG",
-                    },
-                    {
-                        "label": "Step 6: SWUD PDF → Markdown",
-                        "cmd": [sys.executable, "prepare_markdowns.py",
-                                "--input", str(swud_pdf),
-                                "--output-dir", str(SWUD_DIR),
-                                "--reconvert", "-v"],
-                        "cwd": CODE_DIR / "RAG",
-                    },
-                ],
-                dry_run=args.dry_run,
-            )
-            executed.add(step_num)
-            executed.add(partner)
+        fn = step["fn"]
+        # Pass clear= to steps that support it
+        import inspect
+        sig = inspect.signature(fn)
+        kwargs: dict = {}
+        if "clear" in sig.parameters:
+            kwargs["clear"] = args.clear
+        if "profile" in sig.parameters:
+            kwargs["profile"] = profile
+        if "force" in sig.parameters:
+            kwargs["force"] = args.force
+        if "project" in sig.parameters:
+            kwargs["project"] = args.project
+        if step.get("needs_qeax"):
+            kwargs["qeax_path"] = qeax_path
+        if step["needs_module"]:
+            fn(module, args.dry_run, **kwargs)
         else:
-            fn = step["fn"]
-            # Pass clear= to steps that support it (0, 4, 5, 6, 7)
-            import inspect
-            sig = inspect.signature(fn)
-            kwargs: dict = {}
-            if "clear" in sig.parameters:
-                kwargs["clear"] = args.clear
-            if step["needs_module"]:
-                fn(module, args.dry_run, **kwargs)
-            else:
-                fn(args.dry_run, **kwargs)
-            executed.add(step_num)
+            fn(args.dry_run, **kwargs)
 
     total = time.perf_counter() - pipeline_start
 

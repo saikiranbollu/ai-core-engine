@@ -40,6 +40,10 @@ spec:
               containerPort: 3593
               protocol: TCP
           env:
+            # --- Fix: add /app to PYTHONPATH so src.Observability.metrics
+            #     is importable before the sys.path bootstrapping in mcp_server.py ---
+            - name: PYTHONPATH
+              value: "/app:/app/src:/app/src/HybridRAG/code:/app/src/MemoryLayer:/app/aice_mcp"
             # --- Cerbos ---
             - name: CERBOS_HOST
               value: "localhost"
@@ -54,6 +58,9 @@ spec:
               value: "8000"
             - name: API_KEY_REGISTRY_PATH
               value: "/app/aice_mcp/auth/api_keys.yaml"
+            # --- Prometheus metrics ---
+            - name: ENABLE_METRICS
+              value: "true"
             # --- Offline mode (model cached in image) ---
             - name: HF_HUB_OFFLINE
               value: "1"

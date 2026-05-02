@@ -68,29 +68,48 @@ except ImportError:
     ILLDNode = None
     ILLDEdge = None
 
-# SWA parser import (IngestionPipeline/parsers)
+# SWA parser import (IngestionPipeline/Parsers)
 try:
-    from src.IngestionPipeline.parsers.swa_parsers import parse_swa_directory
+    from src.IngestionPipeline.Parsers.swa_parsers import parse_swa_directory
 except ImportError:
     parse_swa_directory = None
 
-# SWUD parser import (IngestionPipeline/parsers)
+# EA builder imports (replaces SWA/SWUD PDF parsers)
 try:
-    from src.IngestionPipeline.parsers.swud_parsers import parse_swud_directory
+    from ea_graph_builder import EAGraphBuilder
+except ImportError:
+    EAGraphBuilder = None
+
+# SWUD parser import (IngestionPipeline/Parsers)
+try:
+    from src.IngestionPipeline.Parsers.swud_parsers import parse_swud_directory
 except ImportError:
     parse_swud_directory = None
 
-# TestSpec parser import (IngestionPipeline/parsers)
 try:
-    from src.IngestionPipeline.parsers.testspec_parsers import parse_testspec_workbook
+    from ea_diagram_extractor import EADiagramExtractor
 except ImportError:
-    parse_testspec_workbook = None
+    EADiagramExtractor = None
+
+# TestSpec parser import (IngestionPipeline/Parsers)
+try:
+    from src.IngestionPipeline.Parsers.testspec_parsers import parse_testspec_workbook
+except ImportError:
+    try:
+        from testspec_parsers import parse_testspec_workbook
+    except ImportError:
+        parse_testspec_workbook = None
 
 # SFR parser import (KG directory)
 try:
-    from sfr_parsers import parse_sfr_repo
+    from sfr_parsers import parse_sfr_repo, discover_devices, discover_modules
 except ImportError:
     parse_sfr_repo = None
+    discover_devices = None
+    discover_modules = None
+
+# Incremental tracker
+from incremental_tracker import IncrementalTracker, discover_files, _hash_file
 
 # JamaConnector import
 try:
@@ -100,8 +119,11 @@ except ImportError:
 CONFIG_DIR = HYBRIDRAG_DIR / "config"
 JAMA_REQ_DIR = HYBRIDRAG_DIR / "jama-req"
 DATA_DIR = HYBRIDRAG_DIR / "data"                     # ILLD processed data root
-SWA_DIR = HYBRIDRAG_DIR / "swa"                       # SWA markdown sections
-SWUD_DIR = HYBRIDRAG_DIR / "swud"                     # SWUD markdown sections
+# Default QEAX model path (replaces SWA/SWUD markdown dirs)
+DEFAULT_QEAX = Path(
+    r"C:\Users\NairSurajRet\Downloads"
+    r"\2.20.0_tc4xx_sw_mcal\2.20.0_tc4xx_sw_mcal.qeax"
+)
 TESTSPEC_DIR = HYBRIDRAG_DIR / "testspec"              # Test spec Excel workbooks
 VISUALIZE_DIR = HYBRIDRAG_DIR / "visualize"
 ONTOLOGY_PATH = CONFIG_DIR / "ontology.yaml"
@@ -235,17 +257,41 @@ def get_neo4j_settings(profile: str, storage_cfg: dict) -> dict:
     return neo4j_section[profile]
 
 
+def _stamp_project_on_module(neo4j_cfg: dict, module: str, project: str) -> None:
+    """Set ``project`` on every node whose ``module`` matches *module*."""
+    from neo4j import GraphDatabase as _GD
+    driver = _GD.driver(
+        neo4j_cfg["uri"],
+        auth=(neo4j_cfg["username"], neo4j_cfg["password"]),
+    )
+    cypher = (
+        "MATCH (n) "
+        "WHERE n.module = $module AND (n.project IS NULL OR n.project <> $project) "
+        "SET n.project = $project "
+        "RETURN count(n) AS cnt"
+    )
+    with driver.session(database=neo4j_cfg.get("database", "neo4j")) as session:
+        cnt = session.run(cypher, module=module, project=project).single()["cnt"]
+    driver.close()
+    logger.info("Stamped project='%s' on %d nodes (module=%s)", project, cnt, module)
+
+
 # ---------------------------------------------------------------------------
 # Ontology Helpers
 # ---------------------------------------------------------------------------
 def get_profile_config(ontology: dict, profile: str) -> dict:
-    """Return the profile sub-dict from the ontology."""
+    """Return the profile sub-dict from the ontology.
+
+    The 'test' and 'local' profiles reuse the 'mcal' ontology definition
+    (same node types, relationships, etc.) — only the Neo4j URL differs.
+    """
+    ontology_profile = "mcal" if profile in ("test", "local") else profile
     profiles = ontology.get("profiles", {})
-    if profile not in profiles:
+    if ontology_profile not in profiles:
         raise ValueError(
-            f"Unknown profile '{profile}'. Available: {list(profiles.keys())}"
+            f"Unknown profile '{ontology_profile}'. Available: {list(profiles.keys())}"
         )
-    return profiles[profile]
+    return profiles[ontology_profile]
 
 
 def build_item_type_map(node_types: list) -> Dict[int, dict]:
@@ -400,6 +446,8 @@ class KnowledgeGraphBuilder:
         relationships_path: Optional[Path] = None,
         folders_path: Optional[Path] = None,
         jama_cfg: Optional[dict] = None,
+        module: Optional[str] = None,
+        force_incremental: bool = False,
     ):
         self.profile = profile
         self.profile_cfg = get_profile_config(ontology, profile)
@@ -407,6 +455,7 @@ class KnowledgeGraphBuilder:
         self.data_path = data_path
         self.dry_run = dry_run
         self.clear_db = clear_db
+        self.force_incremental = force_incremental
         # Derive module-aware cache paths from data_path if not explicitly given
         if not relationships_path or not folders_path:
             import re as _re
@@ -416,6 +465,11 @@ class KnowledgeGraphBuilder:
                 relationships_path = JAMA_REQ_DIR / f"jama_{_mod}_relationships.json" if _mod else None
             if not folders_path:
                 folders_path = JAMA_REQ_DIR / f"jama_{_mod}_folders.json" if _mod else None
+        else:
+            import re as _re
+            _m = _re.search(r'jama_(\w+)_combined', data_path.name) if data_path else None
+            _mod = _m.group(1) if _m else None
+        self.module = (module or _mod or "").upper() or None
         self.relationships_path = relationships_path
         self.folders_path = folders_path
         self.jama_cfg = jama_cfg or {}
@@ -576,6 +630,22 @@ class KnowledgeGraphBuilder:
         self._connect()
 
         try:
+            # ── Incremental check ──
+            if self.module and not self.clear_db and not self.force_incremental:
+                tracker = IncrementalTracker(self._driver, self.module)
+                plan = tracker.plan_jama(self.data_path, self.relationships_path)
+                logger.info(plan.summary())
+                if not plan.has_changes:
+                    logger.info("Jama data unchanged — skipping base KG ingestion")
+                    print(f"\n  ✓ Jama data unchanged for {self.module} — skipping.\n")
+                    return
+                if not plan.is_first_run:
+                    logger.info("Jama data changed — deleting old requirement nodes")
+                    tracker.delete_jama_nodes()
+                self._jama_hash = list(plan.changed.values())[0] if plan.changed else None
+            else:
+                self._jama_hash = None
+
             if self.clear_db:
                 self._clear_database()
 
@@ -587,6 +657,13 @@ class KnowledgeGraphBuilder:
             self._create_belongs_to_module_relationships()
             self._create_targeted_for_relationships()
             self._create_jama_relationships(data)
+
+            # ── Stamp incremental hash ──
+            if self.module and self._jama_hash:
+                tracker = IncrementalTracker(self._driver, self.module)
+                tracker.stamp_jama(self._jama_hash)
+                logger.info("  Stamped Jama hash for %s", self.module)
+
             self._print_summary(time.time() - t0)
         finally:
             self._close()
@@ -2045,1623 +2122,86 @@ class ILLDKnowledgeGraphBuilder:
 
 
 # ---------------------------------------------------------------------------
-# SWA Knowledge Graph Builder
+# EA (Enterprise Architect) Knowledge Graph Builder
 # ---------------------------------------------------------------------------
 
-class SWAKnowledgeGraphBuilder:
+class EAKnowledgeGraphBuilder:
     """
-    Builds SWA (Software Architecture) nodes and relationships in the
-    MCAL Neo4j database from parsed SWA markdown section files.
+    Thin wrapper that delegates to EAGraphBuilder (elements + connectors)
+    and EADiagramExtractor (diagram structure) for a given MCAL module.
 
-    This builder is **document-agnostic** and **section-agnostic**:
-    it auto-detects the module from filenames, infers content types
-    from structural patterns in the markdown (headings, [req] tags,
-    table layouts, stereotypes), and works for any MCAL module's SWA
-    document (ADC, SPI, CAN, GPT, …).
-
-    Node types created (from the MCAL ontology):
-        - SWA_ArchitecturalDecision
-        - SWA_HwPeripheral
-        - SWA_SwDependency
-        - SWA_ConfigContainer
-        - SWA_ConfigParam
-        - SWA_Function
-        - SWA_DataType
-        - SWA_Macro
-
-    Relationships created:
-        - SWA_ARCH_DECISION_TRACES_TO   (decision → PRQ)
-        - SWA_ARCH_DECISION_PARENT      (decision hierarchy)
-        - SWA_ARCH_DECISION_BELONGS_TO_MODULE
-        - SWA_DEPENDS_ON_HW             (module → HW peripheral)
-        - SWA_CALLS_EXTERNAL            (module → SW dependency)
-        - SWA_DEPENDENCY_PROVIDED_BY     (SW dep → provider module)
-        - SWA_CONTAINS_CONTAINER        (container hierarchy)
-        - SWA_CONTAINS_PARAM            (container → parameter)
-        - SWA_CONFIG_TRACES_TO          (container/param → PRQ)
+    Replaces the former SWAKnowledgeGraphBuilder and SWUDKnowledgeGraphBuilder
+    classes.  All SWA/SWUD PDF-parsed artefacts are now sourced directly
+    from the QEAX model via ``ifx_ea_sqlite``.
 
     Usage::
 
-        python build_knowledge_graph.py --profile mcal --module ADC --ingest-swa
-        python build_knowledge_graph.py --profile mcal --module ADC --ingest-swa --dry-run
-        python build_knowledge_graph.py --profile mcal --module ADC --ingest-swa --swa-dir path/to/swa/
+        python build_knowledge_graph.py --profile mcal --module ADC --ingest-ea
+        python build_knowledge_graph.py --profile mcal --module ADC --ingest-ea --dry-run
+        python build_knowledge_graph.py --profile mcal --module ADC --ingest-ea --qeax-path path/to/model.qeax
     """
-
-    BATCH_SIZE = 500
-
-    # Unique-key property for each SWA node type
-    _UID_MAP = {
-        "SWA_ArchitecturalDecision": "decision_id",
-        "SWA_HwPeripheral":         "peripheral_name",
-        "SWA_SwDependency":         "api_name",
-        "SWA_ConfigContainer":      "container_name",
-        "SWA_ConfigParam":          "param_name",
-        "SWA_Function":             "function_name",
-        "SWA_DataType":             "type_name",
-        "SWA_Macro":                "macro_name",
-    }
 
     def __init__(
         self,
         neo4j_cfg: dict,
         module: str,
-        swa_dir: Path,
+        qeax_path: Path = None,
         dry_run: bool = False,
+        clear: bool = False,
     ):
         self.neo4j_cfg = neo4j_cfg
-        self.module = module.upper()
-        self.swa_dir = swa_dir
+        self.module = module
+        self.qeax_path = qeax_path or DEFAULT_QEAX
         self.dry_run = dry_run
-        self.stats: dict = Counter()
-        self._driver = None
-
-    # -- Connection ---------------------------------------------------------
-
-    def _connect(self):
-        cfg = self.neo4j_cfg
-        uri = cfg["uri"]
-        logger.info("Connecting to Neo4j at %s …", uri)
-        try:
-            drv_kw = dict(
-                auth=(cfg["username"], cfg["password"]),
-                max_connection_lifetime=cfg.get("max_connection_lifetime", 3600),
-                max_connection_pool_size=cfg.get("max_connection_pool_size", 50),
-            )
-            if "+s" not in uri.split("://")[0]:
-                drv_kw["encrypted"] = cfg.get("encrypted", False)
-            self._driver = GraphDatabase.driver(uri, **drv_kw)
-            self._driver.verify_connectivity()
-        except (ServiceUnavailable, AuthError, OSError) as exc:
-            logger.error("Could not connect to Neo4j at %s: %s", uri, exc)
-            print(
-                f"\n  ERROR: Neo4j is not reachable at {uri}.\n"
-                f"  Please ensure Neo4j is running and the URI/credentials in\n"
-                f"  {STORAGE_CONFIG_PATH} are correct.\n"
-            )
-            sys.exit(1)
-        logger.info("Connected to Neo4j at %s (database: %s)", uri, cfg["database"])
-
-    def _close(self):
-        if self._driver:
-            self._driver.close()
-            self._driver = None
-
-    def _write_tx(self, cypher: str, parameters: Optional[dict] = None):
-        """Execute a write transaction with retry on transient errors."""
-        max_attempts = 3
-        db = self.neo4j_cfg["database"]
-        for attempt in range(1, max_attempts + 1):
-            try:
-                with self._driver.session(database=db) as session:
-                    session.execute_write(lambda tx: tx.run(cypher, parameters or {}))
-                return
-            except (ServiceUnavailable, TransientError, OSError) as exc:
-                if attempt >= max_attempts:
-                    logger.error("SWA write failed after %d attempts: %s", max_attempts, exc)
-                    raise
-                wait = min(2 ** attempt, 8)
-                logger.warning("Transient write error (attempt %d/%d), retrying in %ds: %s",
-                               attempt, max_attempts, wait, exc)
-                time.sleep(wait)
-
-    def _run(self, cypher: str, parameters: Optional[dict] = None):
-        """Execute a read query with retry on transient errors."""
-        max_attempts = 3
-        db = self.neo4j_cfg["database"]
-        for attempt in range(1, max_attempts + 1):
-            try:
-                with self._driver.session(database=db) as session:
-                    result = session.run(cypher, parameters or {})
-                    return [rec.data() for rec in result]
-            except (ServiceUnavailable, TransientError, OSError) as exc:
-                if attempt >= max_attempts:
-                    logger.error("SWA read failed after %d attempts: %s", max_attempts, exc)
-                    raise
-                wait = min(2 ** attempt, 8)
-                logger.warning("Transient read error (attempt %d/%d), retrying in %ds: %s",
-                               attempt, max_attempts, wait, exc)
-                time.sleep(wait)
-        return []
-
-    # -- Public entry point -------------------------------------------------
+        self.clear = clear
+        self.BATCH_SIZE = 500  # kept for CLI compat
 
     def build(self):
-        """Run the full SWA ingestion pipeline."""
-        if parse_swa_directory is None:
+        """Run EA element extraction then diagram extraction."""
+        if EAGraphBuilder is None:
             logger.error(
-                "swa_parsers module not found. Ensure "
-                "src/HybridRAG/code/KG/swa_parsers.py exists."
+                "ea_graph_builder is not available.  "
+                "Ensure ea_graph_builder.py is on PYTHONPATH."
             )
             sys.exit(1)
 
-        t0 = time.time()
-
-        logger.info("=" * 60)
-        logger.info("SWA Knowledge Graph Builder – module: %s", self.module)
-        logger.info("SWA directory: %s", self.swa_dir)
-        logger.info("Dry run: %s", self.dry_run)
-        logger.info("=" * 60)
-
-        if not self.swa_dir.exists():
-            logger.error("SWA directory not found: %s", self.swa_dir)
-            print(
-                f"\n  ERROR: SWA directory not found:\n"
-                f"  {self.swa_dir}\n\n"
-                f"  Convert SWA PDF sections first using:\n"
-                f"    python prepare_markdowns.py --input <SWA_PDF> ...\n"
-            )
-            sys.exit(1)
-
-        # Step 1: Parse SWA markdown files
-        logger.info("Step 1/4: Parsing SWA markdown files…")
-        parsed = parse_swa_directory(
-            swa_dir=self.swa_dir,
-            module=self.module,
-        )
-
-        if not parsed or all(k.startswith("_") for k in parsed):
-            logger.warning("No SWA nodes parsed from %s", self.swa_dir)
-            return
-
-        if self.dry_run:
-            self._preview(parsed)
-            return
-
-        # Step 2: Connect to Neo4j
-        self._connect()
-
-        try:
-            # Step 3: Create constraints / indexes for SWA node types
-            logger.info("Step 2/4: Creating SWA constraints and indexes…")
-            self._create_constraints(parsed)
-
-            # Step 4: Create nodes
-            logger.info("Step 3/4: Creating SWA nodes…")
-            self._create_nodes(parsed)
-
-            # Step 5: Create relationships
-            logger.info("Step 4/4: Creating SWA relationships…")
-            self._create_relationships(parsed)
-
-            self._print_summary(time.time() - t0)
-        finally:
-            self._close()
-
-    # -- Constraints --------------------------------------------------------
-
-    def _create_constraints(self, parsed: dict):
-        """Create uniqueness constraints for SWA node types."""
-        for node_type, uid_prop in self._UID_MAP.items():
-            if node_type not in parsed:
-                continue
-            constraint_name = f"unique_{node_type}_{uid_prop}"
-            cypher = (
-                f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
-                f"FOR (n:{node_type}) REQUIRE n.{uid_prop} IS UNIQUE"
-            )
-            try:
-                self._write_tx(cypher)
-            except Exception as exc:
-                logger.debug("Constraint %s: %s", constraint_name, exc)
-
-    # -- Node Creation (batched by type) ------------------------------------
-
-    def _create_nodes(self, parsed: dict):
-        """Create nodes for each SWA node type using UNWIND + MERGE."""
-        for node_type, items in parsed.items():
-            if node_type.startswith("_"):  # skip edge lists
-                continue
-
-            uid_prop = self._UID_MAP.get(node_type)
-            if not uid_prop:
-                logger.warning("Unknown SWA node type: %s – skipping", node_type)
-                continue
-
-            logger.info("  Creating :%s (%d nodes)…", node_type, len(items))
-
-            # Prepare items for Neo4j: convert lists to JSON strings,
-            # remove None values
-            batch = []
-            for item in items:
-                clean = {}
-                for k, v in item.items():
-                    if v is None:
-                        continue
-                    if isinstance(v, (list, dict, set, frozenset)):
-                        clean[k] = json.dumps(v, default=str)
-                    else:
-                        clean[k] = v
-                batch.append(clean)
-
-            for chunk in self._chunked(batch, self.BATCH_SIZE):
-                cypher = (
-                    f"UNWIND $items AS props "
-                    f"MERGE (n:{node_type} {{{uid_prop}: props.{uid_prop}}}) "
-                    f"ON CREATE SET n.global_id = randomUUID() "
-                    f"SET n += props"
-                )
-                self._write_tx(cypher, {"items": chunk})
-
-            self.stats[f"nodes:{node_type}"] = len(items)
-            logger.info("    → created/merged %d :%s nodes", len(items), node_type)
-
-    # -- Relationship Creation ----------------------------------------------
-
-    def _create_relationships(self, parsed: dict):
-        """Create all SWA relationships."""
-        self._create_arch_decision_traces_to(parsed)
-        self._create_arch_decision_parent(parsed)
-        self._create_arch_decision_belongs_to_module(parsed)
-        self._create_depends_on_hw(parsed)
-        self._create_sw_dependency_rels(parsed)
-        self._create_config_hierarchy(parsed)
-        self._create_config_traces_to(parsed)
-        self._create_exported_interface_rels(parsed)
-        self._create_new_type_module_membership(parsed)
-        self._create_new_type_traces_to_prq(parsed)
-
-    def _create_arch_decision_traces_to(self, parsed: dict):
-        """
-        SWA_ArchitecturalDecision → ProductRequirement via prq_references.
-        """
-        decisions = parsed.get("SWA_ArchitecturalDecision", [])
-        edges = []
-        for d in decisions:
-            prqs_raw = d.get("prq_references")
-            if not prqs_raw:
-                continue
-            # prq_references may be a string (JSON) or list
-            prqs = json.loads(prqs_raw) if isinstance(prqs_raw, str) else prqs_raw
-            for prq_id in prqs:
-                edges.append({
-                    "decision_id": d["decision_id"],
-                    "requirement_id": prq_id,
-                })
-
-        if not edges:
-            return
-
-        logger.info("  Creating SWA_ARCH_DECISION_TRACES_TO (%d edges)…", len(edges))
-        for chunk in self._chunked(edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (d:SWA_ArchitecturalDecision {decision_id: e.decision_id}) "
-                "MATCH (p:ProductRequirement {requirement_id: e.requirement_id}) "
-                "MERGE (d)-[:SWA_ARCH_DECISION_TRACES_TO]->(p)"
-            )
-            self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWA_ARCH_DECISION_TRACES_TO"] = len(edges)
-
-    def _create_arch_decision_parent(self, parsed: dict):
-        """Hierarchical parent-child between decisions."""
-        edges = parsed.get("_edges_SWA_ARCH_DECISION_PARENT", [])
-        if not edges:
-            return
-
-        logger.info("  Creating SWA_ARCH_DECISION_PARENT (%d edges)…", len(edges))
-        for chunk in self._chunked(edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (child:SWA_ArchitecturalDecision {decision_id: e.child_id}) "
-                "MATCH (parent:SWA_ArchitecturalDecision {decision_id: e.parent_id}) "
-                "MERGE (child)-[:SWA_ARCH_DECISION_PARENT]->(parent)"
-            )
-            self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWA_ARCH_DECISION_PARENT"] = len(edges)
-
-    def _create_arch_decision_belongs_to_module(self, parsed: dict):
-        """Link decisions to the MCALModule node."""
-        decisions = parsed.get("SWA_ArchitecturalDecision", [])
-        if not decisions:
-            return
-
-        module = self.module.upper()
-        logger.info("  Creating SWA_ARCH_DECISION_BELONGS_TO_MODULE → %s …", module)
-        cypher = (
-            "MATCH (d:SWA_ArchitecturalDecision {module: $module}) "
-            "MATCH (m:MCALModule {module_name: $module}) "
-            "MERGE (d)-[:SWA_ARCH_DECISION_BELONGS_TO_MODULE]->(m)"
-        )
-        self._write_tx(cypher, {"module": module})
-
-        count_res = self._run(
-            "MATCH (:SWA_ArchitecturalDecision)-[r:SWA_ARCH_DECISION_BELONGS_TO_MODULE]->(:MCALModule) "
-            "RETURN count(r) AS cnt"
-        )
-        cnt = count_res[0]["cnt"] if count_res else 0
-        self.stats["rel:SWA_ARCH_DECISION_BELONGS_TO_MODULE"] = cnt
-
-    def _create_depends_on_hw(self, parsed: dict):
-        """MCALModule → SWA_HwPeripheral via SWA_DEPENDS_ON_HW."""
-        peripherals = parsed.get("SWA_HwPeripheral", [])
-        if not peripherals:
-            return
-
-        module = self.module.upper()
-        edges = [
-            {
-                "peripheral_name": p["peripheral_name"],
-                "dependency_role": p.get("peripheral_type", "dependent"),
-            }
-            for p in peripherals
-        ]
-
-        logger.info("  Creating SWA_DEPENDS_ON_HW (%d edges)…", len(edges))
-        for chunk in self._chunked(edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (m:MCALModule {module_name: $module}) "
-                "MATCH (h:SWA_HwPeripheral {peripheral_name: e.peripheral_name}) "
-                "MERGE (m)-[r:SWA_DEPENDS_ON_HW]->(h) "
-                "SET r.dependency_role = e.dependency_role"
-            )
-            self._write_tx(cypher, {"edges": chunk, "module": module})
-        self.stats["rel:SWA_DEPENDS_ON_HW"] = len(edges)
-
-    def _create_sw_dependency_rels(self, parsed: dict):
-        """MCALModule → SWA_SwDependency, SWA_SwDependency → provider MCALModule."""
-        deps = parsed.get("SWA_SwDependency", [])
-        if not deps:
-            return
-
-        module = self.module.upper()
-
-        # SWA_CALLS_EXTERNAL: module → dependency
-        logger.info("  Creating SWA_CALLS_EXTERNAL (%d edges)…", len(deps))
-        cypher = (
-            "MATCH (d:SWA_SwDependency {module: $module}) "
-            "MATCH (m:MCALModule {module_name: $module}) "
-            "MERGE (m)-[:SWA_CALLS_EXTERNAL]->(d)"
-        )
-        self._write_tx(cypher, {"module": module})
-
-        count_res = self._run(
-            "MATCH (:MCALModule)-[r:SWA_CALLS_EXTERNAL]->(:SWA_SwDependency) "
-            "RETURN count(r) AS cnt"
-        )
-        self.stats["rel:SWA_CALLS_EXTERNAL"] = count_res[0]["cnt"] if count_res else 0
-
-        # SWA_DEPENDENCY_PROVIDED_BY: dependency → provider module
-        deps_with_provider = [
-            {"api_name": d["api_name"], "provider": d["provider_module"].upper()}
-            for d in deps
-            if d.get("provider_module")
-        ]
-        if deps_with_provider:
-            logger.info("  Creating SWA_DEPENDENCY_PROVIDED_BY (%d edges)…", len(deps_with_provider))
-            for chunk in self._chunked(deps_with_provider, self.BATCH_SIZE):
-                cypher = (
-                    "UNWIND $edges AS e "
-                    "MATCH (d:SWA_SwDependency {api_name: e.api_name}) "
-                    "MATCH (m:MCALModule {module_name: e.provider}) "
-                    "MERGE (d)-[:SWA_DEPENDENCY_PROVIDED_BY]->(m)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-            self.stats["rel:SWA_DEPENDENCY_PROVIDED_BY"] = len(deps_with_provider)
-
-    def _create_config_hierarchy(self, parsed: dict):
-        """SWA_CONTAINS_CONTAINER and SWA_CONTAINS_PARAM relationships."""
-        containers = parsed.get("SWA_ConfigContainer", [])
-        params = parsed.get("SWA_ConfigParam", [])
-
-        # Container → sub-container
-        container_edges = []
-        for c in containers:
-            subs_raw = c.get("sub_containers")
-            if not subs_raw:
-                continue
-            subs = json.loads(subs_raw) if isinstance(subs_raw, str) else subs_raw
-            for sub in subs:
-                container_edges.append({
-                    "parent": c["container_name"],
-                    "child": sub.strip(),
-                })
-
-        if container_edges:
-            logger.info("  Creating SWA_CONTAINS_CONTAINER (%d edges)…", len(container_edges))
-            for chunk in self._chunked(container_edges, self.BATCH_SIZE):
-                cypher = (
-                    "UNWIND $edges AS e "
-                    "MATCH (p:SWA_ConfigContainer {container_name: e.parent}) "
-                    "MATCH (c:SWA_ConfigContainer {container_name: e.child}) "
-                    "MERGE (p)-[:SWA_CONTAINS_CONTAINER]->(c)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-            self.stats["rel:SWA_CONTAINS_CONTAINER"] = len(container_edges)
-
-        # Container → parameter (via parent_container field)
-        param_edges = [
-            {"container": p["parent_container"], "param": p["param_name"]}
-            for p in params
-            if p.get("parent_container")
-        ]
-        if param_edges:
-            logger.info("  Creating SWA_CONTAINS_PARAM (%d edges)…", len(param_edges))
-            for chunk in self._chunked(param_edges, self.BATCH_SIZE):
-                cypher = (
-                    "UNWIND $edges AS e "
-                    "MATCH (c:SWA_ConfigContainer {container_name: e.container}) "
-                    "MATCH (p:SWA_ConfigParam {param_name: e.param}) "
-                    "MERGE (c)-[:SWA_CONTAINS_PARAM]->(p)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-            self.stats["rel:SWA_CONTAINS_PARAM"] = len(param_edges)
-
-        # Config containers belong to module
-        if containers:
-            module = self.module.upper()
-            logger.info("  Creating SWA_CONFIG_BELONGS_TO_MODULE → %s …", module)
-            cypher = (
-                "MATCH (c:SWA_ConfigContainer {module: $module}) "
-                "MATCH (m:MCALModule {module_name: $module}) "
-                "MERGE (c)-[:SWA_CONFIG_BELONGS_TO_MODULE]->(m)"
-            )
-            self._write_tx(cypher, {"module": module})
-
-    def _create_config_traces_to(self, parsed: dict):
-        """SWA_ConfigContainer/Param → ProductRequirement via prq_references."""
-        for node_type in ("SWA_ConfigContainer", "SWA_ConfigParam"):
-            items = parsed.get(node_type, [])
-            uid_prop = self._UID_MAP.get(node_type)
-            if not items or not uid_prop:
-                continue
-
-            edges = []
-            for item in items:
-                prqs_raw = item.get("prq_references")
-                if not prqs_raw:
-                    continue
-                prqs = json.loads(prqs_raw) if isinstance(prqs_raw, str) else prqs_raw
-                for prq_id in prqs:
-                    edges.append({
-                        "uid": item[uid_prop],
-                        "requirement_id": prq_id,
-                    })
-
-            if not edges:
-                continue
-
-            rel_name = "SWA_CONFIG_TRACES_TO"
-            logger.info("  Creating %s from %s (%d edges)…", rel_name, node_type, len(edges))
-            for chunk in self._chunked(edges, self.BATCH_SIZE):
-                cypher = (
-                    f"UNWIND $edges AS e "
-                    f"MATCH (n:{node_type} {{{uid_prop}: e.uid}}) "
-                    f"MATCH (p:ProductRequirement {{requirement_id: e.requirement_id}}) "
-                    f"MERGE (n)-[:{rel_name}]->(p)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-            self.stats[f"rel:{rel_name}({node_type})"] = len(edges)
-
-    def _create_exported_interface_rels(self, parsed: dict):
-        """Create relationships for SWA_Function, SWA_DataType, SWA_Macro.
-
-        Creates:
-        - ARCHITECTURALLY_REALIZES  (Function/DataType/Macro → PRQ)
-        - SWA_BELONGS_TO_MODULE     (Function/DataType/Macro → MCALModule)
-        - SWA_USES_TYPE             (Function → DataType via parameter types)
-        - SWA_REPORTS_ERROR         (Function → SWA_ErrorCode) — skipped if no error nodes
-        """
-        module = self.module.upper()
-
-        # ── PRQ traceability ──────────────────────────────────────
-        for node_type in ("SWA_Function", "SWA_DataType", "SWA_Macro"):
-            items = parsed.get(node_type, [])
-            uid_prop = self._UID_MAP.get(node_type)
-            if not items or not uid_prop:
-                continue
-
-            edges = []
-            for item in items:
-                prqs_raw = item.get("prq_references")
-                if not prqs_raw:
-                    continue
-                prqs = json.loads(prqs_raw) if isinstance(prqs_raw, str) else prqs_raw
-                for prq_id in prqs:
-                    edges.append({
-                        "uid": item[uid_prop],
-                        "requirement_id": prq_id,
-                    })
-
-            if edges:
-                logger.info(
-                    "  Creating ARCHITECTURALLY_REALIZES from %s (%d edges)…",
-                    node_type, len(edges),
-                )
-                for chunk in self._chunked(edges, self.BATCH_SIZE):
-                    cypher = (
-                        f"UNWIND $edges AS e "
-                        f"MATCH (n:{node_type} {{{uid_prop}: e.uid}}) "
-                        f"MATCH (p:ProductRequirement {{requirement_id: e.requirement_id}}) "
-                        f"MERGE (n)-[:ARCHITECTURALLY_REALIZES]->(p)"
-                    )
-                    self._write_tx(cypher, {"edges": chunk})
-                self.stats[f"rel:ARCHITECTURALLY_REALIZES({node_type})"] = len(edges)
-
-        # ── Module membership ─────────────────────────────────────
-        for node_type in ("SWA_Function", "SWA_DataType", "SWA_Macro"):
-            items = parsed.get(node_type, [])
-            if not items:
-                continue
-
-            logger.info("  Creating SWA_BELONGS_TO_MODULE for %s → %s …", node_type, module)
-            cypher = (
-                f"MATCH (n:{node_type} {{module: $module}}) "
-                f"MATCH (m:MCALModule {{module_name: $module}}) "
-                f"MERGE (n)-[:SWA_BELONGS_TO_MODULE]->(m)"
-            )
-            self._write_tx(cypher, {"module": module})
-            self.stats[f"rel:SWA_BELONGS_TO_MODULE({node_type})"] = len(items)
-
-        # ── SWA_USES_TYPE (Function → DataType) ───────────────────
-        functions = parsed.get("SWA_Function", [])
-        datatypes = parsed.get("SWA_DataType", [])
-        if functions and datatypes:
-            type_names = {dt["type_name"] for dt in datatypes}
-            edges = []
-            for func in functions:
-                # Scan syntax, parameters, return type for type references
-                text_fields = " ".join(
-                    str(func.get(f, ""))
-                    for f in ("syntax", "parameters_in", "parameters_out",
-                              "parameters_inout", "return_type")
-                )
-                for tname in type_names:
-                    if tname in text_fields:
-                        edges.append({
-                            "function_name": func["function_name"],
-                            "type_name": tname,
-                        })
-
-            if edges:
-                logger.info("  Creating SWA_USES_TYPE (%d edges)…", len(edges))
-                for chunk in self._chunked(edges, self.BATCH_SIZE):
-                    cypher = (
-                        "UNWIND $edges AS e "
-                        "MATCH (f:SWA_Function {function_name: e.function_name}) "
-                        "MATCH (t:SWA_DataType {type_name: e.type_name}) "
-                        "MERGE (f)-[:SWA_USES_TYPE]->(t)"
-                    )
-                    self._write_tx(cypher, {"edges": chunk})
-                self.stats["rel:SWA_USES_TYPE"] = len(edges)
-
-    # -- New SWA type relationships ------------------------------------------
-
-    # Node types added by the new parsers
-    _NEW_SWA_TYPES = {
-        "SWA_SafetyMeasure":    "feature_id",
-        "SWA_SafetyAoU":        "feature_id",
-        "SWA_SecurityMeasure":  "feature_id",
-        "SWA_SecurityAoU":      "feature_id",
-        "SWA_ErrorCode":        "error_name",
-        "SWA_MemorySection":    "section_name",
-        "SWA_SourceFile":       "file_name",
-        "SWA_PropertyVariable": "variable_name",
-        "SWA_CallSequence":     "feature_id",
-    }
-
-    def _create_new_type_module_membership(self, parsed: dict):
-        """Link new SWA node types to the MCALModule node."""
-        module = self.module.upper()
-        for node_type in self._NEW_SWA_TYPES:
-            if node_type not in parsed:
-                continue
-            items = parsed[node_type]
-            logger.info(
-                "  Creating BELONGS_TO_MODULE for %s → %s …",
-                node_type, module,
-            )
-            cypher = (
-                f"MATCH (n:{node_type} {{module: $module}}) "
-                f"MATCH (m:MCALModule {{module_name: $module}}) "
-                f"MERGE (n)-[:BELONGS_TO_MODULE]->(m)"
-            )
-            self._write_tx(cypher, {"module": module})
-            self.stats[f"rel:BELONGS_TO_MODULE({node_type})"] = len(items)
-
-    def _create_new_type_traces_to_prq(self, parsed: dict):
-        """Create SWA_TRACES_TO edges from new types to ProductRequirement."""
-        for node_type, uid_key in self._NEW_SWA_TYPES.items():
-            nodes = parsed.get(node_type, [])
-            if not nodes:
-                continue
-
-            edges = []
-            for n in nodes:
-                prqs_raw = n.get("prq_references")
-                if not prqs_raw:
-                    continue
-                prqs = (
-                    json.loads(prqs_raw)
-                    if isinstance(prqs_raw, str)
-                    else prqs_raw
-                )
-                for prq_id in prqs:
-                    edges.append({"uid": n[uid_key], "requirement_id": prq_id})
-
-            if not edges:
-                continue
-
-            logger.info(
-                "  Creating SWA_TRACES_TO from %s (%d edges)…",
-                node_type, len(edges),
-            )
-            for chunk in self._chunked(edges, self.BATCH_SIZE):
-                cypher = (
-                    f"UNWIND $edges AS e "
-                    f"MATCH (n:{node_type} {{{uid_key}: e.uid}}) "
-                    f"MATCH (p:ProductRequirement {{requirement_id: e.requirement_id}}) "
-                    f"MERGE (n)-[:SWA_TRACES_TO]->(p)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-            self.stats[f"rel:SWA_TRACES_TO({node_type})"] = len(edges)
-
-    # -- Preview (dry-run) --------------------------------------------------
-
-    def _preview(self, parsed: dict):
-        """Print a summary of what would be created."""
-        print("\n" + "=" * 60)
-        print(f"  DRY-RUN PREVIEW – SWA Ingestion, Module: {self.module}")
-        print("=" * 60)
-
-        total_nodes = 0
-        print(f"\n  Node types:")
-        for node_type, items in sorted(parsed.items()):
-            if node_type.startswith("_"):
-                continue
-            uid = self._UID_MAP.get(node_type, "?")
-            print(f"    :{node_type:<35s}  {len(items):>5,d} nodes  [merge key: {uid}]")
-            total_nodes += len(items)
-
-            # Show a few sample titles/names
-            sample_key = uid
-            for item in items[:3]:
-                val = item.get(sample_key, "?")[:60]
-                print(f"      • {val}")
-            if len(items) > 3:
-                print(f"      … and {len(items) - 3} more")
-
-        print(f"    {'TOTAL':<36s}  {total_nodes:>5,d}")
-
-        # Edge previews
-        edge_keys = [k for k in parsed if k.startswith("_edges_")]
-        if edge_keys:
-            print(f"\n  Relationship hierarchies:")
-            for ek in edge_keys:
-                rel_name = ek.replace("_edges_", "")
-                print(f"    :{rel_name:<35s}  {len(parsed[ek]):>5,d} edges")
-
-        # Traceability summary
-        trace_count = 0
-        for node_type, items in parsed.items():
-            if node_type.startswith("_"):
-                continue
-            for item in items:
-                prqs = item.get("prq_references")
-                if prqs:
-                    prq_list = json.loads(prqs) if isinstance(prqs, str) else prqs
-                    trace_count += len(prq_list)
-        if trace_count:
-            print(f"\n  Traceability links to PRQ requirements: ~{trace_count}")
-
-        print("=" * 60 + "\n")
-
-    # -- Summary ------------------------------------------------------------
-
-    def _print_summary(self, elapsed: float):
-        print("\n" + "=" * 60)
-        print(f"  BUILD COMPLETE – SWA Ingestion, Module: {self.module}")
-        print(f"  Elapsed: {elapsed:.1f}s")
-        print("=" * 60)
-
-        node_stats = {k: v for k, v in self.stats.items() if k.startswith("nodes:")}
-        if node_stats:
-            print("\n  Nodes created/merged:")
-            total_nodes = 0
-            for k, v in sorted(node_stats.items()):
-                label = k.split(":", 1)[1]
-                print(f"    :{label:<35s}  {v:>6,d}")
-                total_nodes += v
-            print(f"    {'TOTAL':<36s}  {total_nodes:>6,d}")
-
-        rel_stats = {k: v for k, v in self.stats.items() if k.startswith("rel:")}
-        if rel_stats:
-            print("\n  Relationships created:")
-            total_rels = 0
-            for k, v in sorted(rel_stats.items()):
-                name = k.split(":", 1)[1]
-                print(f"    :{name:<35s}  {v:>6,d}")
-                total_rels += v
-            print(f"    {'TOTAL':<36s}  {total_rels:>6,d}")
-
-        try:
-            db_stats = self._run("MATCH (n) RETURN count(n) AS nodes")
-            rel_count = self._run("MATCH ()-[r]->() RETURN count(r) AS rels")
-            labels = self._run("CALL db.labels() YIELD label RETURN collect(label) AS labels")
-            print(f"\n  Database totals:")
-            print(f"    Nodes        : {db_stats[0]['nodes']:,d}")
-            print(f"    Relationships: {rel_count[0]['rels']:,d}")
-            print(f"    Labels       : {', '.join(labels[0]['labels'])}")
-        except Exception:
-            pass
-
-        print("=" * 60 + "\n")
-
-    # -- Utilities ----------------------------------------------------------
-
-    @staticmethod
-    def _chunked(lst: list, size: int):
-        for i in range(0, len(lst), size):
-            yield lst[i : i + size]
-
-
-# ---------------------------------------------------------------------------
-# SWUD Knowledge Graph Builder
-# ---------------------------------------------------------------------------
-
-class SWUDKnowledgeGraphBuilder:
-    """
-    Builds SWUD (Software Unit Design) nodes and relationships in the
-    MCAL Neo4j database from parsed SWUD markdown files.
-
-    This builder is **document-agnostic** and **section-agnostic**:
-    it auto-detects the module from filenames, infers content types
-    from structural patterns in the markdown (headings, [req] tags,
-    spec table layouts, keywords), and works for any MCAL module's
-    SWUD document (ADC, SPI, CAN, GPT, …).
-
-    Node types created (from the MCAL ontology):
-        - SWUD_DesignDecision
-        - SWUD_DerivedConfigParam
-        - SWUD_ConfigStructure
-        - SWUD_CodeGenMacro
-        - SWUD_TypeDefinition
-        - SWUD_Function
-        - SWUD_DataVariable
-        - SWUD_CriticalSection
-        - SWUD_MemorySection
-
-    Relationships created:
-        - SWUD_TRACES_TO           (any SWUD node → ProductRequirement)
-        - SWUD_BELONGS_TO_MODULE   (any SWUD node → MCALModule)
-        - SWUD_ALLOCATED_IN        (Function/DataVariable → MemorySection)
-        - SWUD_USES_TYPE           (Function → TypeDefinition)
-        - SWUD_CALLS               (Function → Function)
-        - SWUD_USES_CRITICAL_SECTION (Function → CriticalSection)
-        - SWUD_CONFIG_GATES        (DerivedConfigParam → Function)
-        - SWUD_PROTECTS            (CriticalSection → DataVariable)
-        - SWUD_REALIZES_SWA        (Function → SWA_ArchitecturalDecision)
-
-    Usage::
-
-        python build_knowledge_graph.py --profile mcal --module ADC --ingest-swud
-        python build_knowledge_graph.py --profile mcal --module ADC --ingest-swud --dry-run
-        python build_knowledge_graph.py --profile mcal --module ADC --ingest-swud --swud-dir path/to/swud/
-    """
-
-    BATCH_SIZE = 500
-
-    # Unique-key property for each SWUD node type
-    _UID_MAP = {
-        "SWUD_DesignDecision":    "decision_id",
-        "SWUD_DerivedConfigParam": "param_name",
-        "SWUD_ConfigStructure":   "structure_name",
-        "SWUD_CodeGenMacro":      "macro_name",
-        "SWUD_TypeDefinition":    "type_name",
-        "SWUD_Function":          "function_name",
-        "SWUD_DataVariable":      "variable_name",
-        "SWUD_CriticalSection":   "critical_section_name",
-        "SWUD_MemorySection":     "section_name",
-    }
-
-    def __init__(
-        self,
-        neo4j_cfg: dict,
-        module: str,
-        swud_dir: Path,
-        dry_run: bool = False,
-    ):
-        self.neo4j_cfg = neo4j_cfg
-        self.module = module.upper()
-        self.swud_dir = swud_dir
-        self.dry_run = dry_run
-        self.stats: dict = Counter()
-        self._driver = None
-
-    # -- Connection ---------------------------------------------------------
-
-    def _connect(self):
-        cfg = self.neo4j_cfg
-        uri = cfg["uri"]
-        logger.info("Connecting to Neo4j at %s …", uri)
-        try:
-            drv_kw = dict(
-                auth=(cfg["username"], cfg["password"]),
-                max_connection_lifetime=cfg.get("max_connection_lifetime", 3600),
-                max_connection_pool_size=cfg.get("max_connection_pool_size", 50),
-            )
-            if "+s" not in uri.split("://")[0]:
-                drv_kw["encrypted"] = cfg.get("encrypted", False)
-            self._driver = GraphDatabase.driver(uri, **drv_kw)
-            self._driver.verify_connectivity()
-        except (ServiceUnavailable, AuthError, OSError) as exc:
-            logger.error("Could not connect to Neo4j at %s: %s", uri, exc)
-            print(
-                f"\n  ERROR: Neo4j is not reachable at {uri}.\n"
-                f"  Please ensure Neo4j is running and the URI/credentials in\n"
-                f"  {STORAGE_CONFIG_PATH} are correct.\n"
-            )
-            sys.exit(1)
-        logger.info("Connected to Neo4j at %s (database: %s)", uri, cfg["database"])
-
-    def _close(self):
-        if self._driver:
-            self._driver.close()
-            self._driver = None
-
-    def _write_tx(self, cypher: str, parameters: Optional[dict] = None):
-        """Execute a write transaction with retry on transient errors."""
-        max_attempts = 3
-        db = self.neo4j_cfg["database"]
-        for attempt in range(1, max_attempts + 1):
-            try:
-                with self._driver.session(database=db) as session:
-                    session.execute_write(lambda tx: tx.run(cypher, parameters or {}))
-                return
-            except (ServiceUnavailable, TransientError, OSError) as exc:
-                if attempt >= max_attempts:
-                    logger.error("SWUD write failed after %d attempts: %s", max_attempts, exc)
-                    raise
-                wait = min(2 ** attempt, 8)
-                logger.warning("Transient write error (attempt %d/%d), retrying in %ds: %s",
-                               attempt, max_attempts, wait, exc)
-                time.sleep(wait)
-
-    def _run(self, cypher: str, parameters: Optional[dict] = None):
-        """Execute a read query with retry on transient errors."""
-        max_attempts = 3
-        db = self.neo4j_cfg["database"]
-        for attempt in range(1, max_attempts + 1):
-            try:
-                with self._driver.session(database=db) as session:
-                    result = session.run(cypher, parameters or {})
-                    return [rec.data() for rec in result]
-            except (ServiceUnavailable, TransientError, OSError) as exc:
-                if attempt >= max_attempts:
-                    logger.error("SWUD read failed after %d attempts: %s", max_attempts, exc)
-                    raise
-                wait = min(2 ** attempt, 8)
-                logger.warning("Transient read error (attempt %d/%d), retrying in %ds: %s",
-                               attempt, max_attempts, wait, exc)
-                time.sleep(wait)
-        return []
-
-    # -- Public entry point -------------------------------------------------
-
-    def build(self):
-        """Run the full SWUD ingestion pipeline."""
-        if parse_swud_directory is None:
+        if EADiagramExtractor is None:
             logger.error(
-                "swud_parsers module not found. Ensure "
-                "src/HybridRAG/code/KG/swud_parsers.py exists."
+                "ea_diagram_extractor is not available.  "
+                "Ensure ea_diagram_extractor.py is on PYTHONPATH."
             )
             sys.exit(1)
 
-        t0 = time.time()
-
         logger.info("=" * 60)
-        logger.info("SWUD Knowledge Graph Builder – module: %s", self.module)
-        logger.info("SWUD directory: %s", self.swud_dir)
-        logger.info("Dry run: %s", self.dry_run)
+        logger.info("EA Knowledge Graph Builder — module: %s", self.module)
+        logger.info("  QEAX path : %s", self.qeax_path)
+        logger.info("  Dry-run   : %s", self.dry_run)
+        logger.info("  Clear     : %s", self.clear)
         logger.info("=" * 60)
 
-        if not self.swud_dir.exists():
-            logger.error("SWUD directory not found: %s", self.swud_dir)
-            print(
-                f"\n  ERROR: SWUD directory not found:\n"
-                f"  {self.swud_dir}\n\n"
-                f"  Convert SWUD PDF sections first using:\n"
-                f"    python prepare_markdowns.py --input <SWUD_PDF> ...\n"
-            )
-            sys.exit(1)
-
-        # Step 1: Parse SWUD markdown files
-        logger.info("Step 1/4: Parsing SWUD markdown files…")
-        parsed = parse_swud_directory(
-            swud_dir=self.swud_dir,
+        # Phase 1: Elements + Connectors
+        logger.info("Phase 1/2: EA elements and connectors …")
+        element_builder = EAGraphBuilder(
             module=self.module,
+            qeax_path=self.qeax_path,
+            neo4j_cfg=self.neo4j_cfg,
+            dry_run=self.dry_run,
+            clear=self.clear,
         )
-
-        if not parsed:
-            logger.warning("No SWUD nodes parsed from %s", self.swud_dir)
-            return
-
-        if self.dry_run:
-            self._preview(parsed)
-            return
-
-        # Step 2: Connect to Neo4j
-        self._connect()
-
-        try:
-            # Step 3: Create constraints / indexes
-            logger.info("Step 2/4: Creating SWUD constraints and indexes…")
-            self._create_constraints(parsed)
-
-            # Step 4: Create nodes
-            logger.info("Step 3/4: Creating SWUD nodes…")
-            self._create_nodes(parsed)
-
-            # Step 5: Create relationships
-            logger.info("Step 4/4: Creating SWUD relationships…")
-            self._create_relationships(parsed)
-
-            self._print_summary(time.time() - t0)
-        finally:
-            self._close()
-
-    # -- Constraints --------------------------------------------------------
-
-    def _create_constraints(self, parsed: dict):
-        """Create uniqueness constraints for SWUD node types."""
-        for node_type, uid_prop in self._UID_MAP.items():
-            if node_type not in parsed:
-                continue
-            constraint_name = f"unique_{node_type}_{uid_prop}"
-            cypher = (
-                f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
-                f"FOR (n:{node_type}) REQUIRE n.{uid_prop} IS UNIQUE"
-            )
-            try:
-                self._write_tx(cypher)
-            except Exception as exc:
-                logger.debug("Constraint %s: %s", constraint_name, exc)
-
-    # -- Node Creation (batched by type) ------------------------------------
-
-    def _create_nodes(self, parsed: dict):
-        """Create nodes for each SWUD node type using UNWIND + MERGE."""
-        for node_type, items in parsed.items():
-            uid_prop = self._UID_MAP.get(node_type)
-            if not uid_prop:
-                logger.warning("Unknown SWUD node type: %s – skipping", node_type)
-                continue
-
-            logger.info("  Creating :%s (%d nodes)…", node_type, len(items))
-
-            # Prepare items for Neo4j: convert lists to JSON strings,
-            # remove None values
-            batch = []
-            for item in items:
-                clean = {}
-                for k, v in item.items():
-                    if v is None:
-                        continue
-                    if isinstance(v, (list, dict, set, frozenset)):
-                        clean[k] = json.dumps(v, default=str)
-                    else:
-                        clean[k] = v
-                batch.append(clean)
-
-            for chunk in self._chunked(batch, self.BATCH_SIZE):
-                cypher = (
-                    f"UNWIND $items AS props "
-                    f"MERGE (n:{node_type} {{{uid_prop}: props.{uid_prop}}}) "
-                    f"ON CREATE SET n.global_id = randomUUID() "
-                    f"SET n += props"
-                )
-                self._write_tx(cypher, {"items": chunk})
-
-            self.stats[f"nodes:{node_type}"] = len(items)
-            logger.info("    → created/merged %d :%s nodes", len(items), node_type)
-
-    # -- Relationship Creation ----------------------------------------------
-
-    def _create_relationships(self, parsed: dict):
-        """Create all SWUD relationships."""
-        self._create_traces_to(parsed)
-        self._create_belongs_to_module(parsed)
-        self._create_allocated_in(parsed)
-        self._create_uses_type(parsed)
-        self._create_calls(parsed)
-        self._create_uses_critical_section(parsed)
-        self._create_config_gates(parsed)
-        self._create_protects(parsed)
-        self._create_realizes_swa(parsed)
-        self._create_decision_applies_to(parsed)
-        self._create_generates(parsed)
-
-    def _create_traces_to(self, parsed: dict):
-        """
-        SWUD_TRACES_TO: any SWUD node → ProductRequirement
-        via prq_references field on each node.
-        """
-        for node_type, items in parsed.items():
-            uid_prop = self._UID_MAP.get(node_type)
-            if not uid_prop:
-                continue
-
-            edges = []
-            for item in items:
-                prqs_raw = item.get("prq_references")
-                if not prqs_raw:
-                    continue
-                prqs = json.loads(prqs_raw) if isinstance(prqs_raw, str) else prqs_raw
-                for prq_id in prqs:
-                    edges.append({
-                        "uid": item[uid_prop],
-                        "requirement_id": prq_id,
-                    })
-
-            if not edges:
-                continue
-
-            logger.info("  Creating SWUD_TRACES_TO from %s (%d edges)…", node_type, len(edges))
-            for chunk in self._chunked(edges, self.BATCH_SIZE):
-                cypher = (
-                    f"UNWIND $edges AS e "
-                    f"MATCH (n:{node_type} {{{uid_prop}: e.uid}}) "
-                    f"MATCH (p:ProductRequirement {{requirement_id: e.requirement_id}}) "
-                    f"MERGE (n)-[:SWUD_TRACES_TO]->(p)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-            self.stats[f"rel:SWUD_TRACES_TO({node_type})"] = len(edges)
-
-    def _create_belongs_to_module(self, parsed: dict):
-        """SWUD_BELONGS_TO_MODULE: any SWUD node → MCALModule."""
-        module = self.module.upper()
-
-        # Clean up stale cross-module edges: when a SWUD node's module
-        # property was overwritten (e.g. ADC created Dma_Init, then DMA
-        # set module="DMA"), the old BELONGS_TO edge to the wrong module
-        # remains.  Remove edges where the node.module differs from the
-        # linked MCALModule.
-        for node_type in parsed:
-            uid_prop = self._UID_MAP.get(node_type)
-            if not uid_prop:
-                continue
-            cleanup = (
-                f"MATCH (n:{node_type} {{module: $module}})"
-                f"-[r:SWUD_BELONGS_TO_MODULE]->(m:MCALModule) "
-                f"WHERE m.module_name <> $module DELETE r"
-            )
-            self._write_tx(cleanup, {"module": module})
-
-        for node_type in parsed:
-            uid_prop = self._UID_MAP.get(node_type)
-            if not uid_prop:
-                continue
-
-            logger.info("  Creating SWUD_BELONGS_TO_MODULE for %s → %s …", node_type, module)
-            cypher = (
-                f"MATCH (n:{node_type} {{module: $module}}) "
-                f"MATCH (m:MCALModule {{module_name: $module}}) "
-                f"MERGE (n)-[:SWUD_BELONGS_TO_MODULE]->(m)"
-            )
-            self._write_tx(cypher, {"module": module})
-
-            count_res = self._run(
-                f"MATCH (:{node_type})-[r:SWUD_BELONGS_TO_MODULE]->(:MCALModule) "
-                f"RETURN count(r) AS cnt"
-            )
-            cnt = count_res[0]["cnt"] if count_res else 0
-            self.stats[f"rel:SWUD_BELONGS_TO_MODULE({node_type})"] = cnt
-
-    def _create_allocated_in(self, parsed: dict):
-        """
-        SWUD_ALLOCATED_IN: Function/DataVariable → MemorySection
-        via memory_section field on each node.
-        """
-        mem_sections = parsed.get("SWUD_MemorySection", [])
-        if not mem_sections:
-            return
-
-        for node_type in ("SWUD_Function", "SWUD_DataVariable"):
-            items = parsed.get(node_type, [])
-            uid_prop = self._UID_MAP.get(node_type)
-            if not items or not uid_prop:
-                continue
-
-            edges = []
-            for item in items:
-                ms = item.get("memory_section")
-                if not ms:
-                    continue
-                edges.append({
-                    "uid": item[uid_prop],
-                    "section_name": ms,
-                })
-
-            if not edges:
-                continue
-
-            logger.info("  Creating SWUD_ALLOCATED_IN from %s (%d edges)…", node_type, len(edges))
-            for chunk in self._chunked(edges, self.BATCH_SIZE):
-                cypher = (
-                    f"UNWIND $edges AS e "
-                    f"MATCH (n:{node_type} {{{uid_prop}: e.uid}}) "
-                    f"MATCH (ms:SWUD_MemorySection {{section_name: e.section_name}}) "
-                    f"MERGE (n)-[:SWUD_ALLOCATED_IN]->(ms)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-            self.stats[f"rel:SWUD_ALLOCATED_IN({node_type})"] = len(edges)
-
-    def _create_uses_type(self, parsed: dict):
-        """
-        SWUD_USES_TYPE: Function → TypeDefinition
-        Inferred from parameter types, return types, and algorithm references.
-        """
-        functions = parsed.get("SWUD_Function", [])
-        type_defs = parsed.get("SWUD_TypeDefinition", [])
-        if not functions or not type_defs:
-            return
-
-        type_names = {td["type_name"] for td in type_defs}
-        edges = []
-
-        for func in functions:
-            # Scan all text fields for type references
-            text_fields = " ".join(str(func.get(f, "")) for f in [
-                "syntax", "parameters_in", "parameters_out",
-                "return_type", "algorithm", "description",
-            ])
-            for tname in type_names:
-                if tname in text_fields:
-                    edges.append({
-                        "function_name": func["function_name"],
-                        "type_name": tname,
-                    })
-
-        if not edges:
-            return
-
-        logger.info("  Creating SWUD_USES_TYPE (%d edges)…", len(edges))
-        for chunk in self._chunked(edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (f:SWUD_Function {function_name: e.function_name}) "
-                "MATCH (t:SWUD_TypeDefinition {type_name: e.type_name}) "
-                "MERGE (f)-[:SWUD_USES_TYPE]->(t)"
-            )
-            self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWUD_USES_TYPE"] = len(edges)
-
-    def _create_calls(self, parsed: dict):
-        """
-        SWUD_CALLS: Function → Function
-        Inferred from algorithm text referencing other function names.
-        """
-        functions = parsed.get("SWUD_Function", [])
-        if not functions or len(functions) < 2:
-            return
-
-        func_names = {f["function_name"] for f in functions}
-        edges = []
-
-        for func in functions:
-            algo = str(func.get("algorithm", ""))
-            desc = str(func.get("description", ""))
-            text = algo + " " + desc
-
-            for other_name in func_names:
-                if other_name == func["function_name"]:
-                    continue
-                # Match as whole word to avoid false positives
-                if re.search(rf"\b{re.escape(other_name)}\b", text):
-                    edges.append({
-                        "caller": func["function_name"],
-                        "callee": other_name,
-                    })
-
-        if not edges:
-            return
-
-        logger.info("  Creating SWUD_CALLS (%d edges)…", len(edges))
-        for chunk in self._chunked(edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (a:SWUD_Function {function_name: e.caller}) "
-                "MATCH (b:SWUD_Function {function_name: e.callee}) "
-                "MERGE (a)-[:SWUD_CALLS]->(b)"
-            )
-            self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWUD_CALLS"] = len(edges)
-
-    def _create_uses_critical_section(self, parsed: dict):
-        """
-        SWUD_USES_CRITICAL_SECTION: Function → CriticalSection
-        Inferred from using_functions list on each CriticalSection.
-        """
-        functions = parsed.get("SWUD_Function", [])
-        crit_sections = parsed.get("SWUD_CriticalSection", [])
-        if not functions or not crit_sections:
-            return
-
-        func_name_set = {f["function_name"] for f in functions}
-        edges = []
-
-        for cs in crit_sections:
-            api_raw = cs.get("using_functions")
-            if not api_raw:
-                continue
-            apis = json.loads(api_raw) if isinstance(api_raw, str) else api_raw
-            for api in apis:
-                api = api.strip()
-                if api in func_name_set:
-                    edges.append({
-                        "function_name": api,
-                        "cs_name": cs["critical_section_name"],
-                    })
-
-        if not edges:
-            return
-
-        logger.info("  Creating SWUD_USES_CRITICAL_SECTION (%d edges)…", len(edges))
-        for chunk in self._chunked(edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (f:SWUD_Function {function_name: e.function_name}) "
-                "MATCH (cs:SWUD_CriticalSection {critical_section_name: e.cs_name}) "
-                "MERGE (f)-[:SWUD_USES_CRITICAL_SECTION]->(cs)"
-            )
-            self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWUD_USES_CRITICAL_SECTION"] = len(edges)
-
-    def _create_config_gates(self, parsed: dict):
-        """
-        SWUD_CONFIG_GATES: DerivedConfigParam → Function
-        Inferred from configuration_dependencies on functions and from
-        algorithm text of config params referencing function names.
-        """
-        params = parsed.get("SWUD_DerivedConfigParam", [])
-        functions = parsed.get("SWUD_Function", [])
-        if not params or not functions:
-            return
-
-        func_name_set = {f["function_name"] for f in functions}
-        param_name_set = {p["param_name"] for p in params}
-        edges = []
-
-        # Direction 1: function.configuration_dependencies mentions a param
-        for func in functions:
-            deps = str(func.get("configuration_dependencies", ""))
-            for pname in param_name_set:
-                if pname in deps:
-                    edges.append({
-                        "param_name": pname,
-                        "function_name": func["function_name"],
-                    })
-
-        # Direction 2: param.algorithm mentions a function
-        for param in params:
-            algo = str(param.get("algorithm", ""))
-            for fname in func_name_set:
-                if re.search(rf"\b{re.escape(fname)}\b", algo):
-                    edges.append({
-                        "param_name": param["param_name"],
-                        "function_name": fname,
-                    })
-
-        # Deduplicate
-        unique_edges = list({(e["param_name"], e["function_name"]): e for e in edges}.values())
-
-        if not unique_edges:
-            return
-
-        logger.info("  Creating SWUD_CONFIG_GATES (%d edges)…", len(unique_edges))
-        for chunk in self._chunked(unique_edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (p:SWUD_DerivedConfigParam {param_name: e.param_name}) "
-                "MATCH (f:SWUD_Function {function_name: e.function_name}) "
-                "MERGE (p)-[:SWUD_CONFIG_GATES]->(f)"
-            )
-            self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWUD_CONFIG_GATES"] = len(unique_edges)
-
-    def _create_protects(self, parsed: dict):
-        """
-        SWUD_PROTECTS: CriticalSection → DataVariable
-        Inferred from resource_name on CriticalSection matching variable names.
-        """
-        crit_sections = parsed.get("SWUD_CriticalSection", [])
-        data_vars = parsed.get("SWUD_DataVariable", [])
-        if not crit_sections or not data_vars:
-            return
-
-        var_names = {v["variable_name"] for v in data_vars}
-        edges = []
-
-        for cs in crit_sections:
-            resource = cs.get("resource_name", "")
-            if not resource:
-                continue
-            for vname in var_names:
-                # Check if resource name pattern matches variable name
-                if vname in resource or resource in vname:
-                    edges.append({
-                        "cs_name": cs["critical_section_name"],
-                        "variable_name": vname,
-                    })
-
-        if not edges:
-            return
-
-        logger.info("  Creating SWUD_PROTECTS (%d edges)…", len(edges))
-        for chunk in self._chunked(edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (cs:SWUD_CriticalSection {critical_section_name: e.cs_name}) "
-                "MATCH (v:SWUD_DataVariable {variable_name: e.variable_name}) "
-                "MERGE (cs)-[:SWUD_PROTECTS]->(v)"
-            )
-            self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWUD_PROTECTS"] = len(edges)
-
-    def _create_realizes_swa(self, parsed: dict):
-        """
-        SWUD_REALIZES_SWA: Function → SWA_ArchitecturalDecision
-        Inferred from design_decisions field on functions that match
-        existing SWA decision IDs.
-        """
-        functions = parsed.get("SWUD_Function", [])
-        if not functions:
-            return
-
-        edges = []
-        for func in functions:
-            dd = func.get("design_decisions", "")
-            if not dd:
-                continue
-            # Extract GUID-like references from design_decisions field
-            import re as _re
-            guids = _re.findall(
-                r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
-                r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
-                str(dd),
-            )
-            for guid in guids:
-                edges.append({
-                    "function_name": func["function_name"],
-                    "decision_id": guid,
-                })
-
-        if not edges:
-            return
-
-        logger.info("  Creating SWUD_REALIZES_SWA (%d edges)…", len(edges))
-        for chunk in self._chunked(edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (f:SWUD_Function {function_name: e.function_name}) "
-                "MATCH (d:SWA_ArchitecturalDecision {decision_id: e.decision_id}) "
-                "MERGE (f)-[:SWUD_REALIZES_SWA]->(d)"
-            )
-            self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWUD_REALIZES_SWA"] = len(edges)
-
-    def _create_decision_applies_to(self, parsed: dict):
-        """
-        SWUD_DECISION_APPLIES_TO: DesignDecision → Function/ConfigStructure/CodeGenMacro
-        Inferred from references to node names inside design decision
-        description and rationale text.
-        """
-        decisions = parsed.get("SWUD_DesignDecision", [])
-        if not decisions:
-            return
-
-        # Build lookup sets for target node types
-        target_map = {}  # name → (node_type, uid_prop)
-        for node_type, uid_prop in [
-            ("SWUD_Function", "function_name"),
-            ("SWUD_ConfigStructure", "structure_name"),
-            ("SWUD_CodeGenMacro", "macro_name"),
-        ]:
-            for item in parsed.get(node_type, []):
-                name = item[uid_prop]
-                if len(name) >= 4:  # skip very short names to avoid false matches
-                    target_map[name] = (node_type, uid_prop)
-
-        edges = []  # list of (decision_id, target_label, uid_prop, target_name)
-        for dd in decisions:
-            text = " ".join(str(dd.get(f, "")) for f in ("title", "description", "rationale"))
-            if not text.strip():
-                continue
-            for target_name, (target_label, uid_prop) in target_map.items():
-                if re.search(rf"\b{re.escape(target_name)}\b", text):
-                    edges.append({
-                        "decision_id": dd["decision_id"],
-                        "target_label": target_label,
-                        "uid_prop": uid_prop,
-                        "target_name": target_name,
-                    })
-
-        if not edges:
-            return
-
-        logger.info("  Creating SWUD_DECISION_APPLIES_TO (%d edges)…", len(edges))
-        # Group by target label to generate appropriate Cypher
-        from collections import defaultdict
-        by_label = defaultdict(list)
-        for e in edges:
-            by_label[e["target_label"]].append(e)
-
-        for target_label, group in by_label.items():
-            uid_prop = group[0]["uid_prop"]
-            batch = [{"decision_id": e["decision_id"], "target_name": e["target_name"]} for e in group]
-            for chunk in self._chunked(batch, self.BATCH_SIZE):
-                cypher = (
-                    "UNWIND $edges AS e "
-                    "MATCH (d:SWUD_DesignDecision {decision_id: e.decision_id}) "
-                    f"MATCH (t:{target_label} {{{uid_prop}: e.target_name}}) "
-                    "MERGE (d)-[:SWUD_DECISION_APPLIES_TO]->(t)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWUD_DECISION_APPLIES_TO"] = len(edges)
-
-    def _create_generates(self, parsed: dict):
-        """
-        SWUD_GENERATES: CodeGenMacro → ConfigStructure/DerivedConfigParam
-        Inferred from algorithm text and naming patterns.
-        """
-        macros = parsed.get("SWUD_CodeGenMacro", [])
-        if not macros:
-            return
-
-        # Build lookup sets for target node types
-        target_map = {}
-        for node_type, uid_prop in [
-            ("SWUD_ConfigStructure", "structure_name"),
-            ("SWUD_DerivedConfigParam", "param_name"),
-        ]:
-            for item in parsed.get(node_type, []):
-                name = item[uid_prop]
-                if len(name) >= 4:
-                    target_map[name] = (node_type, uid_prop)
-
-        edges = []
-        for macro in macros:
-            text = " ".join(str(macro.get(f, "")) for f in ("description", "algorithm"))
-            if not text.strip():
-                continue
-            for target_name, (target_label, uid_prop) in target_map.items():
-                if re.search(rf"\b{re.escape(target_name)}\b", text):
-                    edges.append({
-                        "macro_name": macro["macro_name"],
-                        "target_label": target_label,
-                        "uid_prop": uid_prop,
-                        "target_name": target_name,
-                    })
-
-        if not edges:
-            return
-
-        logger.info("  Creating SWUD_GENERATES (%d edges)…", len(edges))
-        from collections import defaultdict
-        by_label = defaultdict(list)
-        for e in edges:
-            by_label[e["target_label"]].append(e)
-
-        for target_label, group in by_label.items():
-            uid_prop = group[0]["uid_prop"]
-            batch = [{"macro_name": e["macro_name"], "target_name": e["target_name"]} for e in group]
-            for chunk in self._chunked(batch, self.BATCH_SIZE):
-                cypher = (
-                    "UNWIND $edges AS e "
-                    "MATCH (m:SWUD_CodeGenMacro {macro_name: e.macro_name}) "
-                    f"MATCH (t:{target_label} {{{uid_prop}: e.target_name}}) "
-                    "MERGE (m)-[:SWUD_GENERATES]->(t)"
-                )
-                self._write_tx(cypher, {"edges": chunk})
-        self.stats["rel:SWUD_GENERATES"] = len(edges)
-
-    # -- Preview (dry-run) --------------------------------------------------
-
-    def _preview(self, parsed: dict):
-        """Print a summary of what would be created."""
-        print("\n" + "=" * 60)
-        print(f"  DRY-RUN PREVIEW – SWUD Ingestion, Module: {self.module}")
-        print("=" * 60)
-
-        total_nodes = 0
-        print(f"\n  Node types:")
-        for node_type, items in sorted(parsed.items()):
-            uid = self._UID_MAP.get(node_type, "?")
-            print(f"    :{node_type:<35s}  {len(items):>5,d} nodes  [merge key: {uid}]")
-            total_nodes += len(items)
-
-            # Show a few sample names
-            sample_key = uid
-            for item in items[:3]:
-                val = str(item.get(sample_key, "?"))[:60]
-                print(f"      • {val}")
-            if len(items) > 3:
-                print(f"      … and {len(items) - 3} more")
-
-        print(f"    {'TOTAL':<36s}  {total_nodes:>5,d}")
-
-        # Traceability summary
-        trace_count = 0
-        for node_type, items in parsed.items():
-            for item in items:
-                prqs = item.get("prq_references")
-                if prqs:
-                    prq_list = json.loads(prqs) if isinstance(prqs, str) else prqs
-                    trace_count += len(prq_list)
-        if trace_count:
-            print(f"\n  Traceability links to PRQ requirements: ~{trace_count}")
-
-        print("=" * 60 + "\n")
-
-    # -- Summary ------------------------------------------------------------
-
-    def _print_summary(self, elapsed: float):
-        print("\n" + "=" * 60)
-        print(f"  BUILD COMPLETE – SWUD Ingestion, Module: {self.module}")
-        print(f"  Elapsed: {elapsed:.1f}s")
-        print("=" * 60)
-
-        node_stats = {k: v for k, v in self.stats.items() if k.startswith("nodes:")}
-        if node_stats:
-            print("\n  Nodes created/merged:")
-            total_nodes = 0
-            for k, v in sorted(node_stats.items()):
-                label = k.split(":", 1)[1]
-                print(f"    :{label:<35s}  {v:>6,d}")
-                total_nodes += v
-            print(f"    {'TOTAL':<36s}  {total_nodes:>6,d}")
-
-        rel_stats = {k: v for k, v in self.stats.items() if k.startswith("rel:")}
-        if rel_stats:
-            print("\n  Relationships created:")
-            total_rels = 0
-            for k, v in sorted(rel_stats.items()):
-                name = k.split(":", 1)[1]
-                print(f"    :{name:<35s}  {v:>6,d}")
-                total_rels += v
-            print(f"    {'TOTAL':<36s}  {total_rels:>6,d}")
-
-        try:
-            db_stats = self._run("MATCH (n) RETURN count(n) AS nodes")
-            rel_count = self._run("MATCH ()-[r]->() RETURN count(r) AS rels")
-            labels = self._run("CALL db.labels() YIELD label RETURN collect(label) AS labels")
-            print(f"\n  Database totals:")
-            print(f"    Nodes        : {db_stats[0]['nodes']:,d}")
-            print(f"    Relationships: {rel_count[0]['rels']:,d}")
-            print(f"    Labels       : {', '.join(labels[0]['labels'])}")
-        except Exception:
-            pass
-
-        print("=" * 60 + "\n")
-
-    # -- Utilities ----------------------------------------------------------
-
-    @staticmethod
-    def _chunked(lst: list, size: int):
-        for i in range(0, len(lst), size):
-            yield lst[i : i + size]
-
-
+        element_builder.build()
+
+        # Phase 2: Diagram structure (Activity, Sequence, Statechart, Logical)
+        logger.info("Phase 2/2: EA diagram structure …")
+        diagram_builder = EADiagramExtractor(
+            module=self.module,
+            qeax_path=self.qeax_path,
+            neo4j_cfg=self.neo4j_cfg,
+            dry_run=self.dry_run,
+            clear=False,  # already cleared in phase 1 if requested
+        )
+        diagram_builder.build()
+
+        logger.info("EA Knowledge Graph Builder — %s — complete.", self.module)
 # ---------------------------------------------------------------------------
 # Test Specification Knowledge Graph Builder
 # ---------------------------------------------------------------------------
@@ -3673,7 +2213,7 @@ class TestSpecKnowledgeGraphBuilder:
 
     This builder parses the test spec Excel file and creates nodes for each
     sheet type, then links them via traceability relationships to existing
-    PRQ, SWA, and SWUD nodes in the graph.
+    PRQ and EA_* nodes in the graph.
 
     Node types created (from the MCAL ontology):
         - TS_FunctionalTestCase     (sheet "Test cases")
@@ -3684,10 +2224,9 @@ class TestSpecKnowledgeGraphBuilder:
 
     Relationships created:
         - TS_VERIFIES               (test case → ProductRequirement via PRQ refs)
-        - TS_VALIDATES_SWA          (test case → SWA node via SWA GUIDs)
-        - TS_VALIDATES_SWUD         (test case → SWUD node via SWUD GUIDs)
-        - TS_TESTS_CONFIG_ELEMENT   (config test → SWA_ConfigParam/Container)
-        - TS_MEASURES_TIMING_OF     (WCET test → SWA_Function via api_name)
+        - TS_VALIDATES_EA           (test case → EA_* node via feature GUIDs)
+        - TS_TESTS_CONFIG_ELEMENT   (config test → EA_ConfigParameter/Container)
+        - TS_MEASURES_TIMING_OF     (WCET test → EA_Function via api_name)
         - TS_BELONGS_TO_MODULE      (test case → MCALModule)
         - TS_CONTAINS_TESTCASE      (TS_TestSpecDocument → test cases)
 
@@ -3715,11 +2254,13 @@ class TestSpecKnowledgeGraphBuilder:
         module: str,
         testspec_dir: Path,
         dry_run: bool = False,
+        force_incremental: bool = False,
     ):
         self.neo4j_cfg = neo4j_cfg
         self.module = module.upper()
         self.testspec_dir = testspec_dir
         self.dry_run = dry_run
+        self.force_incremental = force_incremental
         self.stats: dict = Counter()
         self._driver = None
 
@@ -3849,6 +2390,22 @@ class TestSpecKnowledgeGraphBuilder:
         self._connect()
 
         try:
+            # ── Incremental check ──
+            if not self.force_incremental:
+                tracker = IncrementalTracker(self._driver, self.module)
+                plan = tracker.plan_testspec(xlsx_path)
+                logger.info(plan.summary())
+                if not plan.has_changes:
+                    logger.info("TestSpec unchanged — skipping")
+                    print(f"\n  ✓ TestSpec unchanged for {self.module} — skipping.\n")
+                    return
+                if not plan.is_first_run:
+                    logger.info("TestSpec changed — deleting old TS_ nodes")
+                    tracker.delete_testspec()
+                self._ts_hash = (xlsx_path.stem, list(plan.changed.values())[0])
+            else:
+                self._ts_hash = None
+
             # Step 3: Create constraints / indexes
             logger.info("Step 2/4: Creating TestSpec constraints and indexes…")
             self._create_constraints(parsed)
@@ -3860,6 +2417,12 @@ class TestSpecKnowledgeGraphBuilder:
             # Step 5: Create relationships
             logger.info("Step 4/4: Creating TestSpec relationships…")
             self._create_relationships(parsed)
+
+            # ── Stamp hash ──
+            if self._ts_hash:
+                tracker = IncrementalTracker(self._driver, self.module)
+                tracker.stamp_testspec(*self._ts_hash)
+                logger.info("  Stamped TestSpec hash for %s", self.module)
 
             self._print_summary(time.time() - t0)
         finally:
@@ -3956,8 +2519,8 @@ class TestSpecKnowledgeGraphBuilder:
     def _create_relationships(self, parsed: dict):
         """Create all TestSpec relationships."""
         self._create_ts_verifies(parsed)
-        self._create_ts_validates_swa(parsed)
-        self._create_ts_validates_swud(parsed)
+        self._create_ts_validates_ea(parsed)
+        self._create_ts_validates_ea_by_name(parsed)
         self._create_ts_tests_config_element(parsed)
         self._create_ts_measures_timing(parsed)
         self._create_ts_belongs_to_module(parsed)
@@ -3970,99 +2533,52 @@ class TestSpecKnowledgeGraphBuilder:
 
         The tools query: ProductRequirement -[:IMPLEMENTS]-> Code -[:TRACES_TO]-> Test
         but the existing graph has the reverse edges:
-          - SWA -[:ARCHITECTURALLY_REALIZES/:SWA_ARCH_DECISION_TRACES_TO/:SWA_CONFIG_TRACES_TO]-> PRQ
-          - SWUD -[:SWUD_TRACES_TO]-> PRQ
-          - TS   -[:TS_VALIDATES_SWA/:TS_VALIDATES_SWUD]-> SWA/SWUD
+          - EA -[:EA_REALISES]-> ProductRequirement (via EA_Requirement traceability)
+          - TS -[:TS_VALIDATES_EA]-> EA_*
 
         This method creates the forward-direction IMPLEMENTS/TRACES_TO edges.
         """
         module = self.module.upper()
         logger.info("  Creating V-Model bridge edges for module %s…", module)
 
-        # ── IMPLEMENTS: ProductRequirement → SWA ─────────────────────
-        # Reverse of ARCHITECTURALLY_REALIZES (SWA_Function/DataType → PRQ)
+        # ── IMPLEMENTS: ProductRequirement → EA ──────────────────────
+        # Reverse of EA_REALISES (EA_* → ProductRequirement)
         self._write_tx(
-            "MATCH (swa)-[:ARCHITECTURALLY_REALIZES]->(prq:ProductRequirement) "
-            "WHERE swa.module = $module "
-            "MERGE (prq)-[:IMPLEMENTS {source: 'bridge', derived_from: 'ARCHITECTURALLY_REALIZES'}]->(swa)",
-            {"module": module},
-        )
-        # Reverse of SWA_ARCH_DECISION_TRACES_TO (SWA_ArchDecision → PRQ)
-        self._write_tx(
-            "MATCH (swa)-[:SWA_ARCH_DECISION_TRACES_TO]->(prq:ProductRequirement) "
-            "MERGE (prq)-[:IMPLEMENTS {source: 'bridge', derived_from: 'SWA_ARCH_DECISION_TRACES_TO'}]->(swa)",
-            {},
-        )
-        # Reverse of SWA_CONFIG_TRACES_TO (SWA_ConfigContainer/Param → PRQ)
-        self._write_tx(
-            "MATCH (swa)-[:SWA_CONFIG_TRACES_TO]->(prq:ProductRequirement) "
-            "MERGE (prq)-[:IMPLEMENTS {source: 'bridge', derived_from: 'SWA_CONFIG_TRACES_TO'}]->(swa)",
-            {},
-        )
-
-        swa_count = self._run(
-            "MATCH (prq:ProductRequirement)-[r:IMPLEMENTS]->(swa) "
-            "WHERE any(l IN labels(swa) WHERE l STARTS WITH 'SWA_') "
-            "RETURN count(r) AS c",
-        )
-        n_swa = swa_count[0]["c"] if swa_count else 0
-        logger.info("    IMPLEMENTS (PRQ → SWA): %d edges", n_swa)
-        self.stats["rel:IMPLEMENTS(PRQ→SWA)"] = n_swa
-
-        # ── IMPLEMENTS: ProductRequirement → SWUD ────────────────────
-        # Reverse of SWUD_TRACES_TO
-        self._write_tx(
-            "MATCH (swud)-[:SWUD_TRACES_TO]->(prq:ProductRequirement) "
-            "WHERE swud.module = $module "
-            "MERGE (prq)-[:IMPLEMENTS {source: 'bridge', derived_from: 'SWUD_TRACES_TO'}]->(swud)",
+            "MATCH (ea)-[:EA_REALISES]->(prq:ProductRequirement) "
+            "WHERE ea.module = $module "
+            "MERGE (prq)-[:IMPLEMENTS {source: 'bridge', derived_from: 'EA_REALISES'}]->(ea)",
             {"module": module},
         )
 
-        swud_count = self._run(
-            "MATCH (prq:ProductRequirement)-[r:IMPLEMENTS {derived_from: 'SWUD_TRACES_TO'}]->(swud) "
-            "WHERE swud.module = $module RETURN count(r) AS c",
+        ea_count = self._run(
+            "MATCH (prq:ProductRequirement)-[r:IMPLEMENTS]->(ea) "
+            "WHERE any(l IN labels(ea) WHERE l STARTS WITH 'EA_') "
+            "AND ea.module = $module RETURN count(r) AS c",
             {"module": module},
         )
-        n_swud = swud_count[0]["c"] if swud_count else 0
-        logger.info("    IMPLEMENTS (PRQ → SWUD): %d edges", n_swud)
-        self.stats["rel:IMPLEMENTS(PRQ→SWUD)"] = n_swud
+        n_ea = ea_count[0]["c"] if ea_count else 0
+        logger.info("    IMPLEMENTS (PRQ → EA): %d edges", n_ea)
+        self.stats["rel:IMPLEMENTS(PRQ→EA)"] = n_ea
 
-        # ── TRACES_TO: SWA/SWUD → TS test cases ─────────────────────
-        # Reverse of TS_VALIDATES_SWA
+        # ── TRACES_TO: EA → TS test cases ────────────────────────────
+        # Reverse of TS_VALIDATES_EA
         self._write_tx(
-            "MATCH (ts)-[:TS_VALIDATES_SWA]->(swa) "
+            "MATCH (ts)-[:TS_VALIDATES_EA]->(ea) "
             "WHERE ts.module = $module "
-            "MERGE (swa)-[:TRACES_TO {source: 'bridge', derived_from: 'TS_VALIDATES_SWA'}]->(ts)",
+            "MERGE (ea)-[:TRACES_TO {source: 'bridge', derived_from: 'TS_VALIDATES_EA'}]->(ts)",
             {"module": module},
         )
 
-        ts_swa_count = self._run(
-            "MATCH (swa)-[r:TRACES_TO {derived_from: 'TS_VALIDATES_SWA'}]->(ts) "
+        ts_ea_count = self._run(
+            "MATCH (ea)-[r:TRACES_TO {derived_from: 'TS_VALIDATES_EA'}]->(ts) "
             "WHERE ts.module = $module RETURN count(r) AS c",
             {"module": module},
         )
-        n_ts_swa = ts_swa_count[0]["c"] if ts_swa_count else 0
-        logger.info("    TRACES_TO (SWA → TS): %d edges", n_ts_swa)
-        self.stats["rel:TRACES_TO(SWA→TS)"] = n_ts_swa
+        n_ts_ea = ts_ea_count[0]["c"] if ts_ea_count else 0
+        logger.info("    TRACES_TO (EA → TS): %d edges", n_ts_ea)
+        self.stats["rel:TRACES_TO(EA→TS)"] = n_ts_ea
 
-        # Reverse of TS_VALIDATES_SWUD
-        self._write_tx(
-            "MATCH (ts)-[:TS_VALIDATES_SWUD]->(swud) "
-            "WHERE ts.module = $module "
-            "MERGE (swud)-[:TRACES_TO {source: 'bridge', derived_from: 'TS_VALIDATES_SWUD'}]->(ts)",
-            {"module": module},
-        )
-
-        ts_swud_count = self._run(
-            "MATCH (swud)-[r:TRACES_TO {derived_from: 'TS_VALIDATES_SWUD'}]->(ts) "
-            "WHERE ts.module = $module RETURN count(r) AS c",
-            {"module": module},
-        )
-        n_ts_swud = ts_swud_count[0]["c"] if ts_swud_count else 0
-        logger.info("    TRACES_TO (SWUD → TS): %d edges", n_ts_swud)
-        self.stats["rel:TRACES_TO(SWUD→TS)"] = n_ts_swud
-
-        total = n_swa + n_swud + n_ts_swa + n_ts_swud
+        total = n_ea + n_ts_ea
         logger.info("  V-Model bridge edges total: %d", total)
 
     def _create_ts_verifies(self, parsed: dict):
@@ -4103,137 +2619,84 @@ class TestSpecKnowledgeGraphBuilder:
                 self._write_tx(cypher, {"edges": chunk})
             self.stats[f"rel:TS_VERIFIES({node_type})"] = len(edges)
 
-    def _create_ts_validates_swa(self, parsed: dict):
+    def _create_ts_validates_ea(self, parsed: dict):
         """
-        TS_VALIDATES_SWA: TS test case → SWA node via SWA feature GUIDs.
+        TS_VALIDATES_EA: TS test case → EA_* node via feature GUIDs.
 
-        Matches GUIDs against the appropriate ID property of each SWA node
-        type (decision_id for SWA_ArchitecturalDecision, feature_id for
-        others).  Iterates over all SWA node types – mirrors the approach
-        used by ``_create_ts_validates_swud``.
+        Matches GUIDs from swa_references and swud_references (both map
+        to EA element ea_guid stored as feature_id) against EA node types.
         """
         test_case_types = [
             "TS_FunctionalTestCase",
             "TS_ConfigTestCase",
             "TS_StaticInterfaceTestCase",
         ]
-        # SWA node types to match against, with their GUID property.
-        # SWA_ArchitecturalDecision stores the GUID in `decision_id`;
-        # all other SWA types expose `feature_id`.
-        swa_type_id_props = [
-            ("SWA_ArchitecturalDecision", "decision_id"),
-            ("SWA_Function",              "feature_id"),
-            ("SWA_DataType",              "feature_id"),
-            ("SWA_Macro",                 "feature_id"),
-            ("SWA_ConfigContainer",       "feature_id"),
-            ("SWA_ConfigParam",           "feature_id"),
-            ("SWA_SourceFile",            "feature_id"),
-            ("SWA_HwPeripheral",          "feature_id"),
+        # EA node types to match against — all use feature_id (ea_guid from QEAX)
+        ea_types = [
+            "EA_DesignDecision",
+            "EA_Function",
+            "EA_DataType",
+            "EA_ConfigMacro",
+            "EA_ConfigContainer",
+            "EA_ConfigParameter",
+            "EA_SourceFile",
+            "EA_HwPeripheral",
+            "EA_Requirement",
+            "EA_ErrorCode",
+            "EA_GlobalVariable",
+            "EA_PropertyVariable",
+            "EA_MemorySection",
+            "EA_Register",
+            "EA_Information",
+            "EA_CoverTag",
+            "EA_TrustDomain",
         ]
 
         for node_type in test_case_types:
             items = parsed.get(node_type, [])
             edges = []
-            for item in items:
-                swa_raw = item.get("swa_references")
-                if not swa_raw:
-                    continue
-                swa_guids = json.loads(swa_raw) if isinstance(swa_raw, str) else swa_raw
-                for guid in swa_guids:
-                    edges.append({
-                        "test_case_id": item["test_case_id"],
-                        "guid": guid,
-                    })
+
+            # Collect GUIDs from both swa_references and swud_references
+            # (TestSpec parser still emits these field names — they now
+            #  correspond to EA element GUIDs.)
+            for ref_field in ("swa_references", "swud_references"):
+                for item in items:
+                    raw = item.get(ref_field)
+                    if not raw:
+                        continue
+                    guids = json.loads(raw) if isinstance(raw, str) else raw
+                    for guid in guids:
+                        edges.append({
+                            "test_case_id": item["test_case_id"],
+                            "guid": guid,
+                        })
 
             if not edges:
                 continue
 
-            logger.info("  Creating TS_VALIDATES_SWA from %s (%d edges)…",
+            logger.info("  Creating TS_VALIDATES_EA from %s (%d edges)…",
                         node_type, len(edges))
 
-            # Try to match each GUID against every SWA node type
-            for swa_type, id_prop in swa_type_id_props:
+            # Try to match each GUID against every EA node type
+            for ea_type in ea_types:
                 for chunk in self._chunked(edges, self.BATCH_SIZE):
                     cypher = (
                         f"UNWIND $edges AS e "
                         f"MATCH (tc:{node_type} {{test_case_id: e.test_case_id}}) "
-                        f"MATCH (swa:{swa_type} {{{id_prop}: e.guid}}) "
-                        f"MERGE (tc)-[:TS_VALIDATES_SWA]->(swa)"
+                        f"MATCH (ea:{ea_type} {{feature_id: e.guid}}) "
+                        f"MERGE (tc)-[:TS_VALIDATES_EA]->(ea)"
                     )
                     self._write_tx(cypher, {"edges": chunk})
 
-            self.stats[f"rel:TS_VALIDATES_SWA({node_type})"] = len(edges)
+            self.stats[f"rel:TS_VALIDATES_EA({node_type})"] = len(edges)
 
-    def _create_ts_validates_swud(self, parsed: dict):
+    def _create_ts_validates_ea_by_name(self, parsed: dict):
         """
-        TS_VALIDATES_SWUD: TS test case → SWUD node via SWUD feature GUIDs.
-
-        Matches GUIDs against the feature_id property of SWUD nodes
-        (SWUD_DesignDecision, SWUD_Function, SWUD_TypeDefinition, etc.).
-        """
-        test_case_types = [
-            "TS_FunctionalTestCase",
-            "TS_ConfigTestCase",
-            "TS_StaticInterfaceTestCase",
-        ]
-        # SWUD node types to match against
-        swud_types = [
-            "SWUD_DesignDecision",
-            "SWUD_Function",
-            "SWUD_TypeDefinition",
-            "SWUD_DerivedConfigParam",
-            "SWUD_ConfigStructure",
-            "SWUD_DataVariable",
-        ]
-
-        for node_type in test_case_types:
-            items = parsed.get(node_type, [])
-            edges = []
-            for item in items:
-                swud_raw = item.get("swud_references")
-                if not swud_raw:
-                    continue
-                swud_guids = json.loads(swud_raw) if isinstance(swud_raw, str) else swud_raw
-                for guid in swud_guids:
-                    edges.append({
-                        "test_case_id": item["test_case_id"],
-                        "guid": guid,
-                    })
-
-            if not edges:
-                continue
-
-            logger.info("  Creating TS_VALIDATES_SWUD from %s (%d edges)…",
-                        node_type, len(edges))
-
-            # Try to match each GUID against any SWUD node type
-            for swud_type in swud_types:
-                for chunk in self._chunked(edges, self.BATCH_SIZE):
-                    cypher = (
-                        f"UNWIND $edges AS e "
-                        f"MATCH (tc:{node_type} {{test_case_id: e.test_case_id}}) "
-                        f"MATCH (swud:{swud_type} {{feature_id: e.guid}}) "
-                        f"MERGE (tc)-[:TS_VALIDATES_SWUD]->(swud)"
-                    )
-                    self._write_tx(cypher, {"edges": chunk})
-
-            self.stats[f"rel:TS_VALIDATES_SWUD({node_type})"] = len(edges)
-
-        # ── Text-mention expansion ────────────────────────────────
-        # Create additional TS_VALIDATES_SWUD edges based on function name
-        # mentions in test case text fields.  Only for names with a clear
-        # identifier pattern (underscore-separated like Adc_Init) to avoid
-        # false positives from short names like "Adc" or "Dio".
-        self._create_ts_validates_swud_by_name(parsed)
-
-    def _create_ts_validates_swud_by_name(self, parsed: dict):
-        """
-        Text-mention expansion: create TS_VALIDATES_SWUD edges when a test
-        case's text fields mention a SWUD_Function by name.
+        Text-mention expansion: create TS_VALIDATES_EA edges when a test
+        case's text fields mention an EA_Function by name.
 
         Only matches function names containing an underscore (e.g. Adc_Init)
-        to avoid false positives from short names.  Skips edges that already
-        exist via GUID matching.
+        to avoid false positives.  Skips edges that already exist via GUID.
         """
         module = self.module.upper()
         test_case_types = [
@@ -4248,33 +2711,31 @@ class TestSpecKnowledgeGraphBuilder:
         db = self.neo4j_cfg["database"]
 
         for tc_type in test_case_types:
-            # Count existing edges before
             with self._driver.session(database=db) as session:
                 before = session.run(
-                    f"MATCH (:{tc_type})-[r:TS_VALIDATES_SWUD]->(f:SWUD_Function) "
+                    f"MATCH (:{tc_type})-[r:TS_VALIDATES_EA]->(f:EA_Function) "
                     f"WHERE f.module = $module RETURN count(r) AS c",
                     module=module,
                 ).single()["c"]
 
             cypher = (
-                f"MATCH (f:SWUD_Function) "
-                f"WHERE f.module = $module AND f.function_name CONTAINS '_' "
+                f"MATCH (f:EA_Function) "
+                f"WHERE f.module = $module AND f.name CONTAINS '_' "
                 f"WITH f "
                 f"MATCH (tc:{tc_type} {{module: $module}}) "
-                f"WHERE NOT (tc)-[:TS_VALIDATES_SWUD]->(f) "
+                f"WHERE NOT (tc)-[:TS_VALIDATES_EA]->(f) "
                 f"  AND ("
                 + " OR ".join(
-                    f"tc.{field} CONTAINS f.function_name" for field in text_fields
+                    f"tc.{field} CONTAINS f.name" for field in text_fields
                 )
                 + f") "
-                f"MERGE (tc)-[:TS_VALIDATES_SWUD {{source: 'text_mention'}}]->(f)"
+                f"MERGE (tc)-[:TS_VALIDATES_EA {{source: 'text_mention'}}]->(f)"
             )
             self._write_tx(cypher, {"module": module})
 
-            # Count after to determine how many were created
             with self._driver.session(database=db) as session:
                 after = session.run(
-                    f"MATCH (:{tc_type})-[r:TS_VALIDATES_SWUD]->(f:SWUD_Function) "
+                    f"MATCH (:{tc_type})-[r:TS_VALIDATES_EA]->(f:EA_Function) "
                     f"WHERE f.module = $module RETURN count(r) AS c",
                     module=module,
                 ).single()["c"]
@@ -4282,17 +2743,17 @@ class TestSpecKnowledgeGraphBuilder:
             created = after - before
             if created:
                 logger.info(
-                    "  Text-mention TS_VALIDATES_SWUD from %s: %d new edges",
+                    "  Text-mention TS_VALIDATES_EA from %s: %d new edges",
                     tc_type, created,
                 )
-                self.stats[f"rel:TS_VALIDATES_SWUD_textmention({tc_type})"] = created
+                self.stats[f"rel:TS_VALIDATES_EA_textmention({tc_type})"] = created
 
     def _create_ts_tests_config_element(self, parsed: dict):
         """
-        TS_TESTS_CONFIG_ELEMENT: TS_ConfigTestCase → SWA_ConfigParam/Container.
+        TS_TESTS_CONFIG_ELEMENT: TS_ConfigTestCase → EA_ConfigParameter/EA_ConfigContainer.
 
-        Matches config_path on the test case against container_name or
-        param_name on SWA nodes.
+        Matches config_path on the test case against the name property
+        on EA config nodes.
         """
         config_tests = parsed.get("TS_ConfigTestCase", [])
         if not config_tests:
@@ -4318,22 +2779,22 @@ class TestSpecKnowledgeGraphBuilder:
 
         logger.info("  Creating TS_TESTS_CONFIG_ELEMENT (%d edges)…", len(edges))
 
-        # Match against SWA_ConfigContainer
+        # Match against EA_ConfigContainer
         for chunk in self._chunked(edges, self.BATCH_SIZE):
             cypher = (
                 "UNWIND $edges AS e "
                 "MATCH (tc:TS_ConfigTestCase {test_case_id: e.test_case_id}) "
-                "MATCH (c:SWA_ConfigContainer {container_name: e.leaf_name}) "
+                "MATCH (c:EA_ConfigContainer {name: e.leaf_name}) "
                 "MERGE (tc)-[:TS_TESTS_CONFIG_ELEMENT]->(c)"
             )
             self._write_tx(cypher, {"edges": chunk})
 
-        # Match against SWA_ConfigParam
+        # Match against EA_ConfigParameter
         for chunk in self._chunked(edges, self.BATCH_SIZE):
             cypher = (
                 "UNWIND $edges AS e "
                 "MATCH (tc:TS_ConfigTestCase {test_case_id: e.test_case_id}) "
-                "MATCH (p:SWA_ConfigParam {param_name: e.leaf_name}) "
+                "MATCH (p:EA_ConfigParameter {name: e.leaf_name}) "
                 "MERGE (tc)-[:TS_TESTS_CONFIG_ELEMENT]->(p)"
             )
             self._write_tx(cypher, {"edges": chunk})
@@ -4342,10 +2803,10 @@ class TestSpecKnowledgeGraphBuilder:
 
     def _create_ts_measures_timing(self, parsed: dict):
         """
-        TS_MEASURES_TIMING_OF: TS_WCETTestCase → SWA_Function.
+        TS_MEASURES_TIMING_OF: TS_WCETTestCase → EA_Function.
 
-        Matches api_name on the WCET test case against function_name
-        on SWA_ArchitecturalDecision nodes (or SWUD_Function).
+        Matches api_name on the WCET test case against name
+        on EA_Function nodes.
         """
         wcet_tests = parsed.get("TS_WCETTestCase", [])
         if not wcet_tests:
@@ -4368,12 +2829,12 @@ class TestSpecKnowledgeGraphBuilder:
 
         logger.info("  Creating TS_MEASURES_TIMING_OF (%d edges)…", len(edges))
 
-        # Match against SWUD_Function
+        # Match against EA_Function
         for chunk in self._chunked(edges, self.BATCH_SIZE):
             cypher = (
                 "UNWIND $edges AS e "
                 "MATCH (tc:TS_WCETTestCase {test_case_id: e.test_case_id}) "
-                "MATCH (f:SWUD_Function {function_name: e.api_name}) "
+                "MATCH (f:EA_Function {name: e.api_name}) "
                 "MERGE (tc)-[r:TS_MEASURES_TIMING_OF]->(f) "
                 "SET r.data_point = e.data_point"
             )
@@ -4464,15 +2925,14 @@ class TestSpecKnowledgeGraphBuilder:
 
         # Traceability summary
         prq_count = 0
-        swa_count = 0
-        swud_count = 0
+        ea_count = 0
         hazop_count = 0
         for node_type, items in parsed.items():
             for item in items:
                 for ref_key, counter_name in [
                     ("prq_references", "prq"),
-                    ("swa_references", "swa"),
-                    ("swud_references", "swud"),
+                    ("swa_references", "ea"),
+                    ("swud_references", "ea"),
                     ("hazop_references", "hazop"),
                 ]:
                     refs = item.get(ref_key)
@@ -4480,17 +2940,14 @@ class TestSpecKnowledgeGraphBuilder:
                         ref_list = json.loads(refs) if isinstance(refs, str) else refs
                         if counter_name == "prq":
                             prq_count += len(ref_list)
-                        elif counter_name == "swa":
-                            swa_count += len(ref_list)
-                        elif counter_name == "swud":
-                            swud_count += len(ref_list)
+                        elif counter_name == "ea":
+                            ea_count += len(ref_list)
                         elif counter_name == "hazop":
                             hazop_count += len(ref_list)
 
         print(f"\n  Traceability links (potential edges):")
         print(f"    TS_VERIFIES          → PRQ  : ~{prq_count}")
-        print(f"    TS_VALIDATES_SWA     → SWA  : ~{swa_count}")
-        print(f"    TS_VALIDATES_SWUD    → SWUD : ~{swud_count}")
+        print(f"    TS_VALIDATES_EA      → EA   : ~{ea_count}")
         print(f"    HAZOP references            : ~{hazop_count}")
 
         # Config path matching
@@ -4616,7 +3073,7 @@ def main():
     )
     parser.add_argument(
         "--profile",
-        choices=["mcal", "illd"],
+        choices=["mcal", "illd", "test", "local"],
         default=None,
         help="Ontology profile to use. If omitted, you will be prompted.",
     )
@@ -4662,46 +3119,25 @@ def main():
         help="Re-fetch folder hierarchy from Jama API even if a cached file exists (MCAL only).",
     )
     parser.add_argument(
-        "--ingest-swa",
+        "--ingest-ea",
         action="store_true",
         help=(
-            "Ingest SWA (Software Architecture) markdown sections into the "
-            "MCAL database.  Parses section_*_raw.md files from the SWA "
-            "directory and creates SWA_ArchitecturalDecision, SWA_HwPeripheral, "
-            "SWA_SwDependency, SWA_ConfigContainer, SWA_ConfigParam nodes "
-            "plus traceability relationships to existing PRQ requirements."
+            "Ingest EA (Enterprise Architect) model data from a QEAX file "
+            "into the MCAL database.  Extracts elements, connectors, and "
+            "diagram structure and creates EA_Function, EA_DataType, "
+            "EA_ConfigParameter, EA_ConfigContainer, EA_ConfigMacro, "
+            "EA_ErrorCode, EA_Requirement, EA_DesignDecision, EA_Diagram "
+            "(and more) nodes plus 17 EA relationship types.  "
+            "Replaces the former --ingest-swa and --ingest-swud flags."
         ),
     )
     parser.add_argument(
-        "--swa-dir",
+        "--qeax-path",
         type=Path,
         default=None,
         help=(
-            "Override path to SWA markdown directory. "
-            "Default: swa/ under the HybridRAG root. "
-            "Should contain section_*_raw.md files produced by prepare_markdowns.py."
-        ),
-    )
-    parser.add_argument(
-        "--ingest-swud",
-        action="store_true",
-        help=(
-            "Ingest SWUD (Software Unit Design) markdown sections into the "
-            "MCAL database.  Parses the SWUD markdown files and creates "
-            "SWUD_Function, SWUD_TypeDefinition, SWUD_DerivedConfigParam, "
-            "SWUD_DesignDecision, SWUD_DataVariable, SWUD_CriticalSection, "
-            "SWUD_MemorySection, SWUD_ConfigStructure, SWUD_CodeGenMacro nodes "
-            "plus traceability relationships to existing PRQ requirements."
-        ),
-    )
-    parser.add_argument(
-        "--swud-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Override path to SWUD markdown directory. "
-            "Default: swud/ under the HybridRAG root. "
-            "Should contain the converted SWUD markdown file(s)."
+            "Path to the .qeax (Enterprise Architect) model file.  "
+            "Default: see DEFAULT_QEAX in source."
         ),
     )
     parser.add_argument(
@@ -4713,7 +3149,7 @@ def main():
             "Static source code IF tests, WCET analysis) and creates "
             "TS_FunctionalTestCase, TS_ConfigTestCase, TS_StaticInterfaceTestCase, "
             "TS_WCETTestCase, TS_TestSpecDocument nodes plus traceability "
-            "relationships to existing PRQ, SWA, and SWUD nodes."
+            "relationships to existing PRQ and EA_* nodes."
         ),
     )
     parser.add_argument(
@@ -4792,30 +3228,18 @@ def main():
         return
 
     # -----------------------------------------------------------------------
-    # Dispatch: --ingest-swa and/or --ingest-swud
-    # Both flags can be combined in a single invocation.
+    # Dispatch: --ingest-ea  (EA model from QEAX)
     # -----------------------------------------------------------------------
     ran_doc_ingest = False
 
-    if args.ingest_swa:
-        swa_dir = args.swa_dir or SWA_DIR
-        builder = SWAKnowledgeGraphBuilder(
+    if args.ingest_ea:
+        qeax_path = args.qeax_path or DEFAULT_QEAX
+        builder = EAKnowledgeGraphBuilder(
             neo4j_cfg=neo4j_cfg,
             module=module,
-            swa_dir=swa_dir,
+            qeax_path=qeax_path,
             dry_run=args.dry_run,
-        )
-        builder.BATCH_SIZE = args.batch_size
-        builder.build()
-        ran_doc_ingest = True
-
-    if args.ingest_swud:
-        swud_dir = args.swud_dir or SWUD_DIR
-        builder = SWUDKnowledgeGraphBuilder(
-            neo4j_cfg=neo4j_cfg,
-            module=module,
-            swud_dir=swud_dir,
-            dry_run=args.dry_run,
+            clear=args.clear,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()
@@ -4828,12 +3252,15 @@ def main():
             module=module,
             testspec_dir=testspec_dir,
             dry_run=args.dry_run,
+            force_incremental=args.force,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()
         ran_doc_ingest = True
 
     if ran_doc_ingest:
+        if args.project and not args.dry_run:
+            _stamp_project_on_module(neo4j_cfg, module, args.project)
         return
 
     # -----------------------------------------------------------------------
@@ -4876,6 +3303,8 @@ def main():
         relationships_path=relationships_path,
         folders_path=folders_path,
         jama_cfg=jama_cfg,
+        module=module,
+        force_incremental=args.force,
     )
     builder.BATCH_SIZE = args.batch_size
     builder.build()
@@ -4893,8 +3322,8 @@ class SourceCodeKnowledgeGraphBuilder:
     Builds source-code nodes and relationships in the MCAL Neo4j database
     from C source files (.c / .h) in a module repository.
 
-    This builder fills the **implementation** layer in the V-Model ΓÇö the gap
-    between SWUD (detailed design) and Test Specification.  It parses every
+    This builder fills the **implementation** layer in the V-Model — the gap
+    between EA design and Test Specification.  It parses every
     C file in the ``ssc/`` and ``Plugins/`` sub-trees of a module repo,
     extracts functions, data types, macros, call graphs, and register
     accesses, then populates the knowledge graph.
@@ -4906,11 +3335,10 @@ class SourceCodeKnowledgeGraphBuilder:
         - SRC_Macro
 
     Relationships created:
-        - SRC_DEFINED_IN          (function/type/macro ΓåÆ file)
-        - SRC_CALLS               (function ΓåÆ function)
-        - SRC_BELONGS_TO_MODULE   (all ΓåÆ MCALModule)
-        - SRC_IMPLEMENTS_SWA      (function ΓåÆ SWA_Function by name)
-        - SRC_IMPLEMENTS_SWUD     (function ΓåÆ SWUD_Function by name)
+        - SRC_DEFINED_IN          (function/type/macro → file)
+        - SRC_CALLS               (function → function)
+        - SRC_BELONGS_TO_MODULE   (all → MCALModule)
+        - SRC_IMPLEMENTS_EA       (function → EA_Function by name)
 
     Usage::
 
@@ -5051,11 +3479,15 @@ class SourceCodeKnowledgeGraphBuilder:
         sum_mode: bool = False,
         sum_configs: Optional[list] = None,
         force_fetch: bool = False,
+        force_incremental: bool = False,
+        project: Optional[str] = None,
     ):
         self.neo4j_cfg = neo4j_cfg
         self.module = module.upper()
         self.source_dir = Path(source_dir)
         self.dry_run = dry_run
+        self.force_incremental = force_incremental
+        self.project = project
         self.cfgmcal_dir = Path(cfgmcal_dir) if cfgmcal_dir else None
         self.temp_dir = temp_dir or (HYBRIDRAG_DIR / "temp" / f"src_{self.module.lower()}")
         self.sfr_include_dir = Path(sfr_include_dir) if sfr_include_dir else None
@@ -5223,6 +3655,40 @@ class SourceCodeKnowledgeGraphBuilder:
         self._connect()
 
         try:
+            # ── Incremental check ──
+            if not self.force_incremental:
+                # Build file_map from parsed self._files (correct file_ids,
+                # including CfgMcal files from cfgmcal_dir).
+                file_map = {
+                    f["file_id"]: Path(f["_abs_path"])
+                    for f in self._files
+                    if "_abs_path" in f
+                }
+                tracker = IncrementalTracker(self._driver, self.module)
+                plan = tracker.plan_source(file_map)
+                logger.info(plan.summary())
+                if not plan.has_changes:
+                    logger.info("Source code unchanged — skipping")
+                    print(f"\n  ✓ Source code unchanged for {self.module} — skipping.\n")
+                    return
+                if not plan.is_first_run:
+                    stale_ids = list(plan.changed.keys()) + plan.deleted
+                    logger.info("Source code changed — cascade deleting %d file(s)", len(stale_ids))
+                    tracker.cascade_delete_source(stale_ids)
+                self._src_hashes = {k: v for k, v in plan.changed.items()}
+                self._src_hashes.update({fid: plan.changed.get(fid, "") for fid in plan.unchanged})
+                # rebuild full hash map for stamping (changed + unchanged)
+                self._src_all_hashes = {}
+                for fid, fp in file_map.items():
+                    self._src_all_hashes[fid] = plan.changed.get(fid) or _hash_file(fp)
+            else:
+                # --force: skip incremental plan, still stamp after ingestion
+                self._src_all_hashes = {
+                    f["file_id"]: _hash_file(Path(f["_abs_path"]))
+                    for f in self._files
+                    if "_abs_path" in f
+                }
+
             # Step 4: Create constraints + nodes
             logger.info("Step 3/5: Creating constraints and indexesΓÇª")
             self._create_constraints()
@@ -5234,9 +3700,39 @@ class SourceCodeKnowledgeGraphBuilder:
             logger.info("Step 5/5: Creating relationshipsΓÇª")
             self._create_relationships()
 
+            # ── Stamp project property on SRC_* nodes ──
+            if self.project:
+                self._stamp_project()
+
+            # ── Stamp hashes ──
+            if self._src_all_hashes:
+                tracker = IncrementalTracker(self._driver, self.module)
+                tracker.stamp_source(self._src_all_hashes)
+                logger.info("  Stamped source hashes for %s (%d files)", self.module, len(self._src_all_hashes))
+
             self._print_summary(time.time() - t0)
         finally:
             self._close()
+
+    # ======================================================================
+    # PROJECT STAMP
+    # ======================================================================
+
+    _SRC_NODE_LABELS = (
+        "SRC_SourceFile", "SRC_Function", "SRC_DataType",
+        "SRC_Macro", "SRC_GlobalVariable", "SRC_LocalVariable",
+    )
+
+    def _stamp_project(self):
+        """Set ``project`` property on all SRC_* nodes for this module."""
+        for label in self._SRC_NODE_LABELS:
+            cypher = (
+                f"MATCH (n:{label} {{module: $module}}) "
+                f"WHERE n.project IS NULL OR n.project <> $project "
+                f"SET n.project = $project"
+            )
+            self._write_tx(cypher, {"module": self.module, "project": self.project})
+            logger.info("  Stamped project='%s' on %s nodes (module=%s)", self.project, label, self.module)
 
     # ======================================================================
     # STEP 1: DISCOVER + PARSE
@@ -5350,7 +3846,7 @@ class SourceCodeKnowledgeGraphBuilder:
             return c_parser
         except ImportError:
             logger.warning(
-                "c_parser not found in IngestionPipeline ΓÇô "
+                "c_parser not found in IngestionPipeline -- "
                 "falling back to regex-only extraction"
             )
             return None
@@ -5621,6 +4117,7 @@ class SourceCodeKnowledgeGraphBuilder:
 
         return {
             "file_id": rel_path,
+            "_abs_path": str(fpath.resolve()),
             "file_name": fpath.name,
             "relative_path": rel_path,
             "file_type": "header" if is_header else "source",
@@ -6545,8 +5042,7 @@ class SourceCodeKnowledgeGraphBuilder:
         self._create_has_local_var_rels()
         self._create_uses_global_rels()
         self._create_includes_rels()
-        self._create_implements_swa_rels()
-        self._create_implements_swud_rels()
+        self._create_implements_ea_rels()
         self._create_traceability_rels()
         self._create_register_access_rels()
 
@@ -6851,88 +5347,58 @@ class SourceCodeKnowledgeGraphBuilder:
             self._write_tx(cypher, {"edges": chunk})
         self.stats["rel:SRC_INCLUDES"] = len(edges)
 
-    def _create_implements_swa_rels(self):
-        """SRC_Function ΓåÆ SWA_Function (by matching function name)."""
-        # Check if any SWA_Function nodes exist
+    def _create_implements_ea_rels(self):
+        """SRC_Function → EA_Function (by matching function name).
+
+        Matches source code function names against EA_Function.name from
+        the QEAX model.  No OCR fuzzy-matching needed since EA names come
+        directly from the model (not via PDF→Markdown).
+        """
         check = self._run(
-            "MATCH (s:SWA_Function {module: $module}) RETURN count(s) AS cnt",
+            "MATCH (s:EA_Function {module: $module}) RETURN count(s) AS cnt",
             {"module": self.module},
         )
-        swa_count = check[0]["cnt"] if check else 0
-        if swa_count == 0:
-            logger.info("  Skipping SRC_IMPLEMENTS_SWA (no SWA_Function nodes for %s)", self.module)
+        ea_count = check[0]["cnt"] if check else 0
+        if ea_count == 0:
+            logger.info("  Skipping SRC_IMPLEMENTS_EA (no EA_Function nodes for %s)", self.module)
             return
 
-        logger.info("  Creating SRC_IMPLEMENTS_SWA (matching against %d SWA functions)ΓÇª", swa_count)
+        logger.info("  Creating SRC_IMPLEMENTS_EA (matching against %d EA functions)…", ea_count)
         cypher = (
             "MATCH (src:SRC_Function {module: $module}) "
-            "MATCH (swa:SWA_Function {function_name: src.name, module: $module}) "
-            "MERGE (src)-[:SRC_IMPLEMENTS_SWA]->(swa)"
+            "MATCH (ea:EA_Function {name: src.name, module: $module}) "
+            "MERGE (src)-[:SRC_IMPLEMENTS_EA]->(ea)"
         )
         self._write_tx(cypher, {"module": self.module})
 
         count_res = self._run(
-            "MATCH (:SRC_Function)-[r:SRC_IMPLEMENTS_SWA]->(:SWA_Function) "
-            "RETURN count(r) AS cnt"
-        )
-        self.stats["rel:SRC_IMPLEMENTS_SWA"] = count_res[0]["cnt"] if count_res else 0
-
-    def _create_implements_swud_rels(self):
-        """SRC_Function → SWUD_Function (by matching function name).
-
-        Handles OCR artefact where PDF→Markdown conversion misreads
-        lowercase 'l' (local-function prefix) as uppercase 'I'.
-        E.g. SWUD has ``Dma_IChannelDeInit`` for source ``Dma_lChannelDeInit``.
-        A case-insensitive fallback with ``_l`` → ``_I`` replacement catches
-        these, including adjacent-case corruption (``Dma_IrpErrorChecks``
-        for ``Dma_lRpErrorChecks``).
-        """
-        check = self._run(
-            "MATCH (s:SWUD_Function {module: $module}) RETURN count(s) AS cnt",
-            {"module": self.module},
-        )
-        swud_count = check[0]["cnt"] if check else 0
-        if swud_count == 0:
-            logger.info("  Skipping SRC_IMPLEMENTS_SWUD (no SWUD_Function nodes for %s)", self.module)
-            return
-
-        logger.info("  Creating SRC_IMPLEMENTS_SWUD (matching against %d SWUD functions)…", swud_count)
-
-        # --- Pass 1: exact name match (fast, indexed) ---
-        cypher_exact = (
-            "MATCH (src:SRC_Function {module: $module}) "
-            "MATCH (swud:SWUD_Function {function_name: src.name, module: $module}) "
-            "MERGE (src)-[:SRC_IMPLEMENTS_SWUD]->(swud)"
-        )
-        self._write_tx(cypher_exact, {"module": self.module})
-
-        # --- Pass 2: OCR l→I fuzzy match for remaining unlinked functions ---
-        # Only targets SRC functions with '_l' (local prefix) that have no
-        # SRC_IMPLEMENTS_SWUD edge yet, matching SWUD names where '_l' was
-        # OCR'd to '_I' (case-insensitive to handle adjacent-char corruption).
-        cypher_ocr = (
-            "MATCH (src:SRC_Function {module: $module}) "
-            "WHERE src.name CONTAINS '_l' "
-            "AND NOT EXISTS { MATCH (src)-[:SRC_IMPLEMENTS_SWUD]->() } "
-            "MATCH (swud:SWUD_Function {module: $module}) "
-            "WHERE toLower(swud.function_name) = toLower(replace(src.name, '_l', '_I')) "
-            "AND NOT EXISTS { MATCH ()-[:SRC_IMPLEMENTS_SWUD]->(swud) } "
-            "MERGE (src)-[:SRC_IMPLEMENTS_SWUD]->(swud)"
-        )
-        self._write_tx(cypher_ocr, {"module": self.module})
-
-        count_res = self._run(
-            "MATCH (:SRC_Function {module: $module})-[r:SRC_IMPLEMENTS_SWUD]->(:SWUD_Function) "
+            "MATCH (:SRC_Function {module: $module})-[r:SRC_IMPLEMENTS_EA]->(:EA_Function) "
             "RETURN count(r) AS cnt",
             {"module": self.module},
         )
-        self.stats["rel:SRC_IMPLEMENTS_SWUD"] = count_res[0]["cnt"] if count_res else 0
+        self.stats["rel:SRC_IMPLEMENTS_EA"] = count_res[0]["cnt"] if count_res else 0
+
+        # Propagate is_isr from EA_Function to SRC_Function
+        self._write_tx(
+            "MATCH (src:SRC_Function {module: $module})-[:SRC_IMPLEMENTS_EA]->(ea:EA_Function) "
+            "WHERE ea.is_isr IS NOT NULL "
+            "SET src.is_isr = ea.is_isr",
+            {"module": self.module},
+        )
+        isr_res = self._run(
+            "MATCH (f:SRC_Function {module: $module}) WHERE f.is_isr = true "
+            "RETURN count(f) AS cnt",
+            {"module": self.module},
+        )
+        isr_count = isr_res[0]["cnt"] if isr_res else 0
+        if isr_count > 0:
+            logger.info("  Propagated is_isr=true to %d SRC_Functions from EA_Function", isr_count)
 
     def _create_traceability_rels(self):
-        """SRC_* -[SRC_TRACES_TO]ΓåÆ SWUD_* / SWA_* / ProductRequirement.
+        """SRC_* -[SRC_TRACES_TO]→ EA_* / ProductRequirement.
 
         Source code ``[cover parentID={GUID}]`` tags reference design items
-        by their ``feature_id`` (UUID) stored on SWUD_* and SWA_* nodes.
+        by their ``feature_id`` (ea_guid) stored on EA_* nodes.
         As a fallback, also tries ``global_id`` on requirement nodes.
         """
         # Collect all (node_type, uid_prop, item) with non-empty traceability_ids
@@ -6981,13 +5447,12 @@ class SourceCodeKnowledgeGraphBuilder:
                 for e in edges_for_type
             ]
             for chunk in self._chunked(batch, self.BATCH_SIZE):
-                # Match against feature_id on SWUD_*/SWA_* nodes (case-insensitive)
+                # Match against feature_id on EA_* nodes (case-insensitive)
                 cypher_design = (
                     "UNWIND $edges AS e "
                     f"MATCH (src:{node_type} {{{uid_prop}: e.uid}}) "
                     "MATCH (tgt) "
-                    "WHERE (any(lbl IN labels(tgt) WHERE lbl STARTS WITH 'SWUD_') "
-                    "   OR any(lbl IN labels(tgt) WHERE lbl STARTS WITH 'SWA_')) "
+                    "WHERE any(lbl IN labels(tgt) WHERE lbl STARTS WITH 'EA_') "
                     "AND toUpper(tgt.feature_id) = toUpper(e.guid) "
                     "MERGE (src)-[r:SRC_TRACES_TO]->(tgt) "
                     "SET r.guid = e.guid"
@@ -7106,29 +5571,30 @@ class SourceCodeKnowledgeGraphBuilder:
 
         sfr_edges_created = 0
         for chunk in self._chunked(edge_batch, self.BATCH_SIZE):
-            # Match by exact name first, then by suffix (_NORM_NAME)
+            # Match by exact name or suffix — no module filter so cross-module
+            # edges (e.g. ADC → EGTM/SCU registers) are created too.
             if target_device:
                 cypher = (
                     "UNWIND $items AS item "
                     "MATCH (f:SRC_Function {function_id: item.func_id}) "
-                    "MATCH (r:SFR_Register {module: $module, device: $device}) "
+                    "MATCH (r:SFR_Register {device: $device}) "
                     "WHERE r.name = item.register_name "
                     "   OR r.name ENDS WITH ('_' + item.norm_name) "
                     "MERGE (f)-[rel:SRC_ACCESSES_SFR {access_type: item.access_type}]->(r) "
                     "SET rel.field = item.field"
                 )
-                self._write_tx(cypher, {"items": chunk, "module": self.module, "device": target_device})
+                self._write_tx(cypher, {"items": chunk, "device": target_device})
             else:
                 cypher = (
                     "UNWIND $items AS item "
                     "MATCH (f:SRC_Function {function_id: item.func_id}) "
-                    "MATCH (r:SFR_Register {module: $module}) "
+                    "MATCH (r:SFR_Register) "
                     "WHERE r.name = item.register_name "
                     "   OR r.name ENDS WITH ('_' + item.norm_name) "
                     "MERGE (f)-[rel:SRC_ACCESSES_SFR {access_type: item.access_type}]->(r) "
                     "SET rel.field = item.field"
                 )
-                self._write_tx(cypher, {"items": chunk, "module": self.module})
+                self._write_tx(cypher, {"items": chunk})
             sfr_edges_created += len(chunk)
 
         self.stats["register_access_functions"] = len(by_func)
@@ -7141,7 +5607,7 @@ class SourceCodeKnowledgeGraphBuilder:
 
     def _preview(self):
         print("\n" + "=" * 60)
-        print(f"  DRY-RUN PREVIEW ΓÇô Source Code Ingestion, Module: {self.module}")
+        print(f"  DRY-RUN PREVIEW -- Source Code Ingestion, Module: {self.module}")
         print("=" * 60)
 
         print(f"\n  Source directory: {self.source_dir}")
@@ -7162,9 +5628,9 @@ class SourceCodeKnowledgeGraphBuilder:
             print(f"    :{label:<25s}  {len(items):>6,d} nodes  [merge key: {uid}]")
             for item in items[:3]:
                 name = item.get("name", item.get("file_name", item.get(uid, "?")))
-                print(f"      ΓÇó {name}")
+                print(f"      - {name}")
             if len(items) > 3:
-                print(f"      ΓÇª and {len(items) - 3} more")
+                print(f"      ... and {len(items) - 3} more")
 
         total = (len(self._files) + len(self._functions) + len(self._data_types)
                  + len(self._macros) + len(self._global_variables) + len(self._local_variables))
@@ -7213,7 +5679,7 @@ class SourceCodeKnowledgeGraphBuilder:
 
     def _print_summary(self, elapsed: float):
         print("\n" + "=" * 60)
-        print(f"  BUILD COMPLETE ΓÇô Source Code Ingestion, Module: {self.module}")
+        print(f"  BUILD COMPLETE -- Source Code Ingestion, Module: {self.module}")
         print(f"  Elapsed: {elapsed:.1f}s")
         print("=" * 60)
 
@@ -7275,10 +5741,10 @@ class SFRKnowledgeGraphBuilder:
     module across all (or selected) device variants.
 
     Node types created:
-        - SFR_File          ΓÇô one per header file per device
-        - SFR_Register      ΓÇô one per typedef struct per device
-        - SFR_BitField      ΓÇô one per bitfield member per device
-        - SFR_BaseAddress   ΓÇô one per base-address macro per device
+        - SFR_File          -- one per header file per device
+        - SFR_Register      -- one per typedef struct per device
+        - SFR_BitField      -- one per bitfield member per device
+        - SFR_BaseAddress   -- one per base-address macro per device
 
     Relationships created:
         - SFR_DEFINED_IN        (register/base_addr ΓåÆ file)
@@ -7311,11 +5777,15 @@ class SFRKnowledgeGraphBuilder:
         sfr_dir: Path,
         dry_run: bool = False,
         devices: Optional[list[str]] = None,
+        force_incremental: bool = False,
+        project: Optional[str] = None,
     ):
         self.neo4j_cfg = neo4j_cfg
         self.module = module.upper()
         self.sfr_dir = Path(sfr_dir)
         self.dry_run = dry_run
+        self.force_incremental = force_incremental
+        self.project = project
         self.devices = devices          # None ΓåÆ all devices
         self.stats: dict = Counter()
         self._driver = None
@@ -7401,7 +5871,7 @@ class SFRKnowledgeGraphBuilder:
         t0 = time.time()
 
         logger.info("=" * 60)
-        logger.info("SFR KG Builder ΓÇô module: %s", self.module)
+        logger.info("SFR KG Builder -- module: %s", self.module)
         logger.info("SFR directory: %s", self.sfr_dir)
         logger.info("Devices: %s", self.devices or "ALL")
         logger.info("Dry run: %s", self.dry_run)
@@ -7440,20 +5910,81 @@ class SFRKnowledgeGraphBuilder:
         self._connect()
 
         try:
+            # ── Incremental check ──
+            if not self.force_incremental:
+                # Build file_map from parsed self._files which have the
+                # correct composite file_id (e.g. "SFR:TC44xA:...").
+                file_map = {
+                    f["file_id"]: Path(f["path"])
+                    for f in self._files
+                }
+                tracker = IncrementalTracker(self._driver, self.module)
+                plan = tracker.plan_sfr(file_map)
+                logger.info(plan.summary())
+                if not plan.has_changes:
+                    logger.info("SFR files unchanged — skipping")
+                    print(f"\n  ✓ SFR files unchanged for {self.module} — skipping.\n")
+                    return
+                if not plan.is_first_run:
+                    stale_ids = list(plan.changed.keys()) + plan.deleted
+                    logger.info("SFR changed — cascade deleting %d file(s)", len(stale_ids))
+                    tracker.cascade_delete_sfr(stale_ids)
+                self._sfr_all_hashes = {}
+                for fid, fp in file_map.items():
+                    self._sfr_all_hashes[fid] = plan.changed.get(fid) or _hash_file(fp)
+            else:
+                # --force: skip incremental plan, still stamp after ingestion
+                self._sfr_all_hashes = {
+                    f["file_id"]: _hash_file(Path(f["path"]))
+                    for f in self._files
+                }
+
             # Step 3: Create constraints + nodes
             logger.info("Step 2/4: Creating constraints and indexesΓÇª")
             self._create_constraints()
 
-            logger.info("Step 3/4: Creating nodesΓÇª")
+            logger.info("Step 3/4: Creating nodes…")
             self._create_nodes()
 
+            # Step 3b: Auto-detect and ingest cross-module SFR dependencies
+            self._ingest_cross_module_sfrs()
+
             # Step 4: Create relationships
-            logger.info("Step 4/4: Creating relationshipsΓÇª")
+            logger.info("Step 4/4: Creating relationships…")
             self._create_relationships()
+
+            # ── Stamp project property on SFR_* nodes ──
+            if self.project:
+                self._stamp_project()
+
+            # ── Stamp hashes ──
+            if self._sfr_all_hashes:
+                tracker = IncrementalTracker(self._driver, self.module)
+                tracker.stamp_sfr(self._sfr_all_hashes)
+                logger.info("  Stamped SFR hashes for %s (%d files)", self.module, len(self._sfr_all_hashes))
 
             self._print_summary(time.time() - t0)
         finally:
             self._close()
+
+    # ======================================================================
+    # PROJECT STAMP
+    # ======================================================================
+
+    _SFR_NODE_LABELS = (
+        "SFR_File", "SFR_Register", "SFR_BitField", "SFR_BaseAddress",
+    )
+
+    def _stamp_project(self):
+        """Set ``project`` property on all SFR_* nodes for this module."""
+        for label in self._SFR_NODE_LABELS:
+            cypher = (
+                f"MATCH (n:{label} {{module: $module}}) "
+                f"WHERE n.project IS NULL OR n.project <> $project "
+                f"SET n.project = $project"
+            )
+            self._write_tx(cypher, {"module": self.module, "project": self.project})
+            logger.info("  Stamped project='%s' on %s nodes (module=%s)", self.project, label, self.module)
 
     # ======================================================================
     # CONSTRAINTS
@@ -7517,7 +6048,138 @@ class SFRKnowledgeGraphBuilder:
                 self._write_tx(cypher, {"items": chunk})
 
             self.stats[f"nodes:{node_type}"] = len(items)
-            logger.info("    ΓåÆ created/merged %d :%s nodes", len(items), node_type)
+            logger.info("    → created/merged %d :%s nodes", len(items), node_type)
+
+    # ======================================================================
+    # CROSS-MODULE SFR INGESTION
+    # ======================================================================
+
+    def _ingest_cross_module_sfrs(self):
+        """Auto-detect and ingest SFR headers for cross-referenced modules.
+
+        Reads ``register_accesses`` JSON from SRC_Function nodes for this
+        module, extracts register name prefixes (e.g. EGTM_, SCU_) that
+        don't match the current module, and parses SFR headers for those
+        additional modules — creating the SFR_Register nodes needed for
+        cross-module SRC_ACCESSES_SFR edges.
+        """
+        # Read register names from SRC_Function.register_accesses
+        src_rows = self._run(
+            "MATCH (f:SRC_Function {module: $module}) "
+            "WHERE f.register_accesses IS NOT NULL "
+            "RETURN f.register_accesses AS ra",
+            {"module": self.module},
+        )
+        if not src_rows:
+            return
+
+        # Collect all unique register name prefixes
+        import re as _re_prefix
+        all_prefixes: set[str] = set()
+        for row in src_rows:
+            try:
+                accesses = json.loads(row["ra"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for entry in accesses:
+                reg = entry.get("register", "")
+                # Extract prefix: "EGTM_CLS_ATOM_..." → "EGTM"
+                m = _re_prefix.match(r'^([A-Z]{2,}?)_', reg)
+                if m:
+                    all_prefixes.add(m.group(1))
+
+        # Filter out the current module and already-ingested modules
+        ingested_modules = {r["module"] for r in self._registers}
+        cross_prefixes = {
+            p for p in all_prefixes
+            if p not in ingested_modules and p != self.module
+        }
+
+        if not cross_prefixes:
+            return
+
+        # Discover available SFR modules in the repo
+        devices = self.devices or discover_devices(self.sfr_dir)
+        if not devices:
+            return
+        available_modules = {
+            m.upper(): m
+            for m in discover_modules(self.sfr_dir, devices[0])
+        }
+
+        # Match prefixes to available modules
+        modules_to_ingest = []
+        for prefix in sorted(cross_prefixes):
+            if prefix in available_modules:
+                modules_to_ingest.append(available_modules[prefix])
+
+        if not modules_to_ingest:
+            logger.info("  No cross-module SFR headers found for prefixes: %s",
+                        ", ".join(sorted(cross_prefixes)))
+            return
+
+        logger.info("  Auto-ingesting cross-module SFR headers for: %s",
+                     ", ".join(modules_to_ingest))
+
+        # Parse and ingest SFR headers for each cross-module
+        for xmod in modules_to_ingest:
+            xmod_upper = xmod.upper()
+            # Check if already ingested in Neo4j
+            existing = self._run(
+                "MATCH (r:SFR_Register {module: $module}) RETURN count(r) AS cnt",
+                {"module": xmod_upper},
+            )
+            if existing and existing[0]["cnt"] > 0:
+                logger.info("    %s: %d SFR_Register nodes already exist — skipping",
+                            xmod_upper, existing[0]["cnt"])
+                # Add to self._registers so edge creation can find them
+                existing_regs = self._run(
+                    "MATCH (r:SFR_Register {module: $module}) "
+                    "RETURN r.register_id AS register_id, r.name AS name, "
+                    "r.device AS device, r.module AS module",
+                    {"module": xmod_upper},
+                )
+                self._registers.extend(existing_regs)
+                continue
+
+            try:
+                xfiles, xregs, xbfs, xbas = parse_sfr_repo(
+                    repo_dir=self.sfr_dir,
+                    module=xmod,
+                    devices=self.devices,
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                logger.warning("    %s: Failed to parse SFR headers: %s", xmod, exc)
+                continue
+
+            if not xregs:
+                logger.info("    %s: No registers found", xmod)
+                continue
+
+            logger.info("    %s: Parsed %d registers, %d bitfields",
+                        xmod_upper, len(xregs), len(xbfs))
+
+            # Create nodes using same batch approach
+            for node_type, items, uid_key in [
+                ("SFR_File", xfiles, "file_id"),
+                ("SFR_Register", xregs, "register_id"),
+                ("SFR_BitField", xbfs, "bitfield_id"),
+                ("SFR_BaseAddress", xbas, "base_address_id"),
+            ]:
+                if not items:
+                    continue
+                for chunk in [items[i:i+self.BATCH_SIZE]
+                              for i in range(0, len(items), self.BATCH_SIZE)]:
+                    cypher = (
+                        f"UNWIND $items AS item "
+                        f"MERGE (n:{node_type} {{{uid_key}: item.{uid_key}}}) "
+                        f"SET n += item"
+                    )
+                    self._write_tx(cypher, {"items": chunk})
+
+            # Add to self._registers for edge creation
+            self._registers.extend(xregs)
+            self.stats[f"cross_module:{xmod_upper}:registers"] = len(xregs)
 
     # ======================================================================
     # CREATE RELATIONSHIPS
@@ -7620,11 +6282,12 @@ class SFRKnowledgeGraphBuilder:
         self.stats["rel:SFR_BELONGS_TO_MODULE"] = count_res[0]["cnt"] if count_res else 0
 
     def _create_src_accesses_sfr_rels(self):
-        """SRC_Function -[SRC_ACCESSES_SFR]ΓåÆ SFR_Register.
+        """SRC_Function -[SRC_ACCESSES_SFR]→ SFR_Register.
 
-        Cross-links source code functions to SFR registers by matching
-        register names found in the existing SRC_Function nodes'
-        ``register_accesses`` data against ingested SFR_Register names.
+        Cross-links source code functions to SFR registers by parsing
+        the ``register_accesses`` JSON property on SRC_Function nodes
+        and matching register names against ingested SFR_Register names.
+        Stores ``access_type`` (READ/WRITE/READ_WRITE) on every edge.
         """
         # Check if there are any SRC_Function nodes to link
         src_check = self._run(
@@ -7632,48 +6295,93 @@ class SFRKnowledgeGraphBuilder:
             {"module": self.module},
         )
         if not src_check or src_check[0]["cnt"] == 0:
-            logger.info("  No SRC_Function nodes for module %s ΓÇö skipping SRC_ACCESSES_SFR", self.module)
+            logger.info("  No SRC_Function nodes for module %s — skipping SRC_ACCESSES_SFR", self.module)
             return
 
-        # Build a set of register names we've ingested (without device prefix)
+        # Clean up existing SRC_ACCESSES_SFR edges for this module
+        logger.info("  Removing existing SRC_ACCESSES_SFR edges for module %s...", self.module)
+        self._write_tx(
+            "MATCH (f:SRC_Function {module: $module})-[r:SRC_ACCESSES_SFR]->() DELETE r",
+            {"module": self.module},
+        )
+
+        # Build a set of register names we've ingested (across all devices)
         reg_names = {r["name"] for r in self._registers}
 
-        # For each device, try to link SRC functions ΓåÆ SFR registers
-        # The SRC_Function nodes have a `register_accesses` JSON property
-        # that lists register names accessed by the function.
-        # We match those against our SFR_Register.name property.
+        # Read register_accesses JSON from all SRC_Function nodes for this module
+        src_rows = self._run(
+            "MATCH (f:SRC_Function {module: $module}) "
+            "WHERE f.register_accesses IS NOT NULL "
+            "RETURN f.function_id AS fid, f.register_accesses AS ra",
+            {"module": self.module},
+        )
+        if not src_rows:
+            logger.info("  No SRC_Function nodes with register_accesses for module %s", self.module)
+            return
+
+        # Parse JSON and build (function_id, register, access_type) triples
+        import re as _re_norm
+        edge_set: set = set()
+        edge_batch: list[dict] = []
+        for row in src_rows:
+            try:
+                accesses = json.loads(row["ra"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for entry in accesses:
+                reg = entry.get("register", "")
+                access_type = entry.get("access_type", "READ")
+                if not reg or len(reg) < 3:
+                    continue
+                # Normalize: strip array subscripts, replace dots
+                norm = _re_norm.sub(r'\[.*?\]', '', reg).replace('.', '_')
+                # Only create edge if we have a matching SFR_Register
+                if reg not in reg_names and not any(
+                    rn.endswith("_" + norm) for rn in reg_names
+                ):
+                    continue
+                key = (row["fid"], norm, access_type)
+                if key not in edge_set:
+                    edge_set.add(key)
+                    edge_batch.append({
+                        "func_id": row["fid"],
+                        "register_name": reg,
+                        "norm_name": norm,
+                        "access_type": access_type,
+                    })
+
+        if not edge_batch:
+            logger.info("    No register accesses matched SFR_Register names")
+            self.stats["rel:SRC_ACCESSES_SFR"] = 0
+            return
+
+        logger.info("  Creating SRC_ACCESSES_SFR edges for %d unique accesses…", len(edge_batch))
         devices = sorted({r["device"] for r in self._registers})
-        total = 0
 
         for device in devices:
-            # Get device-specific register names
-            device_regs = {r["name"] for r in self._registers if r["device"] == device}
-
-            cypher = (
-                "MATCH (f:SRC_Function {module: $module}) "
-                "WHERE f.register_accesses IS NOT NULL "
-                "WITH f "
-                "UNWIND $reg_names AS rname "
-                "WITH f, rname "
-                "WHERE f.register_accesses CONTAINS rname "
-                "MATCH (r:SFR_Register {name: rname, device: $device}) "
-                "MERGE (f)-[:SRC_ACCESSES_SFR]->(r)"
-            )
-            self._write_tx(cypher, {
-                "module": self.module,
-                "device": device,
-                "reg_names": list(device_regs),
-            })
+            for chunk in [edge_batch[i:i+self.BATCH_SIZE]
+                          for i in range(0, len(edge_batch), self.BATCH_SIZE)]:
+                cypher = (
+                    "UNWIND $items AS item "
+                    "MATCH (f:SRC_Function {function_id: item.func_id}) "
+                    "MATCH (r:SFR_Register {device: $device}) "
+                    "WHERE r.name = item.register_name "
+                    "   OR r.name ENDS WITH ('_' + item.norm_name) "
+                    "MERGE (f)-[rel:SRC_ACCESSES_SFR]->(r) "
+                    "SET rel.access_type = item.access_type"
+                )
+                self._write_tx(cypher, {"items": chunk, "device": device})
 
         count_res = self._run(
-            "MATCH ()-[r:SRC_ACCESSES_SFR]->() RETURN count(r) AS cnt"
+            "MATCH (f:SRC_Function {module: $module})-[r:SRC_ACCESSES_SFR]->() RETURN count(r) AS cnt",
+            {"module": self.module},
         )
         total = count_res[0]["cnt"] if count_res else 0
         self.stats["rel:SRC_ACCESSES_SFR"] = total
         if total:
-            logger.info("    ΓåÆ %d SRC_ACCESSES_SFR edges created", total)
+            logger.info("    → %d SRC_ACCESSES_SFR edges created (with access_type)", total)
         else:
-            logger.info("    No SRC_ACCESSES_SFR cross-links found (source code may not store register names)")
+            logger.info("    No SRC_ACCESSES_SFR cross-links found")
 
     # ======================================================================
     # DRY-RUN PREVIEW
@@ -7681,7 +6389,7 @@ class SFRKnowledgeGraphBuilder:
 
     def _preview(self):
         print("\n" + "=" * 60)
-        print(f"  DRY-RUN PREVIEW ΓÇô SFR Ingestion, Module: {self.module}")
+        print(f"  DRY-RUN PREVIEW -- SFR Ingestion, Module: {self.module}")
         print("=" * 60)
 
         devices = sorted({f["device"] for f in self._files})
@@ -7700,9 +6408,9 @@ class SFRKnowledgeGraphBuilder:
             for item in items[:3]:
                 name = item.get("name", item.get("file_name", item.get(uid, "?")))
                 dev = item.get("device", "")
-                print(f"      ΓÇó {dev}/{name}")
+                print(f"      - {dev}/{name}")
             if len(items) > 3:
-                print(f"      ΓÇª and {len(items) - 3} more")
+                print(f"      ... and {len(items) - 3} more")
 
         total = (len(self._files) + len(self._registers)
                  + len(self._bitfields) + len(self._base_addresses))
@@ -7728,7 +6436,7 @@ class SFRKnowledgeGraphBuilder:
 
     def _print_summary(self, elapsed: float):
         print("\n" + "=" * 60)
-        print(f"  BUILD COMPLETE ΓÇô SFR Ingestion, Module: {self.module}")
+        print(f"  BUILD COMPLETE -- SFR Ingestion, Module: {self.module}")
         print(f"  Elapsed: {elapsed:.1f}s")
         print("=" * 60)
 
@@ -7783,7 +6491,7 @@ def select_profile(ontology: dict) -> str:
         raise ValueError("No profiles found in ontology.")
 
     print("\n" + "=" * 60)
-    print("  Knowledge Graph Builder ΓÇô Profile Selection")
+    print("  Knowledge Graph Builder -- Profile Selection")
     print("=" * 60)
     print("\n  Available profiles:\n")
 
@@ -7797,7 +6505,7 @@ def select_profile(ontology: dict) -> str:
 
         print(f"    [{i}] {pname}")
         print(f"        {meta.get('name', pname)}")
-        print(f"        {desc[:100]}ΓÇª" if len(desc) > 100 else f"        {desc}")
+        print(f"        {desc[:100]}..." if len(desc) > 100 else f"        {desc}")
         print(f"        Node types: {node_count}  |  Relationship types: {rel_count}  |  Modules: {len(modules)}")
         print()
 
@@ -7833,7 +6541,7 @@ def main():
     )
     parser.add_argument(
         "--profile",
-        choices=["mcal", "illd"],
+        choices=["mcal", "illd", "test", "local"],
         default=None,
         help="Ontology profile to use. If omitted, you will be prompted.",
     )
@@ -7879,46 +6587,25 @@ def main():
         help="Re-fetch folder hierarchy from Jama API even if a cached file exists (MCAL only).",
     )
     parser.add_argument(
-        "--ingest-swa",
+        "--ingest-ea",
         action="store_true",
         help=(
-            "Ingest SWA (Software Architecture) markdown sections into the "
-            "MCAL database.  Parses section_*_raw.md files from the SWA "
-            "directory and creates SWA_ArchitecturalDecision, SWA_HwPeripheral, "
-            "SWA_SwDependency, SWA_ConfigContainer, SWA_ConfigParam nodes "
-            "plus traceability relationships to existing PRQ requirements."
+            "Ingest EA (Enterprise Architect) model data from a QEAX file "
+            "into the MCAL database.  Extracts elements, connectors, and "
+            "diagram structure and creates EA_Function, EA_DataType, "
+            "EA_ConfigParameter, EA_ConfigContainer, EA_ConfigMacro, "
+            "EA_ErrorCode, EA_Requirement, EA_DesignDecision, EA_Diagram "
+            "(and more) nodes plus 17 EA relationship types.  "
+            "Replaces the former --ingest-swa and --ingest-swud flags."
         ),
     )
     parser.add_argument(
-        "--swa-dir",
+        "--qeax-path",
         type=Path,
         default=None,
         help=(
-            "Override path to SWA markdown directory. "
-            "Default: swa/ under the HybridRAG root. "
-            "Should contain section_*_raw.md files produced by prepare_markdowns.py."
-        ),
-    )
-    parser.add_argument(
-        "--ingest-swud",
-        action="store_true",
-        help=(
-            "Ingest SWUD (Software Unit Design) markdown sections into the "
-            "MCAL database.  Parses the SWUD markdown files and creates "
-            "SWUD_Function, SWUD_TypeDefinition, SWUD_DerivedConfigParam, "
-            "SWUD_DesignDecision, SWUD_DataVariable, SWUD_CriticalSection, "
-            "SWUD_MemorySection, SWUD_ConfigStructure, SWUD_CodeGenMacro nodes "
-            "plus traceability relationships to existing PRQ requirements."
-        ),
-    )
-    parser.add_argument(
-        "--swud-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Override path to SWUD markdown directory. "
-            "Default: swud/ under the HybridRAG root. "
-            "Should contain the converted SWUD markdown file(s)."
+            "Path to the .qeax (Enterprise Architect) model file.  "
+            "Default: see DEFAULT_QEAX in source."
         ),
     )
     parser.add_argument(
@@ -7930,7 +6617,7 @@ def main():
             "Static source code IF tests, WCET analysis) and creates "
             "TS_FunctionalTestCase, TS_ConfigTestCase, TS_StaticInterfaceTestCase, "
             "TS_WCETTestCase, TS_TestSpecDocument nodes plus traceability "
-            "relationships to existing PRQ, SWA, and SWUD nodes."
+            "relationships to existing PRQ and EA_* nodes."
         ),
     )
     parser.add_argument(
@@ -7951,7 +6638,7 @@ def main():
             "MCAL database.  Parses all .c and .h files under ssc/ and "
             "Plugins/ sub-trees and creates SRC_SourceFile, SRC_Function, "
             "SRC_DataType, SRC_Macro nodes plus call-graph and traceability "
-            "relationships to existing SWA, SWUD, and PRQ nodes."
+            "relationships to existing EA_* and PRQ nodes."
         ),
     )
     parser.add_argument(
@@ -8040,6 +6727,11 @@ def main():
         ),
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force full re-ingestion even if content hashes match (bypass incremental check).",
+    )
+    parser.add_argument(
         "--clear",
         action="store_true",
         help="Delete all existing data in the target database before building.",
@@ -8054,6 +6746,15 @@ def main():
         type=int,
         default=500,
         help="Number of items per UNWIND batch (default: 500).",
+    )
+    parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help=(
+            "Project tag to stamp on all nodes (e.g. A3G, RC1). "
+            "When set, every node with module=<MODULE> gets a 'project' property."
+        ),
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -8105,30 +6806,18 @@ def main():
         return
 
     # -----------------------------------------------------------------------
-    # Dispatch: --ingest-swa and/or --ingest-swud
-    # Both flags can be combined in a single invocation.
+    # Dispatch: --ingest-ea  (EA model from QEAX)
     # -----------------------------------------------------------------------
     ran_doc_ingest = False
 
-    if args.ingest_swa:
-        swa_dir = args.swa_dir or SWA_DIR
-        builder = SWAKnowledgeGraphBuilder(
+    if args.ingest_ea:
+        qeax_path = args.qeax_path or DEFAULT_QEAX
+        builder = EAKnowledgeGraphBuilder(
             neo4j_cfg=neo4j_cfg,
             module=module,
-            swa_dir=swa_dir,
+            qeax_path=qeax_path,
             dry_run=args.dry_run,
-        )
-        builder.BATCH_SIZE = args.batch_size
-        builder.build()
-        ran_doc_ingest = True
-
-    if args.ingest_swud:
-        swud_dir = args.swud_dir or SWUD_DIR
-        builder = SWUDKnowledgeGraphBuilder(
-            neo4j_cfg=neo4j_cfg,
-            module=module,
-            swud_dir=swud_dir,
-            dry_run=args.dry_run,
+            clear=args.clear,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()
@@ -8141,6 +6830,7 @@ def main():
             module=module,
             testspec_dir=testspec_dir,
             dry_run=args.dry_run,
+            force_incremental=args.force,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()
@@ -8173,6 +6863,8 @@ def main():
             sum_mode=args.sum_mode,
             sum_configs=args.sum_configs,
             force_fetch=args.force_fetch,
+            force_incremental=args.force,
+            project=args.project,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()
@@ -8188,12 +6880,16 @@ def main():
             sfr_dir=sfr_dir,
             dry_run=args.dry_run,
             devices=args.sfr_device,
+            force_incremental=args.force,
+            project=args.project,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()
         ran_doc_ingest = True
 
     if ran_doc_ingest:
+        if args.project and not args.dry_run:
+            _stamp_project_on_module(neo4j_cfg, module, args.project)
         return
 
     # -----------------------------------------------------------------------
@@ -8236,9 +6932,14 @@ def main():
         relationships_path=relationships_path,
         folders_path=folders_path,
         jama_cfg=jama_cfg,
+        module=module,
+        force_incremental=args.force,
     )
     builder.BATCH_SIZE = args.batch_size
     builder.build()
+
+    if args.project and not args.dry_run:
+        _stamp_project_on_module(neo4j_cfg, module, args.project)
 
 
 if __name__ == "__main__":

@@ -485,7 +485,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--instance",
-        choices=["illd", "mcal"],
+        choices=["illd", "mcal", "test", "local"],
         default=None,
         help="Instance to use (defaults to active_instance in config)",
     )

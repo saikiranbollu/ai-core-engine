@@ -63,6 +63,15 @@ del _saved_paths, _saved_mcp, _repo_root, _il
 from .auth_middleware import check_authorization, extract_workspace_id, _err_permission_denied
 from .tool_tiers import TOOL_TIERS
 
+# ── Path bootstrapping: make src/ importable ──────────────────────────────
+# Must happen BEFORE the metrics import, which uses `from src.Observability...`
+_MCP_DIR = Path(__file__).resolve().parent          # mcp/core/
+_REPO_ROOT = _MCP_DIR.parents[1]                    # repo root
+_SRC_DIR = _REPO_ROOT / "src"
+for _p in (_REPO_ROOT, _SRC_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
 # ── Prometheus metrics (graceful degradation) ─────────────────────────────
 try:
     from src.Observability.metrics import (
@@ -106,14 +115,6 @@ except ImportError:
     CACHE_SIZE = _noop
     ERROR_TOTAL = _noop
     INGESTION_DURATION = _noop
-
-# ── Path bootstrapping: make src/ importable ──────────────────────────────
-_MCP_DIR = Path(__file__).resolve().parent          # mcp/core/
-_REPO_ROOT = _MCP_DIR.parents[1]                    # repo root
-_SRC_DIR = _REPO_ROOT / "src"
-for _p in (_REPO_ROOT, _SRC_DIR):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -213,6 +214,10 @@ def _authorize(tool_name: str, **kw) -> Optional[str]:
     Returns ``None`` if allowed, or a JSON error string (PERMISSION_DENIED)
     if denied.  The caller should return the error string immediately.
     """
+    # ── Set per-tool timing context for Prometheus metrics ──
+    _tool_name_ctx.set(tool_name)
+    _tool_start_time.set(time.time())
+
     api_key = _current_api_key.get("") or os.environ.get("MCP_API_KEY", "")
     if not api_key:
         return _err_permission_denied("No API key provided (set MCP_API_KEY env var or send Authorization header)")
@@ -282,7 +287,15 @@ def with_session_routing(tool_name: str):
 
 
 # ── Lazy backend connections (BUG FIX #3: creds from env only) ─────────────
-_neo4j_drivers: Dict[str, Any] = {}     # keyed by profile ("illd", "mcal")
+#
+# Neo4j instance binding:
+#   Each MCP deployment is bound to exactly ONE Neo4j instance, set via
+#   MCP_NEO4J_INSTANCE env var (e.g. "local", "test", "mcal").
+#   The workspace_id ("illd"/"mcal") is purely an ontology concept and
+#   does NOT influence which Neo4j server is used.
+#
+_NEO4J_INSTANCE: str = os.environ.get("MCP_NEO4J_INSTANCE", "")
+_neo4j_driver = None          # single shared driver for the bound instance
 _qdrant_client = None
 _redis_client = None
 
@@ -302,36 +315,48 @@ def _load_neo4j_profile_config(profile: str) -> Optional[Dict[str, Any]]:
         return None
 
 def _get_neo4j(profile: str = "illd"):
-    """Return a Neo4j driver for *profile*, creating one if needed.
+    """Return the shared Neo4j driver for this MCP deployment.
 
-    Resolution order:
-      1. storage_config.yaml (per-profile URI + credentials)
-      2. NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD env vars (legacy fallback)
+    The Neo4j instance is determined by the MCP_NEO4J_INSTANCE env var,
+    NOT by the workspace_id/profile parameter.  All workspaces ("illd",
+    "mcal") share the same driver because they live in the same database.
+
+    Resolution order for the connection URI:
+      1. MCP_NEO4J_INSTANCE env var → storage_config.yaml[neo4j][<instance>]
+      2. NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD env vars (K8s / legacy)
     """
-    if profile in _neo4j_drivers:
-        return _neo4j_drivers[profile]
+    global _neo4j_driver
+    if _neo4j_driver is not None:
+        return _neo4j_driver
+
+    # Resolve which storage_config profile to use for the connection
+    instance = _NEO4J_INSTANCE  # e.g. "local", "test", "mcal"
+
     try:
         from neo4j import GraphDatabase
-        cfg = _load_neo4j_profile_config(profile)
+        cfg = _load_neo4j_profile_config(instance) if instance else None
         if cfg:
             uri = cfg["uri"]
             auth = (cfg["username"], cfg["password"])
-            logger.info("[Neo4j] Connecting profile '%s' → %s", profile, uri)
+            logger.info("[Neo4j] Connecting instance '%s' → %s", instance, uri)
         else:
             uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
             auth = (os.environ.get("NEO4J_USERNAME", "neo4j"),
                     os.environ.get("NEO4J_PASSWORD", ""))
-            logger.info("[Neo4j] Connecting profile '%s' → %s (env fallback)", profile, uri)
+            logger.info("[Neo4j] Connecting → %s (env fallback)", uri)
 
         # Pool config from storage_config.yaml (or sensible defaults)
         pool_kwargs = {}
         try:
             from src.HybridRAG.code.neo4j_manager import get_instance_config
-            inst_cfg = get_instance_config(profile)
-            pool_kwargs["max_connection_pool_size"] = inst_cfg.max_connection_pool_size
-            pool_kwargs["max_connection_lifetime"] = inst_cfg.max_connection_lifetime
-            pool_kwargs["connection_acquisition_timeout"] = inst_cfg.connection_acquisition_timeout
+            inst_cfg = get_instance_config(instance) if instance else None
+            if inst_cfg:
+                pool_kwargs["max_connection_pool_size"] = inst_cfg.max_connection_pool_size
+                pool_kwargs["max_connection_lifetime"] = inst_cfg.max_connection_lifetime
+                pool_kwargs["connection_acquisition_timeout"] = inst_cfg.connection_acquisition_timeout
         except Exception:
+            pass
+        if not pool_kwargs:
             pool_kwargs = {
                 "max_connection_pool_size": 50,
                 "max_connection_lifetime": 3600,
@@ -339,7 +364,7 @@ def _get_neo4j(profile: str = "illd"):
             }
 
         driver = GraphDatabase.driver(uri, auth=auth, **pool_kwargs)
-        _neo4j_drivers[profile] = driver
+        _neo4j_driver = driver
         return driver
     except Exception as e:
         logger.error("Neo4j init for profile '%s': %s", profile, e)
@@ -588,11 +613,12 @@ def _get_search_service(profile: str = "illd"):
         return _search_services[profile]
     try:
         from src.HybridRAG.code.querier.search_service import SearchService
-        # Resolve the database name from storage_config.yaml
+        # Resolve the database name from the bound Neo4j instance
         db_name = None
         try:
             from src.HybridRAG.code.neo4j_manager import get_instance_config
-            db_name = get_instance_config(profile).database
+            inst = _NEO4J_INSTANCE or profile
+            db_name = get_instance_config(inst).database
         except Exception:
             pass
         # Resolve Qdrant collection name from storage_config.yaml
@@ -610,6 +636,23 @@ def _get_search_service(profile: str = "illd"):
             default_database=db_name or profile,
             qdrant_collection=qdrant_col or profile,
         )
+        # Attach query enhancer based on workspace profile:
+        #   - mcal: LLM-powered McalQueryEnhancer (GraphProbe + CoT expansion + Cypher patterns)
+        #   - illd: rule-based QueryEnhancer (domain synonyms, complexity classifier — built into SearchService)
+        if profile == "mcal" and os.environ.get("QUERY_ENHANCER_ENABLED", "1") not in ("0", "false", "no"):
+            try:
+                from src.HybridRAG.code.querier.mcal_query_enhancer import McalQueryEnhancer
+                enhancer = McalQueryEnhancer(
+                    neo4j_driver=_get_neo4j(profile),
+                    database=db_name or profile,
+                    enabled=True,
+                )
+                svc.set_query_enhancer(enhancer)
+                logger.info("[MCP] McalQueryEnhancer (LLM) attached for profile '%s'", profile)
+            except Exception as qe_err:
+                logger.warning("[MCP] McalQueryEnhancer init failed for '%s': %s", profile, qe_err)
+        else:
+            logger.info("[MCP] Using built-in rule-based QueryEnhancer for profile '%s'", profile)
         _search_services[profile] = svc
         logger.info("[MCP] SearchService initialized for profile '%s' (database='%s')", profile, db_name or profile)
         return svc
@@ -901,11 +944,12 @@ def _get_ki_service(profile: str = "illd"):
         return _ki_services[profile]
     try:
         from src.HybridRAG.code.querier.knowledge_intelligence import KnowledgeIntelligenceService
-        # Resolve the database name from storage_config.yaml
+        # Resolve the database name from the bound Neo4j instance
         db_name = None
         try:
             from src.HybridRAG.code.neo4j_manager import get_instance_config
-            db_name = get_instance_config(profile).database
+            inst = _NEO4J_INSTANCE or profile
+            db_name = get_instance_config(inst).database
         except Exception:
             pass
         svc = KnowledgeIntelligenceService(
@@ -1096,8 +1140,8 @@ async def search_database(
         filter_by_node_type (list[str] | None): Filter by node labels. Valid labels
             for illd: APIFunction, DataStructure, SoftwareRequirement, TestCase,
             TestResult, SourceFile, Module, Register, Bitfield, HardwareSpec, etc.
-            For mcal: StakeholderRequirement, ProductRequirement, SWA_Function,
-            SWA_DataType, MCALModule, etc.
+            For mcal: StakeholderRequirement, ProductRequirement, EA_Function,
+            EA_DataType, MCALModule, etc.
             Run `get_ontology_schema` to get the full list of valid node labels.
         offset (int): Pagination offset for results. Default 0.
         workspace_id (str): Target workspace — "illd" (default) or "mcal".
@@ -1195,8 +1239,8 @@ async def search_nodes(
         label (str): Node label to query. Required.
             illd labels: APIFunction, DataStructure, SoftwareRequirement, TestCase,
             TestResult, SourceFile, Module, Register, Bitfield, HardwareSpec, etc.
-            mcal labels: StakeholderRequirement, ProductRequirement, SWA_Function,
-            SWA_DataType, MCALModule, VerificationStep, etc.
+            mcal labels: StakeholderRequirement, ProductRequirement, EA_Function,
+            EA_DataType, MCALModule, VerificationStep, etc.
             Run `get_ontology_schema` to get the full list of valid node labels.
         keyword (str | None): Full-text keyword filter applied to node properties.
         filters (dict | None): Property-level filters, e.g. {"module": "Adc",
@@ -1334,7 +1378,7 @@ async def get_neighbors(
             illd types: IMPLEMENTS, TRACES_TO, VERIFIES, DEPENDS_ON,
             USES_STRUCTURE, ACCESSES_REGISTER, BELONGS_TO, CALLS_INTERNALLY, etc.
             mcal types: DERIVES_FROM, VERIFIED_BY, HAS_RESULT, BELONGS_TO_MODULE,
-            SWA_USES_TYPE, SWA_DEPENDS_ON_HW, ARCHITECTURALLY_REALIZES, etc.
+            EA_DEPENDS_ON, EA_ACCESSES_REGISTER, EA_IMPLEMENTS, etc.
             Run `get_ontology_schema` to get the full list of relationship types.
         limit (int): Max neighbor nodes to return. Default 20.
         workspace_id (str): Target workspace — "illd" or "mcal". Default "illd".
@@ -1515,13 +1559,12 @@ async def execute_cypher(
             return _err("QUERY_REJECTED", f"Write clause '{label}' is not allowed. Only read queries permitted.")
     try:
         query_mode = query_mode
-        # Shallow query path: if sandbox active, try to execute against NetworkX first
-        if query_mode == "sandbox" and graph_service and sandbox_ctx:
+        # Hybrid query path: run Cypher on prod Neo4j + patch with sandbox overrides
+        if query_mode in ("sandbox", "hybrid") and graph_service and sandbox_ctx:
             hybrid = graph_service
             try:
-                # Attempt shallow query on sandbox (simple graph searches that don't need full Neo4j)
                 result = await asyncio.to_thread(
-                    hybrid.search, query=query, top_k=100, alpha=0.5
+                    hybrid.deep_query, cypher=query, params=parameters or {}, workspace_id=workspace_id
                 )
                 return _ok({"records": result if isinstance(result, list) else [result], "count": len(result) if isinstance(result, list) else 1, "_origin": "sandbox"})
             except Exception:
@@ -2066,7 +2109,7 @@ async def analyze_hw_sw_links(
 ) -> str:
     """Map hardware register usage to software functions and detect undocumented accesses.
 
-    Walks ACCESSES_REGISTER and SWA_DEPENDS_ON_HW relationships to build
+    Walks EA_ACCESSES_REGISTER and EA_DEPENDS_ON relationships to build
     HW-SW mapping. Flags register accesses not linked to requirements.
     Access tier: public.
 
@@ -2558,6 +2601,7 @@ async def sandbox_upload(
 
         from src.MemoryLayer.memory.ephemeral_sandbox import (
             SandboxAdapter, SandboxParserDispatcher, TraceabilityPuller,
+            EphemeralGraph,
         )
         import base64
         import shutil
@@ -2640,12 +2684,41 @@ async def sandbox_upload(
                 node_names = adapter.ingest_parsed(sandbox, parsed, filename, module=module)
                 parsed_results.append({"filename": filename, "nodes": len(node_names)})
 
+            # ── Phase 2: Boundary Resolution (cross-module Unknown → typed prod nodes) ──
+            boundary_stats = {"boundary_candidates": 0, "boundary_resolved": 0}
+            if trace_depth > 0:
+                boundary_nodes = sandbox.graph.get_boundary_nodes()
+                boundary_stats["boundary_candidates"] = len(boundary_nodes)
+                if boundary_nodes:
+                    boundary_names = [b["name"] for b in boundary_nodes]
+                    driver = _get_neo4j(workspace_id)
+                    if driver:
+                        puller = TraceabilityPuller(driver)
+                        resolved_nodes = await asyncio.to_thread(
+                            puller.pull_boundary_nodes,
+                            boundary_names, workspace_id,
+                        )
+                        if resolved_nodes:
+                            sandbox.graph.load_prod_nodes(resolved_nodes, [])
+                            name_to_canonical = {}
+                            for node in resolved_nodes:
+                                props = node["properties"]
+                                name = props.get("name") or props.get("function_name") or ""
+                                if name and name in boundary_names:
+                                    canonical = EphemeralGraph._canonical_id(
+                                        node["node_type"], props
+                                    )
+                                    name_to_canonical[name] = canonical
+                            resolution = sandbox.graph.resolve_boundary(name_to_canonical)
+                            boundary_stats["boundary_resolved"] = resolution.get("boundary_resolved", 0)
+
             return _ok({
                 "session_id": session_id,
                 "files_ingested": len(parsed_results),
                 "nodes_created": sandbox.graph.node_count,
                 "node_names_extracted": len(all_node_names),
                 **prod_stats,
+                **boundary_stats,
                 "sandbox_status": sandbox.status(),
             })
         finally:
@@ -2657,12 +2730,15 @@ async def sandbox_upload(
 
 
 def _detect_module_from_names(node_names: List[str]) -> str:
-    """Heuristic: extract module name from function names (e.g. Adc_Init → Adc)."""
+    """Heuristic: extract module name from function names (e.g. Adc_Init → ADC).
+
+    Returns uppercase to match Neo4j convention (module property is uppercase).
+    """
     for name in node_names:
         if "_" in name:
             prefix = name.split("_")[0]
             if len(prefix) >= 2:
-                return prefix
+                return prefix.upper()
     return "unknown"
 
 # @mcp.tool()  # Deprecated: use search_database(session_id=...) instead (Plan 2 Phase 6)
@@ -2814,6 +2890,58 @@ async def sandbox_diff(session_id: str) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  CATEGORY 5b — HSI (Hardware-Software Interface) — Sprint 8+
+# ═════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def get_function_hsi(
+    function_name: str,
+    module: str = "Adc",
+    profile: str = "mcal",
+) -> str:
+    """Extract the HSI (Hardware-Software Interface) section for a function.
+
+    Returns structured SWUD-format data: SFR registers accessed (with access
+    type, trust zone, line numbers), global/shared variables used (with access
+    type, via_chain), and events. This is the dedicated HSI extraction tool
+    — use it when you need the exact HSI constituents of a function.
+    Access tier: public.
+
+    Parameters:
+        function_name (str): Exact function name (e.g. "Adc_Init", "Can_Write"). Required.
+        module (str): Module name (e.g. "Adc", "Can", "Spi"). Default "Adc".
+            Run `list_available_modules` to get valid module names.
+        profile (str): Ontology profile — "mcal" (default) or "illd".
+
+    Returns (JSON):
+        {
+          "function_name": str,
+          "registers": [{"register": str, "access_type": str, "trust_zone": str, "line": int, ...}],
+          "global_variables": [{"variable": str, "access_type": str, "data_type": str, "via_chain": str, ...}],
+          "events": [],
+          "summary_text": str  // Markdown-formatted SWUD HSI section
+        }
+    """
+    denied = _authorize("get_function_hsi")
+    if denied:
+        return denied
+    try:
+        svc = _get_search_service(profile)
+        if not svc or not svc.available:
+            return _err("BACKEND_UNAVAILABLE", "Neo4j not connected")
+        result = await asyncio.to_thread(
+            svc.get_function_hsi,
+            function_name=function_name,
+            module=module,
+            workspace_id=profile,
+        )
+        return _ok(result)
+    except Exception as exc:
+        logger.exception("get_function_hsi failed")
+        return _err("INTERNAL_ERROR", str(exc))
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  CATEGORY 6+ — RLM (2 tools) — Sprint 5
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -2857,6 +2985,24 @@ async def rlm_orchestrate(
         query_mode = query_mode
         # Note: RLM Orchestrator internally uses SearchService 
         # Any hybrid/sandbox routing is handled through the session context
+
+        # Auto-detect HSI queries when task_type is generic
+        if task_type == "generic":
+            q_lower = query.lower()
+            hsi_signals = sum([
+                "hsi" in q_lower,
+                "trust zone" in q_lower,
+                "hardware-software interface" in q_lower,
+                ("register" in q_lower and "global" in q_lower),
+                ("sfr" in q_lower and "access" in q_lower),
+                ("register" in q_lower and "access type" in q_lower),
+                ("apu" in q_lower),
+            ])
+            if hsi_signals >= 1:
+                task_type = "hsi_analysis"
+                logger.info("[MCP] Auto-detected HSI query, routing to hsi_analysis")
+
+
         rlm = _get_rlm_orchestrator(module=module, profile=profile)
         if not rlm:
             return _err("INTERNAL_ERROR", "RLMOrchestrator not available")
@@ -3484,7 +3630,7 @@ async def get_ontology_schema(
         include_live_stats (bool): Include live node/relationship counts from
             Neo4j for each type. Default False.
         node_type (str | None): Filter to a specific node type
-            (e.g. "APIFunction", "SWA_Function").
+            (e.g. "APIFunction", "EA_Function").
             When None, returns the complete schema.
 
     Returns (JSON):
@@ -3520,7 +3666,7 @@ async def validate_entity(entity_type: str, data: Dict[str, Any], context: str =
             illd labels: APIFunction, DataStructure, SoftwareRequirement,
             TestCase, Module, Register, etc.
             mcal labels: StakeholderRequirement, ProductRequirement,
-            SWA_Function, MCALModule, etc.
+            EA_Function, MCALModule, etc.
             Run `get_ontology_schema` to get the full list.
         data (dict): Entity property data to validate. Required.
             Keys should match the expected properties for the entity_type.
@@ -3818,7 +3964,7 @@ async def detect_communities(
         workspace_id (str): Target workspace — "illd" or "mcal". Default "illd".
         node_types (list[str] | None): Restrict to specific node labels.
             illd labels: APIFunction, DataStructure, SoftwareRequirement, etc.
-            mcal labels: StakeholderRequirement, SWA_Function, MCALModule, etc.
+            mcal labels: StakeholderRequirement, EA_Function, MCALModule, etc.
             Run `get_ontology_schema` to get valid node labels.
             None includes all node types.
         min_community_size (int): Minimum nodes per community. Default 3.

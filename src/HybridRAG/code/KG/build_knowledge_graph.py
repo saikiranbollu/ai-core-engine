@@ -102,11 +102,12 @@ except ImportError:
 
 # SFR parser import (KG directory)
 try:
-    from sfr_parsers import parse_sfr_repo, discover_devices, discover_modules
+    from sfr_parsers import parse_sfr_repo, discover_devices, discover_modules, resolve_mcal_module_name
 except ImportError:
     parse_sfr_repo = None
     discover_devices = None
     discover_modules = None
+    resolve_mcal_module_name = None
 
 # Incremental tracker
 from incremental_tracker import IncrementalTracker, discover_files, _hash_file
@@ -142,6 +143,9 @@ def get_module_paths(module: str) -> dict:
     Returns a dict with keys ``data``, ``relationships``, ``folders``
     pointing to the expected JSON files under ``jama-req/``.
 
+    Sub-module names (ETH_17_LETH, CAN_17_MCMCAN, etc.) are mapped back
+    to their Jama parent folder name for file lookup.
+
     Example::
 
         paths = get_module_paths("GPT")
@@ -149,7 +153,17 @@ def get_module_paths(module: str) -> dict:
         # paths["relationships"] → jama-req/jama_gpt_relationships.json
         # paths["folders"]       → jama-req/jama_gpt_folders.json
     """
-    mod = module.lower()
+    # Map sub-module names to their Jama parent folder name
+    _jama_map = {
+        "ETH_17_LETH": "ETH",
+        "ETH_17_GETH": "ETH",
+        "CAN_17_MCMCAN": "CAN",
+        "LIN_17_ASCLIN": "LIN",
+        "WDG_17_WTU": "WDG",
+        "PWM_17_TIMERIP": "PWM",
+    }
+    jama_name = _jama_map.get(module.upper(), module.upper())
+    mod = jama_name.lower()
     return {
         "data":          JAMA_REQ_DIR / f"jama_{mod}_combined_requirements.json",
         "relationships": JAMA_REQ_DIR / f"jama_{mod}_relationships.json",
@@ -2845,6 +2859,13 @@ class TestSpecKnowledgeGraphBuilder:
     def _create_ts_belongs_to_module(self, parsed: dict):
         """TS_BELONGS_TO_MODULE: any TS node → MCALModule."""
         module = self.module.upper()
+        # Ensure MCALModule node exists (may be a sub-module like ETH_17_LETH
+        # not created by the base-KG step which only knows "ETH").
+        self._write_tx(
+            "MERGE (m:MCALModule {module_name: $module}) "
+            "ON CREATE SET m.global_id = randomUUID()",
+            {"module": module},
+        )
         for node_type in parsed:
             uid_prop = self._UID_MAP.get(node_type)
             if not uid_prop:
@@ -3388,10 +3409,11 @@ class SourceCodeKnowledgeGraphBuilder:
     _RE_DOC_REENTRANT = re.compile(r'\*\*\s*Reentrancy\s*:\s*(.*?)(?:\*\*|\n)', re.IGNORECASE)
 
     # Function definition (with optional static/inline qualifiers)
+    # Supports AUTOSAR FUNC(RetType, MemClass) macro syntax
     _RE_FUNC_DEF = re.compile(
         r'(?:^|\n)'
         r'((?:static\s+)?(?:inline\s+)?(?:LOCAL_INLINE\s+)?)'
-        r'([\w\s\*]+?)\s+'
+        r'(?:FUNC\s*\(([^)]*)\)\s+|([\w\s\*]+?)\s+)'
         r'([A-Za-z_]\w*)\s*'
         r'\(([^)]*)\)\s*\{',
         re.MULTILINE
@@ -3432,10 +3454,14 @@ class SourceCodeKnowledgeGraphBuilder:
     _RE_GLOBAL_VAR = re.compile(
         r'^[ \t]*'
         r'((?:(?:static|extern|const|volatile)\s+)*)'  # qualifiers
-        r'([\w][\w\s]*?\*?(?:\s*const)?)\s+'             # type (e.g. uint32, Adc_ConfigType * const)
+        r'([\w][\w\s]*?\*?(?:\s*const)?)'                # type (e.g. uint32, Adc_ConfigType * const)
+        r'(?:\s*\*\s*|\s+)'                              # separator: pointer or space(s)
         r'([A-Za-z_]\w*)\s*'                            # name
-        r'(\[[^\]]*\])?\s*'                              # optional array bounds
-        r'(?:=\s*([^;]{0,200}))?\s*;',                  # optional initialiser
+        r'((?:\[[^\]]*\])+)?\s*'                         # optional array bounds (multi-dim)
+        r'(?:'
+        r'(?:=\s*([^;]{0,200}))?\s*;'                   # option A: inline initialiser + ;
+        r'|=\s*$'                                        # option B: = at EOL (multi-line init follows)
+        r')',
         re.MULTILINE,
     )
 
@@ -4011,8 +4037,10 @@ class SourceCodeKnowledgeGraphBuilder:
         2. Sum config MemMap_GenFiles
         3. Sum config SchM_GenFiles
         4. Cross-module dependency headers (real, from Bitbucket)
-        5. SFR device headers (matched to the config's device)
-        6. Module source headers (ssc/inc, ssc/src)
+        5. Platform headers (Std_Types.h, Mcal_ErrorTypes.h, etc.)
+        6. Cross-module source repo headers (ssc/inc from all modules)
+        7. SFR device headers (matched to the config's device)
+        8. Module source headers (ssc/inc, ssc/src)
         """
         paths: list[str] = []
 
@@ -4035,12 +4063,44 @@ class SourceCodeKnowledgeGraphBuilder:
         if deps_dir.is_dir():
             paths.append(str(deps_dir))
 
-        # 5. SFR headers — try to match device from config name
+        # 5. Platform headers (Std_Types.h, Mcal_ErrorTypes.h, etc.)
+        # The platform repo has headers at root level (no ssc/inc)
+        platform_base = (
+            HYBRIDRAG_DIR / "temp" / "temporary_data"
+            / "aurix3g_sw_mcal_tc4xx_platform"
+        )
+        if platform_base.is_dir():
+            paths.append(str(platform_base))
+
+        # 6. Cross-module source repo headers (ssc/inc from all cloned modules)
+        #    This ensures Dma.h, Gtm.h, etc. resolve without needing stubs.
+        temp_data = HYBRIDRAG_DIR / "temp" / "temporary_data"
+        # Build the set of source-dir names belonging to the target module
+        # (handles multi-repo modules like ETH → eth_17_leth_src, eth_17_geth_src)
+        _own_src_names = set()
+        if self.source_dir and self.source_dir.name:
+            _own_src_names.add(self.source_dir.name)
+        _own_src_names.add(f"aurix3g_sw_mcal_tc4xx_{self.module.lower()}_src")
+        if temp_data.is_dir():
+            for child in sorted(temp_data.iterdir()):
+                if not child.is_dir():
+                    continue
+                # Only include *_src repos (skip infra, val, design, etc.)
+                if not child.name.endswith("_src"):
+                    continue
+                # Skip the target module itself (added separately below)
+                if child.name in _own_src_names:
+                    continue
+                ssc_inc = child / "ssc" / "inc"
+                if ssc_inc.is_dir():
+                    paths.append(str(ssc_inc))
+
+        # 7. SFR headers — try to match device from config name
         sfr_dir = self._find_sfr_device_for_config(config_name)
         if sfr_dir and sfr_dir.is_dir():
             paths.append(str(sfr_dir))
 
-        # 6. Module source headers
+        # 8. Module source headers
         for sub in ("ssc/inc", "ssc/src", "ssc"):
             inc_dir = self.source_dir / sub
             if inc_dir.is_dir():
@@ -4189,9 +4249,13 @@ class SourceCodeKnowledgeGraphBuilder:
         # Find all function definitions
         for m in self._RE_FUNC_DEF.finditer(clean_content):
             qualifiers = m.group(1).strip()
-            return_type = m.group(2).strip()
-            func_name = m.group(3)
-            params_raw = m.group(4).strip()
+            # FUNC(RetType, MemClass) macro: return type is first arg
+            if m.group(2):
+                return_type = m.group(2).split(',')[0].strip()
+            else:
+                return_type = m.group(3).strip()
+            func_name = m.group(4)
+            params_raw = m.group(5).strip()
 
             # Skip C keywords falsely matched
             if func_name in self._C_KEYWORDS:
@@ -5115,8 +5179,15 @@ class SourceCodeKnowledgeGraphBuilder:
         self.stats["rel:SRC_CALLS"] = len(valid_edges)
 
     def _create_belongs_to_module_rels(self):
-        """SRC_* ΓåÆ MCALModule."""
+        """SRC_* → MCALModule."""
         module = self.module
+        # Ensure MCALModule node exists (may be a sub-module like ETH_17_LETH
+        # not created by the base-KG step which only knows "ETH").
+        self._write_tx(
+            "MERGE (m:MCALModule {module_name: $module}) "
+            "ON CREATE SET m.global_id = randomUUID()",
+            {"module": module},
+        )
         for node_type in ("SRC_SourceFile", "SRC_Function", "SRC_DataType", "SRC_Macro",
                         "SRC_GlobalVariable", "SRC_LocalVariable"):
             logger.info("  Creating SRC_BELONGS_TO_MODULE for %s ΓåÆ %s ΓÇª", node_type, module)
@@ -5548,6 +5619,22 @@ class SourceCodeKnowledgeGraphBuilder:
             name = _re_norm.sub(r'\[.*?\]', '', name)
             return name.replace('.', '_')
 
+        def _make_regex_pattern(norm: str) -> str:
+            """Build a Cypher regex pattern allowing optional digits between segments.
+
+            ``ACCGRP_PROTE`` → ``.*_ACCGRP\\d*_PROTE\\d*`` (matches P_ACCGRP0_PROTE)
+            ``PROTSE``       → ``""`` (single segment, exact ENDS WITH is enough)
+            """
+            parts = norm.split('_')
+            if len(parts) <= 1:
+                return ""  # Single segment (e.g. PROTSE) — exact ENDS WITH suffices
+            # For multi-segment names, allow optional digit suffixes on each part
+            # Use .*_ prefix to match any module prefix
+            regex_parts = []
+            for p in parts:
+                regex_parts.append(p + "\\d*")
+            return ".*_" + "_".join(regex_parts)
+
         # Deduplicate: one edge per (function, normalized_register, access_type)
         edge_set: set = set()
         edge_batch: list[dict] = []
@@ -5558,10 +5645,12 @@ class SourceCodeKnowledgeGraphBuilder:
             key = (ra["function_id"], norm, ra["access_type"])
             if key not in edge_set:
                 edge_set.add(key)
+                regex_pat = _make_regex_pattern(norm)
                 edge_batch.append({
                     "func_id": ra["function_id"],
                     "register_name": ra["register_name"],
                     "norm_name": norm,
+                    "name_pattern": regex_pat,
                     "access_type": ra["access_type"],
                     "field": ra.get("field", ""),
                 })
@@ -5580,6 +5669,7 @@ class SourceCodeKnowledgeGraphBuilder:
                     "MATCH (r:SFR_Register {device: $device}) "
                     "WHERE r.name = item.register_name "
                     "   OR r.name ENDS WITH ('_' + item.norm_name) "
+                    "   OR (item.name_pattern <> '' AND r.name =~ item.name_pattern) "
                     "MERGE (f)-[rel:SRC_ACCESSES_SFR {access_type: item.access_type}]->(r) "
                     "SET rel.field = item.field"
                 )
@@ -5591,6 +5681,7 @@ class SourceCodeKnowledgeGraphBuilder:
                     "MATCH (r:SFR_Register) "
                     "WHERE r.name = item.register_name "
                     "   OR r.name ENDS WITH ('_' + item.norm_name) "
+                    "   OR (item.name_pattern <> '' AND r.name =~ item.name_pattern) "
                     "MERGE (f)-[rel:SRC_ACCESSES_SFR {access_type: item.access_type}]->(r) "
                     "SET rel.field = item.field"
                 )
@@ -5742,15 +5833,14 @@ class SFRKnowledgeGraphBuilder:
 
     Node types created:
         - SFR_File          -- one per header file per device
-        - SFR_Register      -- one per typedef struct per device
+        - SFR_Register      -- one per typedef struct per device (address as property)
         - SFR_BitField      -- one per bitfield member per device
-        - SFR_BaseAddress   -- one per base-address macro per device
 
     Relationships created:
-        - SFR_DEFINED_IN        (register/base_addr ΓåÆ file)
-        - SFR_HAS_BITFIELD      (register ΓåÆ bitfield)
-        - SFR_BELONGS_TO_MODULE (all ΓåÆ MCALModule)
-        - SRC_ACCESSES_SFR      (SRC_Function ΓåÆ SFR_Register, cross-link)
+        - SFR_DEFINED_IN        (register → file)
+        - SFR_HAS_BITFIELD      (register → bitfield)
+        - SFR_BELONGS_TO_MODULE (all → MCALModule)
+        - SRC_ACCESSES_SFR      (SRC_Function → SFR_Register, cross-link)
 
     Usage::
 
@@ -5767,7 +5857,6 @@ class SFRKnowledgeGraphBuilder:
         "SFR_File":        "file_id",
         "SFR_Register":    "register_id",
         "SFR_BitField":    "bitfield_id",
-        "SFR_BaseAddress": "base_address_id",
     }
 
     def __init__(
@@ -5794,7 +5883,6 @@ class SFRKnowledgeGraphBuilder:
         self._files: list[dict] = []
         self._registers: list[dict] = []
         self._bitfields: list[dict] = []
-        self._base_addresses: list[dict] = []
 
     # -- Connection ---------------------------------------------------------
 
@@ -5894,7 +5982,7 @@ class SFRKnowledgeGraphBuilder:
 
         # Step 1: Parse SFR files
         logger.info("Step 1/4: Parsing SFR header filesΓÇª")
-        self._files, self._registers, self._bitfields, self._base_addresses = (
+        self._files, self._registers, self._bitfields = (
             parse_sfr_repo(
                 repo_dir=self.sfr_dir,
                 module=self.module,
@@ -5972,7 +6060,7 @@ class SFRKnowledgeGraphBuilder:
     # ======================================================================
 
     _SFR_NODE_LABELS = (
-        "SFR_File", "SFR_Register", "SFR_BitField", "SFR_BaseAddress",
+        "SFR_File", "SFR_Register", "SFR_BitField",
     )
 
     def _stamp_project(self):
@@ -6022,7 +6110,6 @@ class SFRKnowledgeGraphBuilder:
             "SFR_File":        self._files,
             "SFR_Register":    self._registers,
             "SFR_BitField":    self._bitfields,
-            "SFR_BaseAddress": self._base_addresses,
         }
 
         for node_type, items in node_groups.items():
@@ -6092,7 +6179,8 @@ class SFRKnowledgeGraphBuilder:
         ingested_modules = {r["module"] for r in self._registers}
         cross_prefixes = {
             p for p in all_prefixes
-            if p not in ingested_modules and p != self.module
+            if resolve_mcal_module_name(p) not in ingested_modules
+            and resolve_mcal_module_name(p) != self.module
         }
 
         if not cross_prefixes:
@@ -6123,27 +6211,27 @@ class SFRKnowledgeGraphBuilder:
 
         # Parse and ingest SFR headers for each cross-module
         for xmod in modules_to_ingest:
-            xmod_upper = xmod.upper()
+            xmod_mcal = resolve_mcal_module_name(xmod)
             # Check if already ingested in Neo4j
             existing = self._run(
                 "MATCH (r:SFR_Register {module: $module}) RETURN count(r) AS cnt",
-                {"module": xmod_upper},
+                {"module": xmod_mcal},
             )
             if existing and existing[0]["cnt"] > 0:
                 logger.info("    %s: %d SFR_Register nodes already exist — skipping",
-                            xmod_upper, existing[0]["cnt"])
+                            xmod_mcal, existing[0]["cnt"])
                 # Add to self._registers so edge creation can find them
                 existing_regs = self._run(
                     "MATCH (r:SFR_Register {module: $module}) "
                     "RETURN r.register_id AS register_id, r.name AS name, "
                     "r.device AS device, r.module AS module",
-                    {"module": xmod_upper},
+                    {"module": xmod_mcal},
                 )
                 self._registers.extend(existing_regs)
                 continue
 
             try:
-                xfiles, xregs, xbfs, xbas = parse_sfr_repo(
+                xfiles, xregs, xbfs = parse_sfr_repo(
                     repo_dir=self.sfr_dir,
                     module=xmod,
                     devices=self.devices,
@@ -6157,14 +6245,13 @@ class SFRKnowledgeGraphBuilder:
                 continue
 
             logger.info("    %s: Parsed %d registers, %d bitfields",
-                        xmod_upper, len(xregs), len(xbfs))
+                        xmod_mcal, len(xregs), len(xbfs))
 
             # Create nodes using same batch approach
             for node_type, items, uid_key in [
                 ("SFR_File", xfiles, "file_id"),
                 ("SFR_Register", xregs, "register_id"),
                 ("SFR_BitField", xbfs, "bitfield_id"),
-                ("SFR_BaseAddress", xbas, "base_address_id"),
             ]:
                 if not items:
                     continue
@@ -6179,7 +6266,7 @@ class SFRKnowledgeGraphBuilder:
 
             # Add to self._registers for edge creation
             self._registers.extend(xregs)
-            self.stats[f"cross_module:{xmod_upper}:registers"] = len(xregs)
+            self.stats[f"cross_module:{xmod_mcal}:registers"] = len(xregs)
 
     # ======================================================================
     # CREATE RELATIONSHIPS
@@ -6217,32 +6304,8 @@ class SFRKnowledgeGraphBuilder:
                 self.stats.get("rel:SFR_DEFINED_IN(Register)", 0) + len(reg_ids)
             )
 
-        # Base addresses ΓåÆ reg file
-        for device in {b["device"] for b in self._base_addresses}:
-            file_id = next(
-                (f["file_id"] for f in self._files
-                 if f["device"] == device and f["file_type"] == "reg"),
-                None,
-            )
-            if not file_id:
-                continue
-
-            ba_ids = [b["base_address_id"] for b in self._base_addresses if b["device"] == device]
-            logger.info("  SFR_DEFINED_IN for %d base addresses ΓåÆ %s", len(ba_ids), file_id)
-            for chunk in self._chunked(ba_ids, self.BATCH_SIZE):
-                cypher = (
-                    "UNWIND $ids AS bid "
-                    "MATCH (b:SFR_BaseAddress {base_address_id: bid}) "
-                    "MATCH (f:SFR_File {file_id: $file_id}) "
-                    "MERGE (b)-[:SFR_DEFINED_IN]->(f)"
-                )
-                self._write_tx(cypher, {"ids": chunk, "file_id": file_id})
-            self.stats["rel:SFR_DEFINED_IN(BaseAddress)"] = (
-                self.stats.get("rel:SFR_DEFINED_IN(BaseAddress)", 0) + len(ba_ids)
-            )
-
     def _create_has_bitfield_rels(self):
-        """SFR_Register -[SFR_HAS_BITFIELD]ΓåÆ SFR_BitField."""
+        """SFR_Register -[SFR_HAS_BITFIELD]→ SFR_BitField."""
         if not self._bitfields:
             return
 
@@ -6263,21 +6326,29 @@ class SFRKnowledgeGraphBuilder:
         self.stats["rel:SFR_HAS_BITFIELD"] = len(edges)
 
     def _create_belongs_to_module_rels(self):
-        """SFR_* ΓåÆ MCALModule."""
-        module = self.module
-        for node_type in ("SFR_File", "SFR_Register", "SFR_BitField", "SFR_BaseAddress"):
-            logger.info("  Creating SFR_BELONGS_TO_MODULE for %s ΓåÆ %s ΓÇª", node_type, module)
+        """SFR_* → MCALModule."""
+        # SFR nodes now store the canonical MCAL module name (e.g.
+        # "ETH_17_LETH", "GPT") which matches self.module.
+        sfr_module = self._files[0]["module"] if self._files else self.module
+        # Ensure MCALModule node exists for the peripheral name.
+        self._write_tx(
+            "MERGE (m:MCALModule {module_name: $module}) "
+            "ON CREATE SET m.global_id = randomUUID()",
+            {"module": sfr_module},
+        )
+        for node_type in ("SFR_File", "SFR_Register", "SFR_BitField"):
+            logger.info("  Creating SFR_BELONGS_TO_MODULE for %s → %s …", node_type, sfr_module)
             cypher = (
                 f"MATCH (n:{node_type} {{module: $module}}) "
                 f"MATCH (m:MCALModule {{module_name: $module}}) "
                 f"MERGE (n)-[:SFR_BELONGS_TO_MODULE]->(m)"
             )
-            self._write_tx(cypher, {"module": module})
+            self._write_tx(cypher, {"module": sfr_module})
 
         count_res = self._run(
             "MATCH ()-[r:SFR_BELONGS_TO_MODULE]->(:MCALModule {module_name: $module}) "
             "RETURN count(r) AS cnt",
-            {"module": module},
+            {"module": sfr_module},
         )
         self.stats["rel:SFR_BELONGS_TO_MODULE"] = count_res[0]["cnt"] if count_res else 0
 
@@ -6321,6 +6392,24 @@ class SFRKnowledgeGraphBuilder:
 
         # Parse JSON and build (function_id, register, access_type) triples
         import re as _re_norm
+
+        def _make_regex_pattern_sfr(norm: str) -> str:
+            """Build a Cypher regex pattern allowing optional digits between segments."""
+            parts = norm.split('_')
+            if len(parts) <= 1:
+                return ""
+            return ".*_" + "_".join(p + "\\d*" for p in parts)
+
+        def _regex_matches_any(pattern: str, reg_names_set: set) -> bool:
+            """Check if a regex pattern matches any register name in the set."""
+            if not pattern:
+                return False
+            try:
+                compiled = _re_norm.compile(pattern)
+                return any(compiled.fullmatch(rn) for rn in reg_names_set)
+            except _re_norm.error:
+                return False
+
         edge_set: set = set()
         edge_batch: list[dict] = []
         for row in src_rows:
@@ -6335,10 +6424,11 @@ class SFRKnowledgeGraphBuilder:
                     continue
                 # Normalize: strip array subscripts, replace dots
                 norm = _re_norm.sub(r'\[.*?\]', '', reg).replace('.', '_')
+                regex_pat = _make_regex_pattern_sfr(norm)
                 # Only create edge if we have a matching SFR_Register
                 if reg not in reg_names and not any(
                     rn.endswith("_" + norm) for rn in reg_names
-                ):
+                ) and not _regex_matches_any(regex_pat, reg_names):
                     continue
                 key = (row["fid"], norm, access_type)
                 if key not in edge_set:
@@ -6347,6 +6437,7 @@ class SFRKnowledgeGraphBuilder:
                         "func_id": row["fid"],
                         "register_name": reg,
                         "norm_name": norm,
+                        "name_pattern": regex_pat,
                         "access_type": access_type,
                     })
 
@@ -6367,6 +6458,7 @@ class SFRKnowledgeGraphBuilder:
                     "MATCH (r:SFR_Register {device: $device}) "
                     "WHERE r.name = item.register_name "
                     "   OR r.name ENDS WITH ('_' + item.norm_name) "
+                    "   OR (item.name_pattern <> '' AND r.name =~ item.name_pattern) "
                     "MERGE (f)-[rel:SRC_ACCESSES_SFR]->(r) "
                     "SET rel.access_type = item.access_type"
                 )
@@ -6401,7 +6493,6 @@ class SFRKnowledgeGraphBuilder:
             ("SFR_File", self._files),
             ("SFR_Register", self._registers),
             ("SFR_BitField", self._bitfields),
-            ("SFR_BaseAddress", self._base_addresses),
         ]:
             uid = self._UID_MAP.get(label, "?")
             print(f"    :{label:<20s}  {len(items):>6,d} nodes  [merge key: {uid}]")
@@ -6413,11 +6504,11 @@ class SFRKnowledgeGraphBuilder:
                 print(f"      ... and {len(items) - 3} more")
 
         total = (len(self._files) + len(self._registers)
-                 + len(self._bitfields) + len(self._base_addresses))
+                 + len(self._bitfields))
         print(f"    {'TOTAL':<21s}  {total:>6,d}")
 
         print(f"\n  Relationships:")
-        print(f"    SFR_DEFINED_IN         : {len(self._registers) + len(self._base_addresses):>6,d}")
+        print(f"    SFR_DEFINED_IN         : {len(self._registers):>6,d}")
         print(f"    SFR_HAS_BITFIELD       : {len(self._bitfields):>6,d}")
         print(f"    SFR_BELONGS_TO_MODULE  :  (all nodes)")
         print(f"    SRC_ACCESSES_SFR       :  (cross-link, computed at ingestion time)")
@@ -6427,8 +6518,7 @@ class SFRKnowledgeGraphBuilder:
         for dev in devices:
             regs = sum(1 for r in self._registers if r["device"] == dev)
             bfs = sum(1 for b in self._bitfields if b["device"] == dev)
-            bas = sum(1 for b in self._base_addresses if b["device"] == dev)
-            print(f"    {dev}: {regs} registers, {bfs} bitfields, {bas} base addresses")
+            print(f"    {dev}: {regs} registers, {bfs} bitfields")
 
         print("=" * 60 + "\n")
 
@@ -6701,9 +6791,10 @@ def main():
             "cloned aurix3g_sw_mcal_tc4xx_infra_sfr repository into the "
             "MCAL database.  Parses _regdef.h, _bf.h, and _reg.h files "
             "for the selected module across all (or filtered) device "
-            "variants and creates SFR_File, SFR_Register, SFR_BitField, "
-            "SFR_BaseAddress nodes plus SFR_HAS_BITFIELD, SFR_DEFINED_IN, "
-            "SFR_BELONGS_TO_MODULE, and SRC_ACCESSES_SFR relationships."
+            "variants and creates SFR_File, SFR_Register, SFR_BitField "
+            "nodes plus SFR_HAS_BITFIELD, SFR_DEFINED_IN, "
+            "SFR_BELONGS_TO_MODULE, and SRC_ACCESSES_SFR relationships. "
+            "Base addresses are stored as properties on register nodes."
         ),
     )
     parser.add_argument(
@@ -6840,7 +6931,21 @@ def main():
         source_dir = args.source_dir
         if source_dir is None:
             # Default: look under temp/temporary_data/
-            source_dir = HYBRIDRAG_DIR / "temp" / "temporary_data" / f"aurix3g_sw_mcal_tc4xx_{module.lower()}_src"
+            # For multi-repo modules, run_pipeline.py passes --source-dir explicitly;
+            # this fallback handles single-module CLI usage.
+            candidate = HYBRIDRAG_DIR / "temp" / "temporary_data" / f"aurix3g_sw_mcal_tc4xx_{module.lower()}_src"
+            if candidate.is_dir():
+                source_dir = candidate
+            else:
+                # Try sub-module repos (e.g. ETH → eth_17_leth_src)
+                from dependency_fetcher import MODULE_SUB_MODULES
+                for sub in MODULE_SUB_MODULES.get(module.upper(), []):
+                    candidate = HYBRIDRAG_DIR / "temp" / "temporary_data" / f"aurix3g_sw_mcal_tc4xx_{sub}_src"
+                    if candidate.is_dir():
+                        source_dir = candidate
+                        break
+                if source_dir is None:
+                    source_dir = HYBRIDRAG_DIR / "temp" / "temporary_data" / f"aurix3g_sw_mcal_tc4xx_{module.lower()}_src"
         cfgmcal_dir = args.cfgmcal_dir
         if cfgmcal_dir is None and not args.sum_mode:
             # Auto-detect: look under temp/temporary_data/<module>_cfgmcal

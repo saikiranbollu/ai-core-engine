@@ -1,7 +1,7 @@
-# GraphRAG Configuration for ILLD, MCAL & Test
-# Select the active instance: "illd", "mcal", or "test"
+# GraphRAG Configuration for MCAL
+# Select the active instance: "mcal" or "local"
 # This also selects the matching ontology profile in ontology.yaml
-active_instance: test
+active_instance: mcal
 
 # Select the vector store backend: qdrant
 vector_backend: qdrant
@@ -18,39 +18,9 @@ ontology:
 # Neo4j Configuration
 # ---------------------------------------------------------------------------
 neo4j:
-  illd:
-    description: "ILLD - Reference Software (Cloud)"
-    uri: "bolt+ssc://bolt-passthrough-neo4j-mcswai-legato.icp.infineon.com:443"
-    username: "${NEO4J_USERNAME}"
-    password: "${NEO4J_PASSWORD}"
-    database: "neo4j"
-    encrypted: false
-    max_connection_lifetime: 3600
-    max_connection_pool_size: 50
-    connection_acquisition_timeout: 60
-    graph_settings:
-      node_label_prefix: "ILLD_"
-      embedding_dimension: 1536
-      similarity_threshold: 0.85
-
   mcal:
-    description: "MCAL - Productive Software (Cloud)"
-    uri: "bolt+ssc://bolt-passthrough-neo4j-mcswai-mcal.icp.infineon.com:443"
-    username: "${NEO4J_USERNAME}"
-    password: "${NEO4J_PASSWORD}"
-    database: "neo4j"
-    encrypted: false
-    max_connection_lifetime: 3600
-    max_connection_pool_size: 50
-    connection_acquisition_timeout: 60
-    graph_settings:
-      node_label_prefix: "MCAL_"
-      embedding_dimension: 1536
-      similarity_threshold: 0.85
-
-  test:
-    description: "Test Instance - EA Migration Experiments"
-    uri: "bolt+ssc://bolt-passthrough-neo4j-mcswai-test.icp.infineon.com:443"
+    description: "MCAL - Production (ai-core-engine-mcal)"
+    uri: "bolt+ssc://bolt-passthrough-neo4j-ai-core-engine-mcal.icp.infineon.com:443"
     username: "${NEO4J_USERNAME}"
     password: "${NEO4J_PASSWORD}"
     database: "neo4j"
@@ -82,7 +52,7 @@ neo4j:
 # Qdrant Configuration (remote vector store)
 # ---------------------------------------------------------------------------
 qdrant:
-  url: "https://qdrant-mcswai.eu-de-7.icp.infineon.com"
+  url: "https://qdrant-ai-core-engine.eu-de-7.icp.infineon.com"
   port: 443
   api_key: "${QDRANT_API_KEY}"
   https: true                          # use HTTPS transport
@@ -95,7 +65,7 @@ qdrant:
   verify_ssl: true                    # Infineon SSL CA 4 cert is publicly trusted
   # In-cluster override: when KUBERNETES_SERVICE_HOST is set, the MCP server
   # connects directly to the K8s service via plain gRPC (no TLS).
-  in_cluster_url: "http://qdrant.mcswai.svc.cluster.local"
+  in_cluster_url: "http://qdrant.ai-core-engine-mcal.svc.cluster.local"
   in_cluster_grpc_port: 6334
   illd:
     description: "ILLD - Reference Software Vector Store (Qdrant)"

@@ -1,0 +1,52 @@
+# trial-mcp — HPA + Session Affinity Configuration
+# ===================================================
+# Autoscales trial-mcp based on CPU utilisation while maintaining
+# sticky sessions so each user continues to hit the pod that holds
+# their active in-memory session.
+#
+# Three resources are managed:
+#   1. Deployment patch  — add resource requests (required by HPA)
+#   2. HPA               — scale 1→5 pods on 70% avg CPU
+#   3. Service patch     — sessionAffinity: ClientIP
+#   4. Route annotation  — cookie-based sticky sessions (HAProxy)
+#
+# Apply:  oc apply -f trial-mcp-hpa.yaml
+# ===================================================
+
+# ── 1. HPA ──────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: trial-mcp
+  namespace: ai-core-engine
+  labels:
+    app: trial-mcp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: trial-mcp
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    # Scale up quickly when traffic spikes
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    # Scale down slowly so active sessions aren't killed
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

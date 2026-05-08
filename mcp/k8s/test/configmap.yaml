@@ -38,8 +38,8 @@ data:
           embedding_dimension: 1536
           similarity_threshold: 0.85
       mcal:
-        description: "MCAL - Test Instance (local)"
-        uri: "bolt://test-neo4j:7687"
+        description: "MCAL - Production (ai-core-engine-mcal)"
+        uri: "bolt+ssc://bolt-passthrough-neo4j-ai-core-engine-mcal.icp.infineon.com:443"
         username: "neo4j"
         password: "${NEO4J_PASSWORD}"
         database: "neo4j"
@@ -53,16 +53,16 @@ data:
           similarity_threshold: 0.85
 
     qdrant:
-      url: "http://test-qdrant"
-      port: 6333
-      api_key: ""
-      https: false
+      url: "https://qdrant-ai-core-engine.eu-de-7.icp.infineon.com"
+      port: 443
+      api_key: "${QDRANT_API_KEY}"
+      https: true
       embedding_dimension: 384
       distance_metric: "cosine"
-      grpc: true
+      grpc: false
       timeout: 30
-      verify_ssl: false
-      in_cluster_url: "http://test-qdrant"
+      verify_ssl: true
+      in_cluster_url: "http://qdrant.ai-core-engine-mcal.svc.cluster.local"
       in_cluster_grpc_port: 6334
       illd:
         description: "ILLD - Test Vector Store"

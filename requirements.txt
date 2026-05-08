@@ -1,10 +1,12 @@
 # AI Core Engine — Full Dependencies
 # =====================================
 # Sprint 25: CPU-only PyTorch to avoid ~2.5GB NVIDIA/CUDA downloads.
+# NOTE: CPU-only index URL is provided via pip CLI in Dockerfile
+#       (Artifactory mirror: pypi-pytorch-remote/cpu)
 
-# ─── Force CPU-only PyTorch (must come before any torch-dependent package) ─
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
+# ─── PyTorch (CPU-only, installed separately in Dockerfile) ─────────────────
+# torch is NOT listed here — it's installed from the Artifactory CPU-only mirror
+# in the Dockerfile BEFORE this file, to prevent pip resolving the GPU variant.
 
 # ─── MCP SDK (Model Context Protocol) ─────────────────────
 mcp>=1.26.0               # includes mcp.server.fastmcp (FastMCP)
@@ -79,6 +81,7 @@ cerbos>=0.5.0
 jenkinsapi>=0.3.13
 
 # ─── Code Analysis ────────────────────────────────────────
+libclang>=16.0            # Python bindings + bundled libclang.so (C AST parsing in sandbox)
 tree-sitter>=0.22
 # ─── Token Counting ────────────────────────────────────────────────
 tiktoken>=0.7.0           # Accurate GPT-4 token counting (ContextBuilder)

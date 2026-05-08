@@ -51,10 +51,17 @@ references
 # Temp / generated data
 temp/
 data/
+docs/
+tests/
 src/HybridRAG/jama-req/
 src/HybridRAG/swa/
 src/HybridRAG/swud/
 src/HybridRAG/testspec/
+src/HybridRAG/logs/
+
+# Include headers for Docker image (baked into container for sandbox clang parsing)
+# Populated by: python prepare_headers.py
+# Only TC49xN and TC4DxA device variants are committed (others stripped to save space)
 
 .mypy_cache/
 .ruff_cache/

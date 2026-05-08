@@ -120,6 +120,8 @@ class EAGraphBuilder:
         self.dry_run = dry_run
         self.clear = clear
         self.stats: Counter = Counter()
+        # Prefix for ea_id to prevent integer ID collisions across QEAX files
+        self.model_prefix = qeax_path.stem if qeax_path else DEFAULT_QEAX.stem
 
         # Neo4j config
         if neo4j_cfg is None:
@@ -283,6 +285,61 @@ class EAGraphBuilder:
                     queue.append(c[0])
         return visited
 
+    # ── Package ancestry & provenance ─────────────────────────────────────
+    _SECTION_KEYWORDS = {
+        "architecture": "architecture",
+        "design": "design",
+        "user manual": "user manual",
+        "product requirements": "product requirements",
+        "configuration": "configuration",
+        "modules": "modules",
+    }
+
+    def _build_package_ancestry(self, pkg_ids: set[int]) -> dict[int, dict]:
+        """Build {package_id: {"path": "Product/Adc/Architecture/...", "section": "architecture"}} for all pkg_ids.
+
+        The section is determined by finding the first ancestor package whose
+        name (lowercased) matches one of _SECTION_KEYWORDS.
+        """
+        # Load all packages in scope + their ancestors up to root
+        # First, grab name+parent for every package in the DB that could be an ancestor
+        rows = self._db.sql_query(
+            "SELECT Package_ID, Name, Parent_ID FROM t_package"
+        )
+        pkg_info = {r[0]: (r[1], r[2]) for r in rows}  # {id: (name, parent_id)}
+
+        ancestry = {}
+        for pid in pkg_ids:
+            # Walk up to root to build path
+            parts = []
+            section = None
+            cur = pid
+            while cur and cur in pkg_info:
+                name, parent = pkg_info[cur]
+                parts.append(name)
+                if section is None and name.lower() in self._SECTION_KEYWORDS:
+                    section = self._SECTION_KEYWORDS[name.lower()]
+                cur = parent
+
+            parts.reverse()
+            ancestry[pid] = {
+                "path": "/".join(parts),
+                "section": section or "unknown",
+            }
+        return ancestry
+
+    def _stamp_provenance(self, elements: dict[int, dict], ancestry: dict[int, dict]):
+        """Stamp ea_section and ea_source_path on each element based on its package_id."""
+        for props in elements.values():
+            pkg_id = props.get("package_id")
+            if pkg_id and pkg_id in ancestry:
+                info = ancestry[pkg_id]
+                props["ea_section"] = info["section"]
+                props["ea_source_path"] = info["path"]
+            else:
+                props["ea_section"] = "unknown"
+                props["ea_source_path"] = ""
+
     # ── Element extraction ────────────────────────────────────────────────
     def _extract_elements(self, pkg_ids: set[int]) -> dict[int, dict]:
         """Query all typed elements in the package scope, return {Object_ID: props}."""
@@ -300,7 +357,7 @@ class EAGraphBuilder:
                 continue
             mapping = STEREOTYPE_MAP[stereo]
             props = {
-                "ea_id": obj_id,
+                "ea_id": f"{self.model_prefix}:{obj_id}",
                 "name": name or "",
                 "object_type": obj_type,
                 "stereotype": stereo,
@@ -308,6 +365,7 @@ class EAGraphBuilder:
                 "package_id": pkg_id,
                 "module": self.module,
                 "label": mapping["label"],
+                "source_model": self.model_prefix,
             }
             # Store EA GUID as feature_id for cross-builder traceability
             if ea_guid:
@@ -530,7 +588,7 @@ class EAGraphBuilder:
                 continue
             mapping = STEREOTYPE_MAP[stereo]
             props = {
-                "ea_id": obj_id,
+                "ea_id": f"{self.model_prefix}:{obj_id}",
                 "name": name or "",
                 "object_type": obj_type,
                 "stereotype": stereo,
@@ -538,6 +596,7 @@ class EAGraphBuilder:
                 "package_id": pkg_id,
                 "module": self.module,
                 "label": mapping["label"],
+                "source_model": self.model_prefix,
             }
             if ea_guid:
                 props["feature_id"] = ea_guid.strip("{}")
@@ -694,9 +753,62 @@ class EAGraphBuilder:
             logger.debug("MCALModule constraint skipped (index may already exist)")
         logger.info("Created uniqueness constraints for %d labels", len(labels))
 
+    def _extract_report_metadata(self) -> dict:
+        """Extract ReportVersion and ReportStatus from the SWA master document."""
+        # The SWA master doc is a Package element named TC4xx_SW_MCAL_SWA_<Module>
+        # with tagged values ReportVersion/ReportStatus in t_objectproperties.
+        rows = self._db.sql_query(
+            "SELECT op.Property, op.Value "
+            "FROM t_objectproperties op "
+            "JOIN t_object o ON o.Object_ID = op.Object_ID "
+            "WHERE o.Name LIKE 'TC4xx_SW_MCAL_SWA_" + self.module + "%' "
+            "AND o.Object_Type = 'Package' "
+            "AND op.Property IN ('ReportVersion', 'ReportStatus')"
+        )
+        meta = {}
+        for prop, value in rows:
+            if prop == "ReportVersion":
+                meta["swa_report_version"] = value
+            elif prop == "ReportStatus":
+                meta["swa_report_status"] = value
+        if meta:
+            logger.info("SWA report metadata: version=%s, status=%s",
+                        meta.get("swa_report_version", "?"),
+                        meta.get("swa_report_status", "?"))
+        else:
+            logger.warning("No SWA report metadata found for module '%s'", self.module)
+        return meta
+
+    def _extract_swud_report_metadata(self) -> dict:
+        """Extract ReportVersion and ReportStatus from the SWUD master document."""
+        rows = self._db.sql_query(
+            "SELECT op.Property, op.Value "
+            "FROM t_objectproperties op "
+            "JOIN t_object o ON o.Object_ID = op.Object_ID "
+            "WHERE o.Name LIKE 'TC4xx_SW_MCAL_SWUD_" + self.module + "%' "
+            "AND o.Object_Type = 'Package' "
+            "AND op.Property IN ('ReportVersion', 'ReportStatus')"
+        )
+        meta = {}
+        for prop, value in rows:
+            if prop == "ReportVersion":
+                meta["swud_report_version"] = value
+            elif prop == "ReportStatus":
+                meta["swud_report_status"] = value
+        if meta:
+            logger.info("SWUD report metadata: version=%s, status=%s",
+                        meta.get("swud_report_version", "?"),
+                        meta.get("swud_report_status", "?"))
+        else:
+            logger.warning("No SWUD report metadata found for module '%s'", self.module)
+        return meta
+
     def _ingest_module_node(self):
-        """Create (or merge) the MCALModule node."""
-        self._merge_nodes("MCALModule", "name", [{"name": self.module}])
+        """Create (or merge) the MCALModule node with report metadata."""
+        props = {"name": self.module}
+        props.update(self._report_meta)
+        props.update(self._swud_meta)
+        self._merge_nodes("MCALModule", "name", [props])
 
     def _ingest_elements(self, elements: dict[int, dict]):
         """Group elements by label and MERGE into Neo4j."""
@@ -722,8 +834,8 @@ class EAGraphBuilder:
         by_rel = defaultdict(list)
         for conn in connectors:
             edge = {
-                "from_key": conn["from_id"],
-                "to_key": conn["to_id"],
+                "from_key": f"{self.model_prefix}:{conn['from_id']}",
+                "to_key": f"{self.model_prefix}:{conn['to_id']}",
             }
             if conn.get("name"):
                 edge["name"] = conn["name"]
@@ -766,7 +878,7 @@ class EAGraphBuilder:
 
     def _ingest_belongs_to_module(self, elements: dict[int, dict]):
         """Create BELONGS_TO_MODULE relationships from all EA nodes to MCALModule."""
-        edges = [{"from_key": eid, "to_key": self.module} for eid in elements]
+        edges = [{"from_key": f"{self.model_prefix}:{eid}", "to_key": self.module} for eid in elements]
         if not edges:
             return
         for chunk in _chunked(edges, BATCH_SIZE):
@@ -800,6 +912,10 @@ class EAGraphBuilder:
 
             self._create_constraints()
 
+            # ── Extract report metadata (version/status) ──
+            self._report_meta = self._extract_report_metadata()
+            self._swud_meta = self._extract_swud_report_metadata()
+
             # ── Extract from QEAX ──
             pkg_ids = self._get_module_package_ids()
             elements = self._extract_elements(pkg_ids)
@@ -807,6 +923,18 @@ class EAGraphBuilder:
             self._enrich_with_tagged_values(elements)
             self._enrich_with_attributes(elements)
             self._enrich_with_operations(elements)
+
+            # ── Provenance: ea_section + ea_source_path ──
+            ancestry = self._build_package_ancestry(pkg_ids)
+            self._stamp_provenance(elements, ancestry)
+
+            # Stamp section-appropriate report version/status on each element
+            for props in elements.values():
+                section = props.get("ea_section", "")
+                if section == "architecture" and self._report_meta:
+                    props.update(self._report_meta)
+                elif section == "design" and self._swud_meta:
+                    props.update(self._swud_meta)
 
             # ── HSI: pull out-of-scope registers & enrich ──
             hsi_connectors = self._pull_hsi_registers(elements, pkg_ids)

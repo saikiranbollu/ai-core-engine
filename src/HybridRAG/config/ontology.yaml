@@ -1016,6 +1016,22 @@ profiles:
             data_type: "boolean"
             required: false
             description: "Whether this module is an AUTOSAR standardised BSW module"
+          - name: "swa_report_version"
+            data_type: "string"
+            required: false
+            description: "SWA document version for this module"
+          - name: "swa_report_status"
+            data_type: "string"
+            required: false
+            description: "SWA document status for this module"
+          - name: "swud_report_version"
+            data_type: "string"
+            required: false
+            description: "SWUD document version for this module"
+          - name: "swud_report_status"
+            data_type: "string"
+            required: false
+            description: "SWUD document status for this module"
 
       # =====================================================================
       #  EA (Enterprise Architect) — QEAX-Extracted Node Types
@@ -1030,6 +1046,14 @@ profiles:
       #
       # Each node carries an ea_id (unique EA Object_ID) and dynamic
       # tagged values (tv_*) and operation tags (op_*) from the EA model.
+      #
+      # COMMON PROVENANCE PROPERTIES (present on ALL EA_* nodes):
+      #   ea_section        – "architecture", "design", or "user manual"
+      #   ea_source_path    – full package ancestry (e.g. "Product/Adc/Architecture/Static view/...")
+      #   swa_report_version – SWA doc version (architecture-section nodes only)
+      #   swa_report_status  – SWA doc status (architecture-section nodes only)
+      #   swud_report_version – SWUD doc version (design-section nodes only)
+      #   swud_report_status  – SWUD doc status (design-section nodes only)
       #
       # Source: QEAX file → SQLite → ea_graph_builder.py / ea_diagram_extractor.py
       # Replaces: SWA_* and SWUD_* node types (PDF-parsed equivalents)
@@ -1077,6 +1101,30 @@ profiles:
             data_type: "string"
             required: false
             description: "MCAL module name (e.g. Adc, Can, Spi)"
+          - name: "ea_section"
+            data_type: "string"
+            required: false
+            description: "Top-level EA section: 'architecture', 'design', or 'user manual'"
+          - name: "ea_source_path"
+            data_type: "string"
+            required: false
+            description: "Full package ancestry path from QEAX (e.g. 'Product/Adc/Architecture/Static view/API functions')"
+          - name: "swa_report_version"
+            data_type: "string"
+            required: false
+            description: "SWA document version (architecture-section nodes only)"
+          - name: "swa_report_status"
+            data_type: "string"
+            required: false
+            description: "SWA document status (architecture-section nodes only)"
+          - name: "swud_report_version"
+            data_type: "string"
+            required: false
+            description: "SWUD document version (design-section nodes only)"
+          - name: "swud_report_status"
+            data_type: "string"
+            required: false
+            description: "SWUD document status (design-section nodes only)"
           - name: "kind"
             data_type: "string"
             required: false

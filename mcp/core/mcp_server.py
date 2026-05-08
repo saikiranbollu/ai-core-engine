@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json, logging, os, sys, time
+import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -145,19 +146,39 @@ def _finish_tool(status: str) -> None:
         return
     name = _tool_name_ctx.get("")
     t0 = _tool_start_time.get(0.0)
+    da = _current_da_name.get("unknown")
     if name:
-        TOOL_REQUESTS_TOTAL.labels(tool=name, status=status).inc()
-        TOOL_REQUEST_DURATION.labels(tool=name).observe(time.time() - t0)
+        TOOL_REQUESTS_TOTAL.labels(da_name=da, tool=name, status=status).inc()
+        TOOL_REQUEST_DURATION.labels(da_name=da, tool=name).observe(time.time() - t0)
 
 # ── Envelope helpers ───────────────────────────────────────────────────────
 def _ok(data: Any) -> str:
     """Wrap a successful result — wire-compatible with base repo contract."""
     _finish_tool("ok")
-    return json.dumps({"error": False, "data": data}, indent=2, default=str)
+    result: Dict[str, Any] = {"error": False, "data": data}
+    rid = _current_request_id.get("")
+    if rid:
+        result["request_id"] = rid
+    return json.dumps(result, indent=2, default=str)
 
-def _err(code: str, message: str) -> str:
+def _err(code: str, message: str, *, _raw_exception: BaseException | None = None) -> str:
+    """Return JSON error response. In production, sanitize internal details."""
     _finish_tool("error")
-    return json.dumps({"error": True, "error_code": code, "message": message})
+    correlation_id = _current_request_id.get("") or str(_uuid.uuid4())[:8]
+
+    if _SANITIZE_ERRORS and code == "INTERNAL_ERROR":
+        logger.error(
+            "Tool error [%s]: %s", correlation_id, message,
+            exc_info=_raw_exception,
+        )
+        safe_message = f"Internal error occurred. Reference: {correlation_id}"
+    else:
+        safe_message = message
+
+    return json.dumps({
+        "error": True, "error_code": code,
+        "message": safe_message, "correlation_id": correlation_id,
+    })
 
 
 # ── Metrics helpers (Tickets 7 & 8) ──────────────────────────────────────
@@ -207,6 +228,23 @@ def _classify_and_record_error(exc: Exception, component: str) -> None:
 _current_api_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_current_api_key", default="",
 )
+_current_da_name: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_da_name", default="unknown",
+)
+_current_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_request_id", default="",
+)
+
+_SANITIZE_ERRORS = os.environ.get("SANITIZE_ERRORS", "true").lower() in ("true", "1", "yes")
+
+def _resolve_da_name(api_key: str) -> str:
+    """Look up the principal_id (DA name) for an API key."""
+    from .auth_middleware import load_api_keys
+    registry = load_api_keys()
+    entry = registry.get(api_key)
+    if entry is None:
+        return "unknown"
+    return entry.get("principal_id", "unknown")
 
 def _authorize(tool_name: str, **kw) -> Optional[str]:
     """Run Cerbos authorization for *tool_name*.
@@ -222,8 +260,12 @@ def _authorize(tool_name: str, **kw) -> Optional[str]:
     if not api_key:
         return _err_permission_denied("No API key provided (set MCP_API_KEY env var or send Authorization header)")
 
+    # Resolve DA name from API key for metrics labelling
+    _current_da_name.set(_resolve_da_name(api_key))
+
     ws = extract_workspace_id(**kw)
-    allowed, message = check_authorization(api_key, tool_name, ws)
+    module_name = kw.get("module_name", None)
+    allowed, message = check_authorization(api_key, tool_name, ws, module_name)
 
     # Audit logging (best-effort, never blocks the tool)
     pg = _get_postgres_client()
@@ -261,13 +303,17 @@ def with_session_routing(tool_name: str):
                 sm = _get_sandbox_manager()
                 sandbox = sm.get_sandbox(session_id) if sm else None
                 if sandbox:
-                    from src.MemoryLayer.memory.ephemeral_sandbox import HybridGraphService
+                    from src.MemoryLayer.memory.ephemeral_sandbox import (
+                        HybridGraphService, HybridTraversal,
+                    )
                     ws = kwargs.get("workspace_id", "illd")
                     driver = _get_neo4j(ws)
                     hybrid = HybridGraphService(sandbox, driver)
+                    traversal = HybridTraversal(sandbox, driver, ws)
                     classification = HybridGraphService.classify_tool(tool_name)
 
                     kwargs["graph_service"] = hybrid
+                    kwargs["hybrid_traversal"] = traversal
                     kwargs["query_mode"] = classification
                     kwargs["sandbox_ctx"] = sandbox
 
@@ -289,13 +335,15 @@ def with_session_routing(tool_name: str):
 # ── Lazy backend connections (BUG FIX #3: creds from env only) ─────────────
 #
 # Neo4j instance binding:
-#   Each MCP deployment is bound to exactly ONE Neo4j instance, set via
-#   MCP_NEO4J_INSTANCE env var (e.g. "local", "test", "mcal").
-#   The workspace_id ("illd"/"mcal") is purely an ontology concept and
-#   does NOT influence which Neo4j server is used.
+#   The workspace_id ("illd"/"mcal"/"test") determines which Neo4j instance
+#   to connect to, resolved from storage_config.yaml per profile.
+#   MCP_NEO4J_INSTANCE env var provides a fallback override.
+#   Drivers are cached per-profile for connection reuse.
 #
 _NEO4J_INSTANCE: str = os.environ.get("MCP_NEO4J_INSTANCE", "")
-_neo4j_driver = None          # single shared driver for the bound instance
+_DEFAULT_MAX_DEPTH = int(os.environ.get("MAX_DEPENDENCIES_DEPTH", "3"))
+_SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "3600"))
+_neo4j_drivers: Dict[str, Any] = {}   # per-profile driver pool
 _qdrant_client = None
 _redis_client = None
 
@@ -315,35 +363,59 @@ def _load_neo4j_profile_config(profile: str) -> Optional[Dict[str, Any]]:
         return None
 
 def _get_neo4j(profile: str = "illd"):
-    """Return the shared Neo4j driver for this MCP deployment.
+    """Return a Neo4j driver for the given workspace profile.
 
-    The Neo4j instance is determined by the MCP_NEO4J_INSTANCE env var,
-    NOT by the workspace_id/profile parameter.  All workspaces ("illd",
-    "mcal") share the same driver because they live in the same database.
+    Maintains a per-profile driver pool so that different workspaces
+    (illd, mcal, test) connect to their respective Neo4j instances
+    as defined in storage_config.yaml. Thread/async-safe via asyncio.Lock.
 
     Resolution order for the connection URI:
-      1. MCP_NEO4J_INSTANCE env var → storage_config.yaml[neo4j][<instance>]
-      2. NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD env vars (K8s / legacy)
+      0. NEO4J_URI env var override (skips storage_config entirely)
+      1. storage_config.yaml[neo4j][<profile>] (preferred)
+      2. MCP_NEO4J_INSTANCE env var → storage_config.yaml[neo4j][<instance>]
+      3. NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD env vars (K8s / legacy)
+      4. bolt://localhost:7687 default fallback
     """
-    global _neo4j_driver
-    if _neo4j_driver is not None:
-        return _neo4j_driver
+    # Determine the effective instance key
+    instance = profile or _NEO4J_INSTANCE or "illd"
 
-    # Resolve which storage_config profile to use for the connection
-    instance = _NEO4J_INSTANCE  # e.g. "local", "test", "mcal"
+    # Return cached driver if available (fast path, no lock)
+    if instance in _neo4j_drivers:
+        return _neo4j_drivers[instance]
+
+    return _create_neo4j_driver(instance)
+
+
+def _create_neo4j_driver(instance: str):
+    """Create and cache a Neo4j driver for the given instance (sync helper)."""
+    # Double-check after potential await
+    if instance in _neo4j_drivers:
+        return _neo4j_drivers[instance]
 
     try:
         from neo4j import GraphDatabase
-        cfg = _load_neo4j_profile_config(instance) if instance else None
-        if cfg:
-            uri = cfg["uri"]
-            auth = (cfg["username"], cfg["password"])
-            logger.info("[Neo4j] Connecting instance '%s' → %s", instance, uri)
-        else:
-            uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+        # Step 0: NEO4J_URI env var override (skips storage_config entirely)
+        env_uri = os.environ.get("NEO4J_URI")
+        if env_uri:
+            uri = env_uri
             auth = (os.environ.get("NEO4J_USERNAME", "neo4j"),
                     os.environ.get("NEO4J_PASSWORD", ""))
-            logger.info("[Neo4j] Connecting → %s (env fallback)", uri)
+            logger.info("[Neo4j] Connecting profile '%s' → %s (NEO4J_URI override)", profile, uri)
+        else:
+            # Try profile-specific config from storage_config.yaml
+            cfg = _load_neo4j_profile_config(instance)
+            if not cfg and instance != _NEO4J_INSTANCE and _NEO4J_INSTANCE:
+                # Fallback: try the MCP_NEO4J_INSTANCE override
+                cfg = _load_neo4j_profile_config(_NEO4J_INSTANCE)
+            if cfg:
+                uri = cfg["uri"]
+                auth = (cfg["username"], cfg["password"])
+                logger.info("[Neo4j] Connecting profile '%s' → %s", instance, uri)
+            else:
+                uri = "bolt://localhost:7687"
+                auth = (os.environ.get("NEO4J_USERNAME", "neo4j"),
+                        os.environ.get("NEO4J_PASSWORD", ""))
+                logger.info("[Neo4j] Connecting profile '%s' → %s (default fallback)", profile, uri)
 
         # Pool config from storage_config.yaml (or sensible defaults)
         pool_kwargs = {}
@@ -364,10 +436,10 @@ def _get_neo4j(profile: str = "illd"):
             }
 
         driver = GraphDatabase.driver(uri, auth=auth, **pool_kwargs)
-        _neo4j_driver = driver
+        _neo4j_drivers[instance] = driver
         return driver
     except Exception as e:
-        logger.error("Neo4j init for profile '%s': %s", profile, e)
+        logger.error("Neo4j init for profile '%s': %s", instance, e)
         _classify_and_record_error(e, "neo4j")
         return None
 
@@ -1360,9 +1432,11 @@ async def get_node_by_id(
 async def get_neighbors(
     document_id: Optional[str] = None, jama_id: Optional[int] = None,
     direction: str = "both", relationship_types: Optional[List[str]] = None,
+    depth: int = 1,
     limit: int = 20, workspace_id: str = "illd", session_id: Optional[str] = None,
     query_mode: Optional[str] = None,
     graph_service: Optional[Any] = None,
+    hybrid_traversal: Optional[Any] = None,
     sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Direct graph traversal — get all nodes connected to a known node.
@@ -1380,6 +1454,9 @@ async def get_neighbors(
             mcal types: DERIVES_FROM, VERIFIED_BY, HAS_RESULT, BELONGS_TO_MODULE,
             EA_DEPENDS_ON, EA_ACCESSES_REGISTER, EA_IMPLEMENTS, etc.
             Run `get_ontology_schema` to get the full list of relationship types.
+        depth (int): Number of hops to traverse. Default 1.
+            When depth > 1 and a sandbox session is active, uses hybrid traversal
+            that seamlessly continues into production Neo4j at boundary leaves.
         limit (int): Max neighbor nodes to return. Default 20.
         workspace_id (str): Target workspace — "illd" or "mcal". Default "illd".
 
@@ -1395,18 +1472,39 @@ async def get_neighbors(
     if denied:
         return denied
     try:
-        # ── Plan 2: Sandbox routing (shallow) ──
+        # ── Plan 2: Sandbox routing with hybrid traversal ──
         query_mode = query_mode
         if query_mode == "sandbox":
             sandbox = sandbox_ctx
             if sandbox and document_id:
                 source = sandbox.graph.get_node(document_id)
                 if source:
-                    # Simple neighbor traversal from ephemeral graph
+                    # Multi-hop: use HybridTraversal (shadow → prod continuation)
+                    if depth > 1 and hybrid_traversal:
+                        result = hybrid_traversal.traverse(
+                            start_id=document_id,
+                            direction=direction,
+                            max_depth=depth,
+                            rel_types=relationship_types,
+                            limit=limit,
+                        )
+                        return _ok({
+                            "source": {"node_id": document_id, "label": source.get("_node_type", "Unknown")},
+                            "nodes": result["nodes"],
+                            "edges": result["edges"],
+                            "total_nodes": result["total_nodes"],
+                            "boundary_continuations": result["boundary_continuations"],
+                            "continued_from": result["continued_from"],
+                            "truncated": result["truncated"],
+                        })
+
+                    # Single-hop: direct NetworkX traversal (fast path)
                     neighbors = []
                     g = sandbox.graph._graph
                     if direction in ("out", "both"):
                         for _, target_id, edge_data in g.out_edges(document_id, data=True):
+                            if relationship_types and edge_data.get("_rel_type") not in relationship_types:
+                                continue
                             neighbor = sandbox.graph.get_node(target_id)
                             if neighbor:
                                 neighbors.append({
@@ -1414,10 +1512,13 @@ async def get_neighbors(
                                     "label": neighbor.get("_node_type", "Unknown"),
                                     "relationship": edge_data.get("_rel_type", "RELATED_TO"),
                                     "direction": "out",
+                                    "origin": neighbor.get("_origin", "unknown"),
                                     "properties": {k: v for k, v in neighbor.items() if not k.startswith("_")}
                                 })
                     if direction in ("in", "both"):
                         for source_id, _, edge_data in g.in_edges(document_id, data=True):
+                            if relationship_types and edge_data.get("_rel_type") not in relationship_types:
+                                continue
                             neighbor = sandbox.graph.get_node(source_id)
                             if neighbor:
                                 neighbors.append({
@@ -1425,6 +1526,7 @@ async def get_neighbors(
                                     "label": neighbor.get("_node_type", "Unknown"),
                                     "relationship": edge_data.get("_rel_type", "RELATED_TO"),
                                     "direction": "in",
+                                    "origin": neighbor.get("_origin", "unknown"),
                                     "properties": {k: v for k, v in neighbor.items() if not k.startswith("_")}
                                 })
                     return _ok({
@@ -1453,6 +1555,7 @@ async def shortest_path(
     max_depth: int = 8, workspace_id: str = "illd", session_id: Optional[str] = None,
     query_mode: Optional[str] = None,
     graph_service: Optional[Any] = None,
+    hybrid_traversal: Optional[Any] = None,
     sandbox_ctx: Optional[Any] = None,
 ) -> str:
     """Find the shortest path between two nodes in the knowledge graph.
@@ -1481,25 +1584,26 @@ async def shortest_path(
     if denied:
         return denied
     try:
-        # ── Plan 2: Sandbox routing (deep/hybrid) ──
+        # ── Plan 2: Sandbox routing — HybridTraversal shortest_path ──
         query_mode = query_mode
-        if query_mode == "hybrid":
-            hybrid = graph_service
-            if hybrid and from_document_id and to_document_id:
-                # Use hybrid deep query to find shortest path with prod neighbor context
-                cypher = """
-                MATCH path = shortestPath( (:Node {_node_id: $from}) -[*..{max_depth}]-> (:Node {_node_id: $to}) )
-                RETURN path, length(path) as path_length
-                LIMIT 1
-                """.replace("{max_depth}", str(max_depth))
-                results = hybrid.deep_query(cypher, {"from": from_document_id, "to": to_document_id}, workspace_id)
-                if results:
+        if query_mode in ("hybrid", "sandbox"):
+            if hybrid_traversal and from_document_id and to_document_id:
+                result = hybrid_traversal.shortest_path(
+                    start_id=from_document_id,
+                    end_id=to_document_id,
+                    max_depth=max_depth,
+                    rel_types=None,
+                )
+                if result:
                     return _ok({
-                        "path": [{"node_id": r.get("_node_id"), "label": r.get("_node_type"), "_origin": r.get("_origin")} for r in results],
-                        "relationships": [],
-                        "length": len(results),
-                        "found": True
+                        "path": result["path_nodes"],
+                        "relationships": result["path_edges"],
+                        "length": result["total_hops"],
+                        "found": True,
+                        "segments": result["segments"],
                     })
+                else:
+                    return _ok({"path": [], "relationships": [], "length": 0, "found": False})
         
         # ── No session → existing production path (unchanged) ──
         svc = _get_search_service(workspace_id)
@@ -1746,7 +1850,7 @@ async def generate_initialization_code(
 @mcp.tool()
 @with_session_routing("query_dependencies")
 async def query_dependencies(
-    function_name: str, module_name: Optional[str] = None, max_depth: int = 3,
+    function_name: str, module_name: Optional[str] = None, max_depth: int = _DEFAULT_MAX_DEPTH,
     include_hardware: bool = False, workspace_id: str = "illd", session_id: Optional[str] = None,
     query_mode: Optional[str] = None,
     graph_service: Optional[Any] = None,
@@ -1762,8 +1866,8 @@ async def query_dependencies(
             Run `search_nodes` with label="APIFunction" to discover function names.
         module_name (str | None): Module name to scope the search (e.g. "Adc").
             Run `list_available_modules` to get valid module names.
-        max_depth (int): Maximum depth for transitive dependency traversal.
-            Default 3. Higher values may return large trees.
+        max_depth (int): Maximum traversal depth. Default from MAX_DEPENDENCIES_DEPTH
+            env var (fallback: 3). Per-request override supported.
         include_hardware (bool): Include hardware register dependencies
             (ACCESSES_REGISTER relationships). Default False.
         workspace_id (str): Target workspace — "illd" or "mcal". Default "illd".
@@ -2341,7 +2445,8 @@ async def session_start(
 
     Sessions persist key-value data and context across multiple tool calls.
     Convention: use "{ASSISTANT}_{timestamp}" format for session IDs.
-    All sessions have a fixed TTL of 3600 seconds (1 hour).
+    TTL is enforced server-side via SESSION_TTL_SECONDS env var (default: 3600s).
+    Sessions automatically expire after this period.
     Access tier: public.
 
     Parameters:
@@ -2365,13 +2470,12 @@ async def session_start(
         mgr = _get_session_manager()
         if not mgr:
             return _err("INTERNAL_ERROR", "SessionManager not initialized")
-        TTL_FIXED = 3600  # Fixed at 1 hour for all sessions (Plan 2)
         session = mgr.create(session_id=session_id, assistant_name=assistant_name or "",
-                              module_context=module_context or "", ttl_seconds=TTL_FIXED)
+                              module_context=module_context or "", ttl_seconds=_SESSION_TTL_SECONDS)
         ACTIVE_SESSIONS.inc()
         return _ok({"session_id": session.session_id, "created": True,
                      "store_type": type(mgr._backend).__name__,
-                     "ttl_seconds": TTL_FIXED})
+                     "ttl_seconds": _SESSION_TTL_SECONDS})
     except ValueError as ve:
         return _err("INVALID_INPUT", str(ve))
     except Exception as exc:
@@ -2550,6 +2654,7 @@ async def sandbox_upload(
     trace_depth: int = 1,
     module: Optional[str] = None,
     workspace_id: str = "illd",
+    include_paths: Optional[List[str]] = None,
 ) -> str:
     """Upload documents into an ephemeral KG + vector store scoped to a session.
 
@@ -2575,6 +2680,10 @@ async def sandbox_upload(
         module (str | None): Module name (e.g. "Adc", "Can"). Auto-detected
             from content if not set.
         workspace_id (str): Target workspace — "illd" or "mcal". Default "illd".
+        include_paths (list[str] | None): Additional -I include paths for
+            clang C parsing. When provided, enables full SFR access and
+            global variable detection.  Pass "auto" as the single element
+            to auto-discover from pipeline temp data.
 
     Returns (JSON):
         {
@@ -2607,7 +2716,24 @@ async def sandbox_upload(
         import shutil
 
         sandbox = sm.create_sandbox(session_id)
-        dispatcher = SandboxParserDispatcher()
+
+        # ── Resolve include paths (auto-discover or explicit) ──
+        resolved_include_paths: List[str] = []
+        skip_default_stubs = False
+        if include_paths and len(include_paths) == 1 and include_paths[0].lower() == "auto":
+            # Auto-discover from pipeline temp data once module is known
+            # (deferred until after module detection below)
+            _auto_discover_includes = True
+        else:
+            _auto_discover_includes = False
+            if include_paths:
+                resolved_include_paths = [p for p in include_paths if Path(p).is_dir()]
+                skip_default_stubs = bool(resolved_include_paths)
+
+        dispatcher = SandboxParserDispatcher(
+            include_paths=resolved_include_paths,
+            skip_default_stubs=skip_default_stubs,
+        )
         adapter = SandboxAdapter()
         tmp_dir = Path(f"/tmp/sandbox_{session_id}")
 
@@ -2660,10 +2786,56 @@ async def sandbox_upload(
                     all_node_names.extend(extracted_names)
                     parsed_files.append((parsed, p.name))
 
+            # ── Resolve module name (uppercase to match Neo4j convention) ──
+            detected_module = module or _detect_module_from_names(all_node_names)
+
+            # ── Auto-discover include paths if requested ──
+            if _auto_discover_includes and detected_module:
+                resolved_include_paths = _auto_discover_module_include_paths(detected_module)
+                if resolved_include_paths:
+                    skip_default_stubs = True
+                    # Re-create dispatcher with discovered paths
+                    dispatcher = SandboxParserDispatcher(
+                        include_paths=resolved_include_paths,
+                        skip_default_stubs=True,
+                    )
+                    # Re-parse files with proper include paths
+                    all_node_names = []
+                    parsed_files = []
+                    if documents:
+                        for doc in documents:
+                            filename = doc.get("filename", "untitled.txt")
+                            content = doc.get("content", "")
+                            if not content:
+                                continue
+                            encoding = doc.get("encoding", "utf-8")
+                            if encoding == "base64":
+                                content_bytes = base64.b64decode(content)
+                            else:
+                                content_bytes = content.encode("utf-8")
+                            tmp_path = tmp_dir / filename
+                            tmp_path.parent.mkdir(parents=True, exist_ok=True)
+                            tmp_path.write_bytes(content_bytes)
+                            parsed = await asyncio.to_thread(dispatcher.parse, tmp_path)
+                            extracted_names = adapter._extract_node_names_from_parsed(parsed)
+                            all_node_names.extend(extracted_names)
+                            parsed_files.append((parsed, filename))
+                    elif file_paths:
+                        for fp in file_paths:
+                            p = Path(fp)
+                            if not p.exists():
+                                continue
+                            parsed = await asyncio.to_thread(dispatcher.parse, p)
+                            extracted_names = adapter._extract_node_names_from_parsed(parsed)
+                            all_node_names.extend(extracted_names)
+                            parsed_files.append((parsed, p.name))
+                    logger.info("sandbox_upload: auto-discovered %d include paths for %s",
+                                len(resolved_include_paths), detected_module)
+            has_includes = bool(resolved_include_paths)
+
             # ── Plan 2 Phase 5 FIX: Load PRODUCTION nodes FIRST (before sandbox ingest) ──
             prod_stats = {"prod_nodes_loaded": 0, "prod_relationships_loaded": 0}
             if trace_depth > 0 and all_node_names:
-                detected_module = module or _detect_module_from_names(all_node_names)
                 driver = _get_neo4j(workspace_id)
                 if driver:
                     puller = TraceabilityPuller(driver)
@@ -2681,7 +2853,9 @@ async def sandbox_upload(
             # ── Plan 2 Phase 5 FIX: NOW ingest sandbox files (shadow detection works correctly) ──
             parsed_results = []
             for parsed, filename in parsed_files:
-                node_names = adapter.ingest_parsed(sandbox, parsed, filename, module=module)
+                node_names = adapter.ingest_parsed(sandbox, parsed, filename,
+                                                   module=detected_module,
+                                                   has_include_paths=has_includes)
                 parsed_results.append({"filename": filename, "nodes": len(node_names)})
 
             # ── Phase 2: Boundary Resolution (cross-module Unknown → typed prod nodes) ──
@@ -2717,6 +2891,7 @@ async def sandbox_upload(
                 "files_ingested": len(parsed_results),
                 "nodes_created": sandbox.graph.node_count,
                 "node_names_extracted": len(all_node_names),
+                "include_paths_used": len(resolved_include_paths),
                 **prod_stats,
                 **boundary_stats,
                 "sandbox_status": sandbox.status(),
@@ -2727,6 +2902,100 @@ async def sandbox_upload(
     except Exception as exc:
         logger.exception("sandbox_upload failed")
         return _err("INTERNAL_ERROR", str(exc))
+
+
+def _auto_discover_module_include_paths(module: str) -> List[str]:
+    """Auto-discover C include paths for a module from baked-in Docker headers
+    or the local pipeline temporary_data directory.
+
+    Search order (first existing base wins):
+    1. ``INCLUDE_HEADERS_DIR`` env var  (default ``/app/include_headers``)
+    2. Local pipeline ``temporary_data/`` relative to this source tree
+
+    Within the chosen base directory the function searches for:
+    - Module CfgMcal config headers  (``<mod>_cfgmcal/inc``)
+    - Shared dependency headers       (``rc1_deps/``)
+    - SFR device headers              (a3g: ``aurix3g_…_infra_sfr/<Device>/``,
+                                       rc1: ``aurix_rc1_sw_mcal_sfr/ssc/<Device>/inc/``)
+    - Module source API headers       (a3g: ``aurix3g_…_<mod>_src/ssc/{inc,src}``,
+                                       rc1: ``aurix_rc1_sw_mcal_dev_<mod>/ssc/{inc,src}``)
+
+    The logic is project-agnostic — it checks both a3g and rc1 naming
+    conventions and includes whichever directories exist.
+
+    Returns a list of existing directory paths to pass as ``-I`` flags to clang.
+    """
+    # ── Resolve base directory ──
+    docker_base = Path(os.environ.get("INCLUDE_HEADERS_DIR", "/app/include_headers"))
+    local_base = Path(__file__).resolve().parents[2] / "src" / "HybridRAG" / "temp" / "temporary_data"
+
+    base: Optional[Path] = None
+    if docker_base.is_dir():
+        base = docker_base
+    elif local_base.is_dir():
+        base = local_base
+
+    if base is None:
+        return []
+
+    mod_lower = module.lower()
+    include_paths: List[str] = []
+
+    # 1. CfgMcal headers: <mod>_cfgmcal/inc
+    cfgmcal = base / f"{mod_lower}_cfgmcal" / "inc"
+    if cfgmcal.is_dir():
+        include_paths.append(str(cfgmcal))
+
+    # 2. Shared dependency headers: rc1_deps
+    deps = base / "rc1_deps"
+    if deps.is_dir():
+        include_paths.append(str(deps))
+
+    # 3. SFR device headers — supports both a3g and rc1 layouts
+    #    a3g:  aurix3g_sw_mcal_tc4xx_infra_sfr/<TC49xN>/  (headers directly in device dir)
+    #    rc1:  aurix_rc1_sw_mcal_sfr/ssc/<RC1S16>/inc/    (headers under inc/)
+    sfr_candidates = [
+        ("aurix3g_sw_mcal_tc4xx_infra_sfr", None),       # a3g: device dirs at top level
+        ("aurix_rc1_sw_mcal_sfr", Path("ssc")),           # rc1: device dirs under ssc/
+    ]
+    for sfr_dirname, sub_path in sfr_candidates:
+        sfr_root = base / sfr_dirname
+        if sub_path:
+            sfr_root = sfr_root / sub_path
+        if not sfr_root.is_dir():
+            continue
+        device_dirs = sorted([d for d in sfr_root.iterdir() if d.is_dir()])
+        if not device_dirs:
+            continue
+        # Prefer TC49* device (a3g) or first available (rc1)
+        chosen = device_dirs[0]
+        for d in device_dirs:
+            if "TC49" in d.name:
+                chosen = d
+                break
+        # rc1 has an extra /inc level; a3g has headers directly in device dir
+        inc_subdir = chosen / "inc"
+        include_paths.append(str(inc_subdir) if inc_subdir.is_dir() else str(chosen))
+
+    # 4. Module source headers — supports both a3g and rc1 naming
+    #    a3g: aurix3g_sw_mcal_tc4xx_<mod>_src/ssc/{inc,src}
+    #    rc1: aurix_rc1_sw_mcal_dev_<mod>/ssc/{inc,src}
+    src_patterns = [
+        f"aurix3g_sw_mcal_tc4xx_{mod_lower}_src",   # a3g
+        f"aurix_rc1_sw_mcal_dev_{mod_lower}",        # rc1
+    ]
+    for src_pattern in src_patterns:
+        src_base = base / src_pattern
+        if not src_base.is_dir():
+            continue
+        ssc_inc = src_base / "ssc" / "inc"
+        ssc_src = src_base / "ssc" / "src"
+        if ssc_inc.is_dir():
+            include_paths.append(str(ssc_inc))
+        if ssc_src.is_dir():
+            include_paths.append(str(ssc_src))
+
+    return include_paths
 
 
 def _detect_module_from_names(node_names: List[str]) -> str:
@@ -4147,6 +4416,10 @@ async def query_enhance(query: str, include_synonyms: bool = False, session_id: 
 #  STARTUP
 # ═════════════════════════════════════════════════════════════════════════
 
+# Validate that every @mcp.tool() has a TOOL_TIERS entry (fail-fast)
+from .tool_tiers import validate_tool_registration
+validate_tool_registration(mcp)
+
 class _APIKeyMiddleware:
     """ASGI middleware that reads ``Authorization: Bearer <key>`` from
     incoming HTTP requests and stores it in the ``_current_api_key``
@@ -4161,11 +4434,19 @@ class _APIKeyMiddleware:
             headers = dict(scope.get("headers", []))
             auth = (headers.get(b"authorization", b"")).decode("utf-8", errors="ignore")
             api_key = auth.removeprefix("Bearer ").strip() if auth else ""
-            token = _current_api_key.set(api_key)
+
+            # Extract or generate X-Request-ID for distributed tracing
+            request_id = (headers.get(b"x-request-id", b"")).decode("utf-8", errors="ignore")
+            if not request_id:
+                request_id = str(_uuid.uuid4())[:8]
+
+            token_key = _current_api_key.set(api_key)
+            token_rid = _current_request_id.set(request_id)
             try:
                 await self.app(scope, receive, send)
             finally:
-                _current_api_key.reset(token)
+                _current_api_key.reset(token_key)
+                _current_request_id.reset(token_rid)
         else:
             await self.app(scope, receive, send)
 

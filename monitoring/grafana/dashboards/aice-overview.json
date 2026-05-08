@@ -11,7 +11,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "targets": [
         {
-          "expr": "sum(rate(aice_tool_requests_total[5m])) by (tool)",
+          "expr": "sum(rate(aice_tool_requests_total{da_name=~\"$da_name\"}[5m])) by (tool)",
           "legendFormat": "{{ tool }}",
           "refId": "A"
         }
@@ -29,7 +29,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "targets": [
         {
-          "expr": "sum(rate(aice_tool_requests_total{status=\"error\"}[5m])) by (tool)",
+          "expr": "sum(rate(aice_tool_requests_total{status=\"error\", da_name=~\"$da_name\"}[5m])) by (tool)",
           "legendFormat": "{{ tool }}",
           "refId": "A"
         }
@@ -48,17 +48,17 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(aice_tool_request_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(aice_tool_request_duration_seconds_bucket{da_name=~\"$da_name\"}[5m])) by (le))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(aice_tool_request_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(aice_tool_request_duration_seconds_bucket{da_name=~\"$da_name\"}[5m])) by (le))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum(rate(aice_tool_request_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(aice_tool_request_duration_seconds_bucket{da_name=~\"$da_name\"}[5m])) by (le))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -210,7 +210,7 @@
   ],
   "schemaVersion": 39,
   "tags": ["aice", "mcp", "automotive"],
-  "templating": { "list": [] },
+  "templating": { "list": [{ "name": "da_name", "label": "DA Name", "type": "query", "query": "label_values(aice_tool_requests_total, da_name)", "datasource": { "type": "prometheus" }, "includeAll": true, "allValue": ".*", "current": { "text": "All", "value": "$__all" }, "refresh": 2, "multi": true, "sort": 1 }] },
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",

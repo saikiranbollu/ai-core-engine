@@ -46,13 +46,13 @@ resourcePolicy:
               - expr: "request.resource.attr.tool_name == 'session_end'"
               # Category 6+: Ephemeral Sandbox
               - expr: "request.resource.attr.tool_name == 'sandbox_upload'"
-              - expr: "request.resource.attr.tool_name == 'sandbox_query'"
               - expr: "request.resource.attr.tool_name == 'sandbox_status'"
               - expr: "request.resource.attr.tool_name == 'sandbox_clear'"
               - expr: "request.resource.attr.tool_name == 'sandbox_diff'"
               # Category 6+: RLM
-              - expr: "request.resource.attr.tool_name == 'rlm_orchestrate'"
               - expr: "request.resource.attr.tool_name == 'rlm_plan_preview'"
+              # Category 6+: HSI
+              - expr: "request.resource.attr.tool_name == 'get_function_hsi'"
               # Category 8: Feedback & Learning
               - expr: "request.resource.attr.tool_name == 'submit_human_feedback'"
               # Category 9: Review Gate
@@ -93,9 +93,9 @@ resourcePolicy:
               # Category 10: Ontology & Config
               - expr: "request.resource.attr.tool_name == 'validate_entity'"
               - expr: "request.resource.attr.tool_name == 'get_ontology_compliance'"
+              # Category 6+: RLM
+              - expr: "request.resource.attr.tool_name == 'rlm_orchestrate'"
               # Category 11: Observability & Health
-              - expr: "request.resource.attr.tool_name == 'get_distribution'"
-              - expr: "request.resource.attr.tool_name == 'get_coverage_report'"
               - expr: "request.resource.attr.tool_name == 'detect_communities'"
               # Category 12: Visualization
               - expr: "request.resource.attr.tool_name == 'visualize_subgraph'"
@@ -112,11 +112,6 @@ resourcePolicy:
         match:
           any:
             of:
-              # Category 5: Ingestion Pipeline
-              - expr: "request.resource.attr.tool_name == 'ingest_file'"
-              - expr: "request.resource.attr.tool_name == 'ingest_module_from_repo'"
-              - expr: "request.resource.attr.tool_name == 'batch_ingest_modules'"
-              - expr: "request.resource.attr.tool_name == 'ingest_repository'"
               # Category 7: Cache Management
               - expr: "request.resource.attr.tool_name == 'cache_invalidate_module'"
               - expr: "request.resource.attr.tool_name == 'cache_clear'"

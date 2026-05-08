@@ -1,6 +1,6 @@
 # AI Core Engine — System Architecture Overview
 
-**Version 2.1.0 | Sprint 25**
+**Version 2.1.0 | Sprint 10**
 
 > This document describes the implemented architecture of the AI Core Engine (AICE). For tool-level API details see [DOCUMENTATION.md](../DOCUMENTATION.md). For setup instructions see [MCP_QUICKSTART.md](../MCP_QUICKSTART.md).
 
@@ -61,16 +61,15 @@ AICE is a **knowledge-graph-backed MCP (Model Context Protocol) server** purpose
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │              FastMCP Tool Layer — 55 Tools                   │   │
+│  │              FastMCP Tool Layer — 56 Tools                   │   │
 │  │                                                              │   │
 │  │  Cat 1: Search & Query (6)      Cat 8: Feedback (4)         │   │
 │  │  Cat 2: API Intelligence (3)    Cat 9: Review Gate (4)      │   │
 │  │  Cat 3: Dependencies (3)        Cat 10: Ontology (4)        │   │
 │  │  Cat 4: Traceability (4)        Cat 11: Observability (6)   │   │
-│  │  Cat 5: Ingestion (0-removed)   Cat 12: Visualization (1)   │   │
-│  │  Cat 5b: HSI (1)                Cat 13: Authentication (2)  │   │
-│  │  Cat 6: Memory (5+5+2=12)       Cat 14: GAP v2 (1)         │   │
-│  │  Cat 7: Cache (5)                                           │   │
+│  │  Cat 5: Ingestion (4)           Cat 12: Visualization (1)   │   │
+│  │  Cat 6: Memory (5+4+2=11)       Cat 13: Authentication (2)  │   │
+│  │  Cat 7: Cache (4)                                           │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐   │
@@ -102,16 +101,16 @@ AICE is a **knowledge-graph-backed MCP (Model Context Protocol) server** purpose
 
 | Component | Source Path | Responsibility | Backing Store |
 |-----------|------------|----------------|---------------|
-| **MCP Server** | `mcp/core/mcp_server.py` | 55 active tool handlers, ASGI middleware, singleton service factories | — |
+| **MCP Server** | `mcp/core/mcp_server.py` | 62 tool handlers, ASGI middleware, singleton service factories | — |
 | **Auth & RBAC** | `mcp/core/auth_middleware.py`, `mcp/auth/` | Cerbos PDP, API key → principal resolution, 3-tier RBAC | Cerbos PDP (subprocess) |
 | **Hybrid RAG / Search** | `src/HybridRAG/code/querier/search_service.py` | Hybrid search pipeline: graph + vector → RRF merge | Neo4j + Qdrant |
 | **Knowledge Intelligence** | `src/HybridRAG/code/querier/knowledge_intelligence.py` | API function lookup, dependency analysis, traceability | Neo4j |
 | **RLM Orchestrator** | `src/HybridRAG/code/querier/rlm_orchestrator.py` | Multi-step retrieval: LLM plans → N sub-queries → synthesis | Neo4j + Qdrant + GPT4IFX |
 | **Context Builder** | `src/HybridRAG/code/querier/context_builder.py` | Token-budget-aware context assembly with 10 priority slots | — (in-memory) |
-| **Ingestion Pipeline** | `src/IngestionPipeline/` | 17 parsers, 3 connectors, incremental ingestion (platform-level; not MCP-exposed) | Neo4j + Qdrant + PostgreSQL |
+| **Ingestion Pipeline** | `src/IngestionPipeline/` | 14 parsers, 3 connectors, incremental ingestion | Neo4j + Qdrant + PostgreSQL |
 | **Memory Layer** | `src/MemoryLayer/` | Sessions (Redis/in-memory), ephemeral sandbox, node sets | Redis + Neo4j |
 | **Review Gate** | `src/ReviewGate/` | Deterministic confidence scoring, feedback loop, result processing | PostgreSQL + Qdrant |
-| **Cache** | `src/Configuration/cache_service.py` | Two-tier cache: LRU exact match + SemanticCache (sentence-transformers cosine, in-process) | In-memory + sentence-transformers |
+| **Cache** | `src/Configuration/cache_service.py` | Three-tier cache: LRU exact + FAISS L1 semantic + RediSearch L2 (feature-flagged) | In-memory + FAISS + sentence-transformers + Redis (optional) |
 | **Ontology** | `src/Configuration/services.py` + `ontology.yaml` | Dual-profile ontology (illd/mcal), schema validation | YAML + Neo4j |
 | **Observability** | `src/Observability/postgres_schema.py`, `src/Observability/metrics.py` | 7-table PostgreSQL audit schema, graph statistics, Prometheus metrics | PostgreSQL + Neo4j + Prometheus + Grafana |
 | **KG Construction** | `src/HybridRAG/code/KG/build_knowledge_graph.py` | Full knowledge graph build pipeline (4668 lines) | Neo4j + Qdrant |
@@ -137,12 +136,12 @@ async def tool_name(params...) → dict:
 |---------------|-------------------|-------------|
 | `SearchService` | Cat 1 (Search) | `search()`, `search_nodes()`, `get_node_by_id()`, `get_neighbors()`, `shortest_path()`, `execute_cypher()` |
 | `KnowledgeIntelligenceService` | Cat 2–4 (Intelligence, Dependencies, Traceability) | `query_api_function()`, `get_type_definition()`, `query_dependencies()`, `validate_api_usage()`, `find_requirement_traces()`, `build_traceability_matrix()` |
-| `IngestionService` | Cat 5 (not MCP) | `ingest_file()`, `ingest_module()`, `batch_ingest()`, `ingest_repository()` — platform-level only |
+| `IngestionService` | Cat 5 (Ingestion) | `ingest_file()`, `ingest_module()`, `batch_ingest()`, `ingest_repository()` |
 | `WorkingMemorySessionAdapter` | Cat 6 (Sessions) | `start()`, `store()`, `retrieve()`, `end()` |
-| `SandboxManager` | Cat 6 (Sandbox) | `upload()`, `status()`, `clear()`, `diff()` — `sandbox_query` deprecated (use `search_database` with `session_id`) |
+| `SandboxManager` | Cat 6 (Sandbox) | `upload()`, `query()`, `status()`, `clear()` |
 | `RLMOrchestrator` | Cat 6 (RLM) | `orchestrate()`, `preview_plan()` |
 | `ContextBuilder` | Cat 6 (Context) | `build()` with 10-slot token budgets |
-| `CacheService` | Cat 7 (Cache) | `get()`, `put()`, `invalidate()`, `stats()`, `refresh_config()` |
+| `CacheService` | Cat 7 (Cache) | `get()`, `put()`, `invalidate()`, `stats()` |
 | `FeedbackSink` + `ResultProcessor` | Cat 8 (Feedback) | `submit()`, `process_results()`, `get_history()`, `get_learning_summary()` |
 | `ConfidenceCalculator` | Cat 9 (Review Gate) | `evaluate()`, `route()`, `explain()`, `submit_review()` |
 | `OntologyService` | Cat 10 (Config) | `get_profile()`, `get_schema()`, `validate()`, `compliance_score()` |
@@ -162,9 +161,9 @@ DA sends search_database(query, workspace, alpha, top_k)
 │                                                         │
 │  ┌─ CacheService.get(query, workspace) ────────────┐   │
 │  │   1. LRU exact match → HIT? return cached       │   │
-│  │   2. SemanticCache (sentence-transformers        │   │
-│  │      cosine, ≥threshold) → HIT? return          │   │
-│  │   3. MISS → proceed to search                   │   │
+│  │   2. FAISS L1 semantic (in-process) ≥0.85 → HIT │   │
+│  │   3. RediSearch L2 (if enabled) → HIT? backfill │   │
+│  │   4. MISS → proceed to search                   │   │
 │  └─────────────────────────────────────────────────┘   │
 │                                                         │
 │  ┌─ SearchService.search() ────────────────────────┐   │
@@ -192,7 +191,8 @@ DA sends search_database(query, workspace, alpha, top_k)
 │  └─────────────────────────────────────────────────┘   │
 │                                                         │
 │  ┌─ CacheService.put(query, result) ───────────────┐   │
-│  │   Write to both tiers (LRU exact + Semantic)    │   │
+│  │   Write to all tiers (LRU + FAISS L1 +          │   │
+│  │   RediSearch L2 if enabled)                     │   │
 │  └─────────────────────────────────────────────────┘   │
 │                                                         │
 └──── return _ok(result) ────────────────────────────────┘
@@ -294,8 +294,8 @@ See [Node Sets Architecture](../NODE_SETS_ARCHITECTURE.md) for the full NodeSet 
 | **Knowledge Graph** | Neo4j Community | 5.26.0 | Structured engineering data + relationships |
 | **Vector Store** | Qdrant | 1.12.1 | 384-dimensional semantic embeddings |
 | **Embedding Model** | all-MiniLM-L6-v2 | — | Local sentence-transformers, 384-dim output |
-| **Session/Cache Store** | Redis | 7-alpine | Working memory, session TTL |
-| **Semantic Cache** | sentence-transformers (all-MiniLM-L6-v2) | — | In-process cosine similarity for semantic cache; O(n) scan, suitable for ≤500 entries |
+| **Session/Cache Store** | Redis | 7-alpine | Working memory, session TTL, RediSearch L2 cache (optional) |
+| **Semantic Cache** | FAISS (faiss-cpu) | ≥1.7.0 | In-process FAISS IndexFlatIP for sub-ms semantic cache lookups |
 | **Relational DB** | PostgreSQL | 16-alpine | Audit logs, feedback, ingestion jobs |
 | **Authorization** | Cerbos PDP | latest | 3-tier RBAC policy evaluation |
 | **LLM Proxy** | GPT4IFX | — | Infineon LLM proxy (RLM planning + PDF extraction) |
@@ -369,7 +369,7 @@ ai-core-engine/
 │   │   └── result_processors.py     # JUnit/VP/Polyspace parsers (709 lines)
 │   │
 │   ├── Configuration/                # Cache + ontology services
-│   │   ├── cache_service.py         # LRU exact + SemanticCache (2-tier)
+│   │   ├── cache_service.py         # LRU + FAISS L1 + RediSearch L2 3-tier cache
 │   │   └── services.py             # OntologyService + ObservabilityService
 │   │
 │   └── Observability/                # Audit persistence + metrics
@@ -386,7 +386,7 @@ ai-core-engine/
     └── architecture/                 # ← You are here
 ```
 
-**Scale**: ~25,000+ lines of Python, 6,166-line ontology YAML, 55 active MCP tools (4 ingestion tools removed from MCP), 17 parsers, 3 external connectors, 7 PostgreSQL tables.
+**Scale**: ~25,000+ lines of Python, 6,166-line ontology YAML, 62 MCP tools, 14 parsers, 3 external connectors, 7 PostgreSQL tables.
 
 ---
 

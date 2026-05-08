@@ -179,6 +179,57 @@ def _resolve_repo_dir(module: str, kind: str) -> Path:
     raise ValueError(f"Unknown repo kind: {kind!r}")
 
 
+def _expand_sub_modules(module: str) -> list[str]:
+    """Expand a module into sub-modules if it is a multi-repo module.
+
+    For standard modules returns ``[module]`` unchanged.
+    For multi-repo modules (e.g. ETH) returns
+    ``["ETH_17_LETH", "ETH_17_GETH"]``.
+    """
+    _kg_dir = str(CODE_DIR / "KG")
+    if _kg_dir not in sys.path:
+        sys.path.insert(0, _kg_dir)
+    from dependency_fetcher import MODULE_SUB_MODULES
+    upper = module.upper()
+    if upper in MODULE_SUB_MODULES:
+        return [sub.upper() for sub in MODULE_SUB_MODULES[upper]]
+    return [module]
+
+
+# Map sub-module names back to their Jama parent folder name.
+# Jama uses flat module names (ETH, CAN, etc.) not sub-module variants.
+_JAMA_MODULE_MAP: dict[str, str] = {
+    "ETH_17_LETH": "ETH",
+    "ETH_17_GETH": "ETH",
+    "CAN_17_MCMCAN": "CAN",
+    "LIN_17_ASCLIN": "LIN",
+    "WDG_17_WTU": "WDG",
+    "PWM_17_TIMERIP": "PWM",
+}
+
+
+def _jama_module_name(module: str) -> str:
+    """Return the Jama folder name for a given module.
+
+    Sub-modules (ETH_17_LETH) map back to their parent (ETH).
+    Standard modules pass through unchanged.
+    """
+    return _JAMA_MODULE_MAP.get(module.upper(), module.upper())
+
+
+def _resolve_repo_dirs(module: str, kind: str) -> list[Path]:
+    """Return all Bitbucket repo directories for a module (handles multi-repo modules).
+
+    For standard modules returns a single-element list.
+    For multi-repo modules (e.g. ETH → eth_17_leth + eth_17_geth) returns
+    one path per sub-module.
+    """
+    subs = _expand_sub_modules(module)
+    if len(subs) > 1:
+        return [_resolve_repo_dir(sub, kind) for sub in subs]
+    return [_resolve_repo_dir(module, kind)]
+
+
 def _find_file(directory: Path, glob_pattern: str, description: str) -> Path:
     """Find exactly one file matching *glob_pattern* in *directory*."""
     matches = list(directory.glob(glob_pattern))
@@ -216,7 +267,12 @@ def setup_working_dirs(module: str, dry_run: bool = False,
             logger.info("  Auto-fetching repos from Bitbucket (ref=%s) ...", ref)
             paths = fetcher.fetch_all()
             for kind, path in paths.items():
-                logger.info("    %s → %s", kind, path)
+                if kind == "cross_module":
+                    logger.info("    %s: %d repos cloned", kind, len(path) if path else 0)
+                elif path is None:
+                    logger.info("    %s → (not available)", kind)
+                else:
+                    logger.info("    %s → %s", kind, path)
 
     if not TEMP_DATA_DIR.exists():
         logger.error(
@@ -227,13 +283,20 @@ def setup_working_dirs(module: str, dry_run: bool = False,
         sys.exit(1)
 
     # --- TestSpec XLSX -------------------------------------------------------
-    val_dir = _resolve_repo_dir(module, "val")
-    if val_dir.exists():
+    val_dirs = _resolve_repo_dirs(module, "val")
+    for val_dir in val_dirs:
+        if not val_dir.exists():
+            logger.warning("Val repo dir not found: %s — skipping TestSpec copy", val_dir)
+            continue
         if not dry_run:
             TESTSPEC_DIR.mkdir(parents=True, exist_ok=True)
         specs_dir = val_dir / "00_Specs"
         search_dir = specs_dir if specs_dir.exists() else val_dir
-        src_xlsx = _find_file(search_dir, "TC4xx_SW_MCAL_TS_*.xlsx", "TestSpec XLSX")
+        matches = list(search_dir.glob("TC4xx_SW_MCAL_TS_*.xlsx"))
+        if not matches:
+            logger.warning("No TestSpec XLSX found in %s", search_dir)
+            continue
+        src_xlsx = matches[0]
         dst_xlsx = TESTSPEC_DIR / src_xlsx.name
         if not dst_xlsx.exists():
             if dry_run:
@@ -243,8 +306,6 @@ def setup_working_dirs(module: str, dry_run: bool = False,
                 logger.info("  Copied %s → %s", src_xlsx.name, dst_xlsx.name)
         else:
             logger.info("  SKIP (exists): %s", dst_xlsx.name)
-    else:
-        logger.warning("  Val repo not found: %s — skipping TestSpec setup", val_dir)
 
     # --- jama-req (just ensure directory exists) -----------------------------
     if not dry_run:
@@ -323,7 +384,8 @@ def step0_token(dry_run: bool) -> None:
 
 def step2_jama_fetch(module: str, dry_run: bool) -> None:
     """Fetch SHRQ + PRQ + Safety + Cybersecurity requirements from Jama."""
-    output = JAMA_REQ_DIR / f"jama_{module.lower()}_combined_requirements.json"
+    jama_mod = _jama_module_name(module)
+    output = JAMA_REQ_DIR / f"jama_{jama_mod.lower()}_combined_requirements.json"
     if output.exists():
         logger.info("┌─ Step 2: Jama SHRQ + PRQ + Safety + Cybersecurity fetch")
         logger.info("│  Already exists: %s", output)
@@ -331,7 +393,7 @@ def step2_jama_fetch(module: str, dry_run: bool) -> None:
         logger.info("└─ Step 2 skipped (file exists)\n")
         return
     _run(
-        [PYTHON, "fetch_jama_requirements.py", "--module", module],
+        [PYTHON, "fetch_jama_requirements.py", "--module", jama_mod],
         cwd=CODE_DIR / "KG",
         label="Step 2: Fetch Jama SHRQ + PRQ + Safety + Cybersecurity requirements",
         dry_run=dry_run,
@@ -340,13 +402,14 @@ def step2_jama_fetch(module: str, dry_run: bool) -> None:
 
 def step3_relationships(module: str, dry_run: bool) -> None:
     """Fetch Jama relationships."""
+    jama_mod = _jama_module_name(module)
     if not dry_run:
         _check_file(
-            JAMA_REQ_DIR / f"jama_{module.lower()}_combined_requirements.json",
+            JAMA_REQ_DIR / f"jama_{jama_mod.lower()}_combined_requirements.json",
             "Run Step 2 first or use: python KG/fetch_jama_requirements.py --module <MODULE>"
         )
     _run(
-        [PYTHON, "fetch_jama_relationships.py", "--module", module, "-v"],
+        [PYTHON, "fetch_jama_relationships.py", "--module", jama_mod, "-v"],
         cwd=CODE_DIR / "KG",
         label="Step 3: Fetch Jama relationships",
         dry_run=dry_run,
@@ -390,65 +453,87 @@ def step_kg_ea(module: str, dry_run: bool, qeax_path: Path = DEFAULT_QEAX, profi
 
 
 def step9_kg_testspec(module: str, dry_run: bool, profile: str = "test", force: bool = False, project: str | None = None) -> None:
-    """Ingest test spec into Neo4j KG."""
-    cmd = [PYTHON, "build_knowledge_graph.py",
-           "--profile", profile, "--module", module,
-           "--ingest-testspec", "-v"]
-    if force:
-        cmd.append("--force")
-    if project:
-        cmd.extend(["--project", project])
-    _run(
-        cmd,
-        cwd=CODE_DIR / "KG",
-        label="Step 5: KG ingestion (Test Spec → Neo4j)",
-        dry_run=dry_run,
-    )
+    """Ingest test spec into Neo4j KG.
+
+    For multi-repo modules, runs once per sub-module so that each
+    sub-module's test cases get a distinct module tag.
+    """
+    sub_modules = _expand_sub_modules(module)
+    for sub in sub_modules:
+        label_suffix = f" [{sub}]" if len(sub_modules) > 1 else ""
+        cmd = [PYTHON, "build_knowledge_graph.py",
+               "--profile", profile, "--module", sub,
+               "--ingest-testspec", "-v"]
+        if force:
+            cmd.append("--force")
+        if project:
+            cmd.extend(["--project", project])
+        _run(
+            cmd,
+            cwd=CODE_DIR / "KG",
+            label=f"Step 5: KG ingestion (Test Spec → Neo4j){label_suffix}",
+            dry_run=dry_run,
+        )
 
 
 def step10_kg_source(module: str, dry_run: bool, profile: str = "test", force: bool = False, project: str | None = None) -> None:
-    """Ingest C source code into Neo4j KG."""
-    source_dir = TEMP_DATA_DIR / f"aurix3g_sw_mcal_tc4xx_{module.lower()}_src"
-    cmd = [PYTHON, "build_knowledge_graph.py",
-        "--profile", profile, "--module", module,
-        "--ingest-source", "--source-dir", str(source_dir),
-        "--sum-mode",           # auto-discovers configs from Bitbucket
-        "-v",
-    ]
-    if dry_run:
-        cmd.append("--dry-run")
-    if force:
-        cmd.append("--force")
-    if project:
-        cmd.extend(["--project", project])
-    _run(
-        cmd,
-        cwd=CODE_DIR / "KG",
-        label="Step 6: KG ingestion (Source Code → Neo4j)",
-        dry_run=False,
-    )
+    """Ingest C source code into Neo4j KG.
+
+    For multi-repo modules (ETH), runs ingestion once per sub-module.
+    Each sub-module gets its own module name in the KG so that
+    ETH_17_LETH and ETH_17_GETH nodes are separate.
+    """
+    sub_modules = _expand_sub_modules(module)
+    for sub in sub_modules:
+        source_dir = _resolve_repo_dir(sub, "src")
+        label_suffix = f" [{sub}]" if len(sub_modules) > 1 else ""
+        cmd = [PYTHON, "build_knowledge_graph.py",
+            "--profile", profile, "--module", sub,
+            "--ingest-source", "--source-dir", str(source_dir),
+            "--sum-mode",
+            "-v",
+        ]
+        if dry_run:
+            cmd.append("--dry-run")
+        if force:
+            cmd.append("--force")
+        if project:
+            cmd.extend(["--project", project])
+        _run(
+            cmd,
+            cwd=CODE_DIR / "KG",
+            label=f"Step 6: KG ingestion (Source Code → Neo4j){label_suffix}",
+            dry_run=False,
+        )
 
 
 def step11_kg_sfr(module: str, dry_run: bool, profile: str = "test", force: bool = False, project: str | None = None) -> None:
-    """Ingest SFR header files into Neo4j KG."""
-    sfr_dir = TEMP_DATA_DIR / "aurix3g_sw_mcal_tc4xx_infra_sfr"
-    cmd = [
-        PYTHON, "build_knowledge_graph.py",
-        "--profile", profile, "--module", module,
-        "--ingest-sfr", "--sfr-dir", str(sfr_dir), "-v",
-    ]
-    if dry_run:
-        cmd.append("--dry-run")
-    if force:
-        cmd.append("--force")
-    if project:
-        cmd.extend(["--project", project])
-    _run(
-        cmd,
-        cwd=CODE_DIR / "KG",
-        label="Step 7: KG ingestion (SFR → Neo4j)",
-        dry_run=False,
-    )
+    """Ingest SFR header files into Neo4j KG.
+
+    For multi-repo modules, runs once per sub-module so that each
+    sub-module has its own SFR register nodes in the KG.
+    """
+    sub_modules = _expand_sub_modules(module)
+    for sub in sub_modules:
+        label_suffix = f" [{sub}]" if len(sub_modules) > 1 else ""
+        sfr_dir = TEMP_DATA_DIR / "aurix3g_sw_mcal_tc4xx_infra_sfr"
+        cmd = [
+            PYTHON, "build_knowledge_graph.py",
+            "--profile", profile, "--module", sub,
+            "--ingest-sfr", "--sfr-dir", str(sfr_dir), "-v",
+        ]
+        if dry_run:
+            cmd.append("--dry-run")
+        if force:
+            cmd.append("--force")
+        if project:
+            cmd.extend(["--project", project])
+        _run(
+            cmd,
+            cwd=CODE_DIR / "KG",
+            label=f"Step 7: KG ingestion (SFR → Neo4j){label_suffix}",
+            dry_run=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -514,8 +599,8 @@ def main() -> None:
                         help="Neo4j target profile. Skips interactive prompt.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable DEBUG logging.")
-    parser.add_argument("--project", type=str, default=None,
-                        help="Project tag to stamp on all nodes (e.g. A3G, RC1).")
+    parser.add_argument("--project", type=str, default="A3G",
+                        help="Project tag to stamp on all nodes (e.g. A3G, RC1). Default: A3G")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -564,6 +649,7 @@ def main() -> None:
     print("=" * 64)
     print(f"  HybridRAG Pipeline  |  Module: {module}")
     print(f"  Target: {profile}")
+    print(f"  Project: {args.project}")
     print(f"  Steps: {', '.join(str(s) for s in steps_to_run)}")
     if args.clear:
         print("  Mode: CLEAR (clean rebuild)")

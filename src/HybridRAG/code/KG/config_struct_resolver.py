@@ -288,11 +288,17 @@ class ConfigStructResolver:
             init_vals = self._split_init_list(init_body)
 
             # Detect array-of-struct: top-level elements are brace-enclosed
-            if init_vals and init_vals[0].lstrip().startswith("{"):
+            # Strip leading C comments before checking (Tresos inserts them)
+            first_stripped = re.sub(
+                r"/\*.*?\*/", "", init_vals[0], flags=re.DOTALL
+            ).lstrip() if init_vals else ""
+            if init_vals and first_stripped.startswith("{"):
                 # Each top-level element is one array element; parse its
                 # inner fields individually.
                 for elem in init_vals:
-                    inner = elem.strip()
+                    inner = re.sub(
+                        r"/\*.*?\*/", "", elem, flags=re.DOTALL
+                    ).strip()
                     if inner.startswith("{") and inner.endswith("}"):
                         inner = inner[1:-1]
                     inner_vals = self._split_init_list(inner)

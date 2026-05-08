@@ -86,3 +86,29 @@ def role_may_invoke(role: str, tool_name: str) -> bool:
         return False
     allowed_tiers = TIER_HIERARCHY.get(role, set())
     return tier in allowed_tiers
+
+
+def validate_tool_registration(mcp_instance) -> None:
+    """Assert all registered MCP tools exist in TOOL_TIERS.
+
+    Raises RuntimeError at startup if any tool is missing from the tier map.
+    Call after all @mcp.tool() decorators have executed.
+    """
+    import logging
+
+    registered_tools = set(mcp_instance._tool_manager._tools.keys())
+    tier_tools = set(TOOL_TIERS.keys())
+
+    missing_from_tiers = registered_tools - tier_tools
+    if missing_from_tiers:
+        raise RuntimeError(
+            f"Tools registered via @mcp.tool() but missing from TOOL_TIERS: "
+            f"{sorted(missing_from_tiers)}. Add them to mcp/core/tool_tiers.py"
+        )
+
+    orphan_tiers = tier_tools - registered_tools
+    if orphan_tiers:
+        logging.getLogger(__name__).warning(
+            "TOOL_TIERS entries with no matching @mcp.tool(): %s",
+            sorted(orphan_tiers),
+        )

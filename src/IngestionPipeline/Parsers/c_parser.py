@@ -85,6 +85,13 @@ class _RegisterAccessExtractor:
         access_pattern = re.compile(
             r'(\w+(?:SFR|ChSFR|Ch))->(\w+(?:\[\w+(?:\[\w+\])?\])?)\.(B|U)(?:\.(\w+))?'
         )
+        # Pattern 1b: Generic register pointer access with array subscript
+        # Matches: Ptr[idx]->REG.U, Ptr[idx].MEMBER.U, Ptr[idx].ARR[n].REG.U
+        generic_ptr_pattern = re.compile(
+            r'\w+Ptr(?:\[\w+\])+[.-]>?'           # pointer with subscript(s)
+            r'(\w+(?:\[\w+\])?(?:\.\w+(?:\[\w+\])?)*)'  # register path (REG or A[n].REG)
+            r'\.(B|U)(?:\.(\w+))?'                 # .U or .B.FIELD
+        )
         # Pattern 2: MCALUTIL macro access  (e.g. MCALUTIL_SFRWRITE(REG.U, val))
         mcal_write_pattern = re.compile(
             r'MCALUTIL_SFRWRITE\s*\(\s*([\w>\-\[\]\.]+?)\.(B|U)\s*,'
@@ -105,6 +112,24 @@ class _RegisterAccessExtractor:
             for match in access_pattern.finditer(line):
                 register = match.group(2)
                 field = match.group(4) if match.group(4) else 'U'
+                rest = line[match.end():]
+
+                if compound_ops.match(rest):
+                    accesses.append({"register": register, "field": field, "access_type": "READ", "line": line_idx})
+                    accesses.append({"register": register, "field": field, "access_type": "WRITE", "line": line_idx})
+                elif re.match(r'^\s*=(?!=)', rest):
+                    accesses.append({"register": register, "field": field, "access_type": "WRITE", "line": line_idx})
+                else:
+                    accesses.append({"register": register, "field": field, "access_type": "READ", "line": line_idx})
+
+            # Pattern 1b: Generic register pointer (e.g. Dma_RegBasePtr[n]->PROTSE.U)
+            for match in generic_ptr_pattern.finditer(line):
+                reg_path = match.group(1)
+                # Strip array subscripts then split on dots: ACCGRP[n].PROTE → ACCGRP_PROTE
+                reg_no_idx = re.sub(r'\[\w+\]', '', reg_path)
+                parts = [p for p in reg_no_idx.split('.') if p]
+                register = '_'.join(parts)
+                field = match.group(3) if match.group(3) else 'U'
                 rest = line[match.end():]
 
                 if compound_ops.match(rest):
@@ -497,13 +522,31 @@ class _ClangAnalyzer:
             body = type_spelling[4:]  # strip "Ifx_"
             return "_" in body  # at least one underscore → MODULE_REG pattern
 
-        def _resolve_register_name(type_spelling: str) -> str:
+        def _resolve_register_name(type_spelling: str, member_name: str = "") -> str:
             """Convert SFR type to KG register name.
 
             ``Ifx_ADC_CLC_Bits`` → ``ADC_CLC``
             ``Ifx_ADC_CLC``      → ``ADC_CLC``
+
+            When *member_name* is given (the struct field name from the parent
+            module register struct, e.g. ``PROTSE``), use it to build the
+            register name if it differs from the type-derived name.  This
+            handles the case where multiple register instances share the same
+            underlying type (e.g. ``PROT`` and ``PROTSE`` both use
+            ``Ifx_DMA_PROT``).
             """
-            return type_spelling.replace("Ifx_", "").replace("_Bits", "")
+            type_name = type_spelling.replace("Ifx_", "").replace("_Bits", "")
+            if not member_name:
+                return type_name
+            # Extract module prefix from type: "DMA_PROT" → "DMA"
+            parts = type_name.split("_", 1)
+            if len(parts) == 2:
+                module_prefix = parts[0]
+                type_reg_suffix = parts[1]
+                # If member name differs from what the type gives us, prefer it
+                if member_name.upper() != type_reg_suffix.upper():
+                    return f"{module_prefix}_{member_name}"
+            return type_name
 
         # Pre-read source lines for macro-based write detection
         try:
@@ -565,7 +608,22 @@ class _ClangAnalyzer:
                         parent_type_name = ref_type.semantic_parent.spelling
 
                     if _is_sfr_bits_type(parent_type_name):
-                        register_name = _resolve_register_name(parent_type_name)
+                        # For ptr->REG.B.FIELD, try to resolve the instance
+                        # member name (REG) from the grandchild cursor.
+                        instance_member = ""
+                        try:
+                            for ch in cursor.get_children():
+                                # ch is the ".B" member ref
+                                if ch.kind == CursorKind.MEMBER_REF_EXPR:
+                                    for gch in ch.get_children():
+                                        if gch.kind == CursorKind.MEMBER_REF_EXPR:
+                                            instance_member = gch.spelling
+                                            break
+                                    break
+                        except Exception:
+                            pass
+                        register_name = _resolve_register_name(
+                            parent_type_name, instance_member)
                         field = cursor.spelling
                         line = cursor.location.line
                         access_type = "WRITE" if _is_write_context(cursor) else "READ"
@@ -582,7 +640,43 @@ class _ClangAnalyzer:
                     elif (cursor.spelling in ("U", "B")
                           and _is_sfr_register_union(parent_type_name)):
                         # Raw register access: reg.U or reg.B
-                        register_name = _resolve_register_name(parent_type_name)
+                        # Get the instance member path from child cursors.
+                        # For ptr->PROTSE.U, child is PROTSE → "PROTSE"
+                        # For ptr->ACCGRP[n].PROTE.U, child is PROTE,
+                        #   grandchild is ACCGRP[n] → "ACCGRP_PROTE"
+                        instance_member = ""
+                        try:
+                            member_parts: list = []
+                            node = cursor
+                            while True:
+                                children = [c for c in node.get_children()
+                                            if c.kind == CursorKind.MEMBER_REF_EXPR]
+                                if not children:
+                                    # Check for array subscript wrapping a member ref
+                                    arr_children = [
+                                        c for c in node.get_children()
+                                        if c.kind == CursorKind.ARRAY_SUBSCRIPT_EXPR
+                                    ]
+                                    if arr_children:
+                                        # Inside array subscript, find the member
+                                        arr_members = [
+                                            c for c in arr_children[0].get_children()
+                                            if c.kind == CursorKind.MEMBER_REF_EXPR
+                                        ]
+                                        if arr_members:
+                                            member_parts.append(arr_members[0].spelling)
+                                    break
+                                child = children[0]
+                                member_parts.append(child.spelling)
+                                node = child
+                            # member_parts is [PROTE, ACCGRP] for nested case
+                            # or [PROTSE] for simple case. Reverse and join.
+                            if member_parts:
+                                instance_member = "_".join(reversed(member_parts))
+                        except Exception:
+                            pass
+                        register_name = _resolve_register_name(
+                            parent_type_name, instance_member)
                         field = cursor.spelling
                         line = cursor.location.line
                         access_type = "WRITE" if _is_write_context(cursor) else "READ"
@@ -1298,19 +1392,39 @@ class _ClangAnalyzer:
             "-D__HIGHTEC__",
             "-Wno-everything",
         ]
-        # Include the AUTOSAR stub headers directory (legacy mode)
-        # In Sum mode (skip_default_stubs=True) the caller provides
-        # real production headers via include_paths instead.
-        if not self._skip_default_stubs:
-            stubs_dir = os.path.join(os.path.dirname(__file__), "stubs")
-            if os.path.isdir(stubs_dir):
-                args.extend(["-I", stubs_dir])
-                # Force-include MCALUTIL macros (available in all MCAL source)
-                mcallib = os.path.join(stubs_dir, "McalLib.h")
-                if os.path.isfile(mcallib):
-                    args.extend(["-include", mcallib])
+        # Always force-include McalLib.h (defines uint32, MCAL macros etc.)
+        # even in Sum mode. Config-generated headers (e.g. Adc_Cfg.h) may
+        # contain broken multi-line macros that poison uint32 if it isn't
+        # already typedef'd before they are parsed.
+        #
+        # Priority: look for McalLib.h in production include paths first
+        # (e.g. from infra_platform repo), fall back to stubs.
+        stubs_dir = os.path.join(os.path.dirname(__file__), "stubs")
+        mcallib = None
+        # Search production include paths for a real McalLib.h
+        for inc in self._include_paths:
+            candidate = os.path.join(inc, "McalLib.h")
+            if os.path.isfile(candidate):
+                mcallib = candidate
+                break
+        # Fall back to stubs McalLib.h
+        if mcallib is None and os.path.isdir(stubs_dir):
+            candidate = os.path.join(stubs_dir, "McalLib.h")
+            if os.path.isfile(candidate):
+                mcallib = candidate
+        if mcallib:
+            args.extend(["-include", mcallib])
+        # In legacy mode, stubs are the primary include path
+        if not self._skip_default_stubs and os.path.isdir(stubs_dir):
+            args.extend(["-I", stubs_dir])
+        # Real production include paths (from caller)
         for inc in self._include_paths:
             args.extend(["-I", inc])
+        # In Sum mode, add stubs as LAST fallback so McalLib.h can resolve
+        # its own includes (Std_Types.h, Mcal_ExecutionContext.h) and provide
+        # definitions for macros missing from the real config headers.
+        if self._skip_default_stubs and os.path.isdir(stubs_dir):
+            args.extend(["-I", stubs_dir])
 
         options = (
             TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD

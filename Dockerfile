@@ -26,12 +26,16 @@ RUN apt-get update && \
 # Copy Cerbos binary from stage 1
 COPY --from=cerbos /cerbos /usr/local/bin/cerbos
 
-# Install Python dependencies (CPU-only PyTorch via extra index)
+# Install CPU-only PyTorch: use --no-deps to prevent pulling ~2.2GB of NVIDIA/CUDA packages.
+# torch works fine for CPU inference without nvidia-* deps.
 COPY requirements.txt .
 RUN pip install --no-cache-dir --timeout 120 \
     --index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pypi-org/simple \
     --trusted-host artifactory.intra.infineon.com \
-    --extra-index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pytorch-remote/cpu \
+    --no-deps torch==2.11.0 && \
+    pip install --no-cache-dir --timeout 120 \
+    --index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pypi-org/simple \
+    --trusted-host artifactory.intra.infineon.com \
     -r requirements.txt && \
     pip install --no-cache-dir \
     --index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pypi-org/simple \
@@ -44,9 +48,10 @@ ENV HF_HOME=/app/.cache \
     SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
-# Pre-download LLMLingua model into the image to avoid first-request runtime fetch.
+# Pre-download LLMLingua model files into the image (download only, no loading
+# into memory — avoids OOM during build while keeping first-call latency low).
 ENV LLMLINGUA_MODEL=microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank
-RUN python -c "import os; from llmlingua import PromptCompressor; PromptCompressor(model_name=os.getenv('LLMLINGUA_MODEL', 'microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank'), use_llmlingua2=True, device_map='cpu')"
+RUN python -c "from huggingface_hub import snapshot_download; import os; snapshot_download(os.environ['LLMLINGUA_MODEL'])"
 
 # Copy application code (renamed to avoid shadowing the pip 'mcp' package)
 COPY mcp/ ./aice_mcp/
@@ -55,6 +60,11 @@ COPY src/ ./src/
 # Copy Cerbos policies into the container's policy directory
 # (matches storage.disk.directory in .cerbos.yaml)
 COPY mcp/auth/policies/ /policies/
+
+# ── C header files for clang-based sandbox parsing ──
+# Headers are provided at runtime via init-container or PVC mount
+# (see sandbox_headers_distribution.md for deployment options).
+# For local testing, use: python prepare_headers.py [--module Adc] [--clean]
 
 # Redirect HuggingFace / sentence-transformers cache to a writable path
 # (default /.cache is not writable in many pod configurations)
@@ -76,6 +86,8 @@ ENV CERBOS_BIN=/usr/local/bin/cerbos \
     FASTMCP_STREAMABLE_HTTP_PATH=/mcp \
     API_KEY_REGISTRY_PATH=/app/aice_mcp/auth/api_keys.yaml \
     REDIS_URL=redis://:password@redis:6379/0 \
+    SANITIZE_ERRORS=true \
+    INCLUDE_HEADERS_DIR=/app/include_headers \
     PYTHONUNBUFFERED=1 \
     WEB_CONCURRENCY=4
 

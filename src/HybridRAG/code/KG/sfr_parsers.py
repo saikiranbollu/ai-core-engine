@@ -17,7 +17,7 @@ Usage::
 
     from sfr_parsers import parse_sfr_repo
 
-    files, registers, bitfields, base_addrs = parse_sfr_repo(
+    files, registers, bitfields = parse_sfr_repo(
         repo_dir=Path("temp/temporary_data/aurix3g_sw_mcal_tc4xx_infra_sfr"),
         module="Adc",          # case-insensitive partial match on "IfxAdc_*"
         devices=None,          # None → all devices
@@ -32,6 +32,42 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ── Module → SFR peripheral name mapping ──────────────────────────────────
+# MCAL module names don't always match the SFR peripheral prefix in
+# ``Ifx<Peripheral>_regdef.h``.  This map provides explicit overrides.
+# Keys are upper-cased MCAL module names; values are the *exact* SFR
+# peripheral prefix as it appears in filenames (title-cased).
+_MODULE_SFR_MAP: dict[str, str] = {
+    "ETH_17_LETH": "Leth",
+    "ETH_17_GETH": "Geth",
+    "SPI": "Qspi",
+    "GPT": "Gpt12",
+    "GTM": "Egtm",
+    "CAN_17_MCMCAN": "Can",
+    "LIN_17_ASCLIN": "Asclin",
+    "WDG_17_WTU": "Wtu",
+}
+
+# Reverse map: upper-cased SFR peripheral → canonical MCAL module name.
+_SFR_TO_MCAL_MAP: dict[str, str] = {
+    v.upper(): k for k, v in _MODULE_SFR_MAP.items()
+}
+
+
+def resolve_mcal_module_name(module: str) -> str:
+    """Resolve a peripheral or MCAL module name to the canonical MCAL name.
+
+    E.g. "Leth" → "ETH_17_LETH", "Gpt12" → "GPT", "DMA" → "DMA".
+    """
+    upper = module.upper()
+    # Already a full MCAL name (key in _MODULE_SFR_MAP)?
+    if upper in _MODULE_SFR_MAP:
+        return upper
+    # Peripheral name (value in _MODULE_SFR_MAP)?  Reverse-lookup.
+    return _SFR_TO_MCAL_MAP.get(upper, upper)
+
 
 # ---------------------------------------------------------------------------
 # Regex patterns for _regdef.h
@@ -90,7 +126,14 @@ _RE_REG_ADDRESS = re.compile(
     r'#define\s+(\w+)\s+.*?0x([0-9A-Fa-f]+)u?\)',
     re.DOTALL,
 )
-
+# Register instance defines in _reg.h:
+# #define DMA0_PROTSE /*lint --e(923, 9078)*/ (*(volatile Ifx_DMA_PROT*)0xF0010024u)
+_RE_REG_INSTANCE = re.compile(
+    r'/\*\*\s*\\brief\s+(.*?)\s*\*/\s*'
+    r'#define\s+(\w+)\s+/\*.*?\*/\s*'
+    r'\(\*\(volatile\s+(Ifx_\w+)\*\)0x([0-9A-Fa-f]+)u?\)',
+    re.DOTALL,
+)
 # Header version line
 _RE_VERSION = re.compile(r'Version:\s*(\S+)')
 
@@ -122,7 +165,7 @@ def parse_sfr_repo(
     repo_dir: Path,
     module: str,
     devices: Optional[list[str]] = None,
-) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Parse SFR files for the given module across one or more devices.
 
@@ -138,8 +181,10 @@ def parse_sfr_repo(
 
     Returns
     -------
-    (sfr_files, registers, bitfields, base_addresses)
+    (sfr_files, registers, bitfields)
         Each is a list of dicts with properties ready for Neo4j ingestion.
+        Base addresses are collapsed into properties: ``module_base_address``
+        on the reg file dict, and ``address`` on individual register dicts.
     """
     repo_dir = Path(repo_dir)
     if not repo_dir.is_dir():
@@ -154,17 +199,25 @@ def parse_sfr_repo(
         raise ValueError(f"No valid device folders found in {repo_dir}")
 
     # Normalise module name to match filename casing (e.g. "ADC" → "Adc")
-    module_norm = _normalise_module_name(repo_dir, devices[0], module)
+    # Try first device, then fall back to others (some peripherals like Geth
+    # only exist on certain devices).
+    module_norm = None
+    for dev in devices:
+        module_norm = _normalise_module_name(repo_dir, dev, module)
+        if module_norm is not None:
+            break
     if module_norm is None:
         raise ValueError(
-            f"Module '{module}' not found in {repo_dir / devices[0]}. "
-            f"Available: {discover_modules(repo_dir, devices[0])}"
+            f"Module '{module}' not found in any device folder. "
+            f"Available in {devices[0]}: {discover_modules(repo_dir, devices[0])}"
         )
+
+    # Canonical MCAL module name for KG node properties (e.g. "ETH_17_LETH")
+    mcal_module = resolve_mcal_module_name(module)
 
     all_files: list[dict] = []
     all_registers: list[dict] = []
     all_bitfields: list[dict] = []
-    all_base_addrs: list[dict] = []
 
     for device in devices:
         device_dir = repo_dir / device
@@ -185,7 +238,7 @@ def parse_sfr_repo(
             if vm:
                 version = vm.group(1)
 
-            regs, bfs = _parse_regdef(text, device, module_norm.upper(), version)
+            regs, bfs = _parse_regdef(text, device, mcal_module, version)
             all_registers.extend(regs)
             all_bitfields.extend(bfs)
 
@@ -194,7 +247,7 @@ def parse_sfr_repo(
                 "file_name": f"Ifx{module_norm}_regdef.h",
                 "file_type": "regdef",
                 "device": device,
-                "module": module_norm.upper(),
+                "module": mcal_module,
                 "version": version,
                 "register_count": len(regs),
                 "bitfield_count": len(bfs),
@@ -206,7 +259,7 @@ def parse_sfr_repo(
         # -- bf.h --
         if bf_path.is_file():
             text = bf_path.read_text(encoding="utf-8", errors="replace")
-            bf_defines = _parse_bf(text, device, module_norm.upper())
+            bf_defines = _parse_bf(text, device, mcal_module)
 
             # Merge bf defines (LEN/MSK/OFF) onto existing bitfields
             _merge_bf_defines(all_bitfields, bf_defines, device)
@@ -216,7 +269,7 @@ def parse_sfr_repo(
                 "file_name": f"Ifx{module_norm}_bf.h",
                 "file_type": "bf",
                 "device": device,
-                "module": module_norm.upper(),
+                "module": mcal_module,
                 "version": version,
                 "define_count": len(bf_defines),
                 "path": str(bf_path),
@@ -226,26 +279,55 @@ def parse_sfr_repo(
         # -- reg.h --
         if reg_path.is_file():
             text = reg_path.read_text(encoding="utf-8", errors="replace")
-            bases = _parse_reg(text, device, module_norm.upper())
-            all_base_addrs.extend(bases)
+            bases = _parse_reg(text, device, mcal_module)
+
+            # Parse register instances (e.g. PROTSE sharing PROT type)
+            existing_reg_names = {r["name"] for r in all_registers if r["device"] == device}
+            instances = _parse_reg_instances(
+                text, device, mcal_module, version, existing_reg_names
+            )
+            all_registers.extend(instances)
+
+            # Enrich registers with addresses from base address list.
+            # Build name→address lookup from parsed bases.
+            addr_lookup: dict[str, str] = {
+                b["name"]: b["address"] for b in bases
+            }
+            for reg in all_registers:
+                if reg["device"] != device:
+                    continue
+                if "address" not in reg or reg.get("address") is None:
+                    addr = addr_lookup.get(reg["name"])
+                    if addr:
+                        reg["address"] = addr
+
+            # Extract module base address
+            module_base = next(
+                (b["address"] for b in bases if b["address_type"] == "module_base"),
+                None,
+            )
 
             all_files.append({
                 "file_id": f"SFR:{device}:Ifx{module_norm}_reg.h",
                 "file_name": f"Ifx{module_norm}_reg.h",
                 "file_type": "reg",
                 "device": device,
-                "module": module_norm.upper(),
+                "module": mcal_module,
                 "version": version,
                 "base_address_count": len(bases),
+                "module_base_address": module_base,
+                "instance_count": len(instances),
                 "path": str(reg_path),
             })
-            logger.info("  %s/%s_reg.h → %d base addresses", device, module_norm, len(bases))
+            logger.info("  %s/%s_reg.h → %d base addresses (collapsed), %d register instances",
+                        device, module_norm, len(bases), len(instances))
 
     logger.info(
-        "SFR parse complete: %d files, %d registers, %d bitfields, %d base addresses",
-        len(all_files), len(all_registers), len(all_bitfields), len(all_base_addrs),
+        "SFR parse complete: %d files, %d registers, %d bitfields "
+        "(base addresses collapsed into register/file properties)",
+        len(all_files), len(all_registers), len(all_bitfields),
     )
-    return all_files, all_registers, all_bitfields, all_base_addrs
+    return all_files, all_registers, all_bitfields
 
 
 # ╔═══════════════════════════════════════════════════════════════════════╗
@@ -256,8 +338,20 @@ def _normalise_module_name(repo_dir: Path, device: str, module: str) -> Optional
     """Find the exact casing of the module name from filenames.
 
     SFR files use ``IfxAdc_regdef.h`` (title-cased) while users might pass
-    ``"ADC"`` or ``"adc"``.
+    ``"ADC"`` or ``"adc"``.  For modules whose MCAL name differs from the
+    SFR peripheral name (e.g. ``ETH_17_LETH`` → ``Leth``), an explicit
+    mapping in ``_MODULE_SFR_MAP`` is checked first.
     """
+    # Check explicit mapping first (e.g. ETH_17_LETH → Leth)
+    mapped = _MODULE_SFR_MAP.get(module.upper())
+    if mapped is not None:
+        # Verify the mapped name actually exists in this device
+        device_dir = repo_dir / device
+        regdef = device_dir / f"Ifx{mapped}_regdef.h"
+        if regdef.is_file():
+            return mapped
+        # File doesn't exist for this device — fall through to glob search
+
     device_dir = repo_dir / device
     for f in device_dir.glob("Ifx*_regdef.h"):
         m = re.match(r'^Ifx(\w+?)_regdef\.h$', f.name)
@@ -397,3 +491,68 @@ def _parse_reg(text: str, device: str, module: str) -> list[dict]:
         })
 
     return bases
+
+
+def _instance_name_to_reg_name(instance_name: str) -> str:
+    """Strip trailing digits from module instance prefix.
+
+    DMA0_PROTSE → DMA_PROTSE, ADC0_CLC → ADC_CLC
+    """
+    parts = instance_name.split('_', 1)
+    if len(parts) == 2:
+        module = re.sub(r'\d+$', '', parts[0])
+        return f"{module}_{parts[1]}"
+    return instance_name
+
+
+def _parse_reg_instances(
+    text: str,
+    device: str,
+    module: str,
+    version: Optional[str],
+    existing_names: set[str],
+) -> list[dict]:
+    """Parse register INSTANCE defines from ``_reg.h``.
+
+    Creates SFR_Register nodes for instances whose normalized name differs
+    from existing nodes (i.e. instances that share a type with another register
+    but have a distinct name, like PROTSE using Ifx_DMA_PROT type).
+    """
+    instances: list[dict] = []
+
+    for m in _RE_REG_INSTANCE.finditer(text):
+        desc = (m.group(1) or "").strip()
+        define_name = m.group(2)      # DMA0_PROTSE
+        type_name = m.group(3)        # Ifx_DMA_PROT
+        addr = m.group(4)             # F0010024
+
+        # Skip aliases (defines whose name starts with MODULE_)
+        if define_name.startswith("MODULE_"):
+            continue
+
+        # Normalize: DMA0_PROTSE → DMA_PROTSE
+        reg_name = _instance_name_to_reg_name(define_name)
+
+        # Skip if already covered by _parse_regdef
+        if reg_name in existing_names:
+            continue
+
+        # Derive the "parent" type name: Ifx_DMA_PROT → DMA_PROT
+        parent_reg_name = type_name.replace("Ifx_", "")
+
+        reg_id = f"SFR:{device}:{reg_name}"
+        instances.append({
+            "register_id": reg_id,
+            "name": reg_name,
+            "description": desc,
+            "struct_name": type_name,
+            "parent_register": parent_reg_name,
+            "address": f"0x{addr}",
+            "device": device,
+            "module": module,
+            "version": version,
+            "source": "reg_instance",
+        })
+        existing_names.add(reg_name)
+
+    return instances

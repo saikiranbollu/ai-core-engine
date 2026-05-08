@@ -42,14 +42,14 @@ if ENABLE_METRICS:
         TOOL_REQUESTS_TOTAL = Counter(
             "aice_tool_requests_total",
             "Total MCP tool invocations",
-            ["tool", "status"],
+            ["da_name", "tool", "status"],
             registry=REGISTRY,
         )
 
         TOOL_REQUEST_DURATION = Histogram(
             "aice_tool_request_duration_seconds",
             "MCP tool invocation latency in seconds",
-            ["tool"],
+            ["da_name", "tool"],
             buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
             registry=REGISTRY,
         )

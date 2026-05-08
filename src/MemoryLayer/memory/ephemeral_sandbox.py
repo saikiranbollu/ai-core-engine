@@ -230,6 +230,27 @@ class EphemeralGraph:
         if self._graph.has_edge(source, target):
             self._graph.edges[source, target].update(properties)
 
+    def remove_outgoing_edges_by_type(self, node_id: str, rel_types: set) -> int:
+        """Remove outgoing edges of specific types from a node.
+
+        Used to clear stale prod edges for relationship types the sandbox
+        parser can reliably re-detect (e.g. SRC_CALLS).  Prod edges for
+        types the sandbox CANNOT detect (SRC_ACCESSES_SFR, SRC_USES_GLOBAL)
+        are preserved as inherited context.
+
+        Returns the number of edges removed.
+        """
+        if node_id not in self._graph:
+            return 0
+        to_remove = [
+            (node_id, tgt)
+            for _, tgt, edata in self._graph.out_edges(node_id, data=True)
+            if edata.get("_rel_type") in rel_types
+        ]
+        for edge in to_remove:
+            self._graph.remove_edge(*edge)
+        return len(to_remove)
+
     def get_all_nodes(self):
         """Return iterator of (node_id, data_dict) for all nodes."""
         return self._graph.nodes(data=True)
@@ -328,11 +349,15 @@ class EphemeralGraph:
 
     @staticmethod
     def _canonical_id(node_type: str, props: Dict) -> str:
-        """Consistent identity matching prod KG naming."""
+        """Consistent identity matching prod KG naming.
+
+        Module is always uppercased to match Neo4j convention
+        (prod KG stores module in UPPERCASE, e.g. 'ADC', 'DMA').
+        """
         name = (props.get("name") or props.get("function_name")
                 or props.get("param_name") or props.get("requirement_id")
                 or props.get("test_case_id") or str(props.get("_neo4j_id", "")))
-        module = props.get("module", "unknown")
+        module = (props.get("module") or "unknown").upper()
         return f"{node_type}:{name}:{module}"
 
     @property
@@ -659,6 +684,11 @@ class SandboxParserDispatcher:
     }
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
+    def __init__(self, include_paths: Optional[List[str]] = None,
+                 skip_default_stubs: bool = False):
+        self._include_paths = include_paths or []
+        self._skip_default_stubs = skip_default_stubs
+
     def parse(self, file_path: Path) -> Dict[str, Any]:
         """Parse a file and return standardized dict."""
         p = Path(file_path) if not isinstance(file_path, Path) else file_path
@@ -687,7 +717,11 @@ class SandboxParserDispatcher:
     def _parse_c(self, p: Path, ext: str, fname_lower: str) -> Dict:
         try:
             from src.IngestionPipeline.Parsers.c_parser import parse as c_parse
-            parsed = c_parse(str(p))
+            parsed = c_parse(
+                str(p),
+                include_paths=self._include_paths or None,
+                skip_default_stubs=self._skip_default_stubs,
+            )
             if isinstance(parsed, dict):
                 parsed.setdefault("type", "c_source" if ext == ".c" else "c_header")
                 parsed.setdefault("file", str(p))
@@ -810,13 +844,15 @@ class SandboxAdapter:
         return node_names
 
     def ingest_parsed(self, sandbox: 'EphemeralSandbox', parsed: Dict, filename: str,
-                      module: Optional[str] = None):
+                      module: Optional[str] = None,
+                      has_include_paths: bool = False):
         """Convert one parser result dict into sandbox graph nodes + vector chunks."""
         ptype = parsed.get("type", "")
         node_names = []
 
         if ptype in ("c_source", "c_header"):
-            node_names = self._ingest_c(sandbox, parsed, filename, module)
+            node_names = self._ingest_c(sandbox, parsed, filename, module,
+                                        has_include_paths=has_include_paths)
         elif ptype == "json":
             node_names = self._ingest_json(sandbox, parsed, filename, module)
         elif ptype in ("pdf", "text", "rst", "generic"):
@@ -842,10 +878,18 @@ class SandboxAdapter:
         })
         return node_names
 
-    def _ingest_c(self, sandbox, parsed, filename, module) -> List[str]:
+    def _ingest_c(self, sandbox, parsed, filename, module,
+                   has_include_paths: bool = False) -> List[str]:
         """Ingest C/H parsed functions into graph."""
         node_names = []
         mod = module or "unknown"
+        # When include_paths were provided, clang detects SFR+globals reliably
+        # so we should clear those prod edge types and re-create from sandbox.
+        clear_types = (
+            self.SANDBOX_DETECTABLE_REL_TYPES_WITH_INCLUDES
+            if has_include_paths
+            else self.SANDBOX_DETECTABLE_REL_TYPES
+        )
         for fn in self._iter_c_functions(parsed):
             name = fn.get("name")
             if not name:
@@ -860,10 +904,11 @@ class SandboxAdapter:
                 "source_file": filename,
                 "function_name": name,
             }
-            self._add_node_with_shadow(sandbox, node_type, node_id, props)
+            self._add_node_with_shadow(sandbox, node_type, node_id, props,
+                                       clear_rel_types=clear_types)
             node_names.append(name)
 
-            # Internal call relationships
+            # Internal call relationships (use SRC_CALLS to match prod naming)
             for call_entry in fn.get("internal_calls", []):
                 # Handle both formats: dict {"function": name, ...} / switch-case or plain string
                 if isinstance(call_entry, dict):
@@ -874,7 +919,7 @@ class SandboxAdapter:
                             callee_name = sub.get("function") if isinstance(sub, dict) else sub
                             if callee_name and callee_name != name:
                                 cid = EphemeralGraph._canonical_id("SRC_Function", {"name": callee_name, "module": mod})
-                                sandbox.graph.add_relationship(node_id, cid, "CALLS_INTERNALLY",
+                                sandbox.graph.add_relationship(node_id, cid, "SRC_CALLS",
                                                                {"_origin": "sandbox"})
                         continue
                     else:
@@ -883,8 +928,39 @@ class SandboxAdapter:
                     callee = str(call_entry)
                 if callee and callee != name:
                     callee_id = EphemeralGraph._canonical_id("SRC_Function", {"name": callee, "module": mod})
-                    sandbox.graph.add_relationship(node_id, callee_id, "CALLS_INTERNALLY",
+                    sandbox.graph.add_relationship(node_id, callee_id, "SRC_CALLS",
                                                    {"_origin": "sandbox"})
+
+            # SFR access relationships (available when include_paths provided)
+            for sfr_entry in fn.get("sfr_accesses", []):
+                if isinstance(sfr_entry, dict):
+                    reg_name = sfr_entry.get("register") or sfr_entry.get("name") or ""
+                    if reg_name:
+                        sfr_id = EphemeralGraph._canonical_id(
+                            "SFR_Register", {"name": reg_name, "module": mod})
+                        edge_props = {"_origin": "sandbox"}
+                        access_type = sfr_entry.get("access_type")
+                        if access_type:
+                            edge_props["access_type"] = access_type
+                        field = sfr_entry.get("field")
+                        if field:
+                            edge_props["field"] = field
+                        sandbox.graph.add_relationship(
+                            node_id, sfr_id, "SRC_ACCESSES_SFR", edge_props)
+
+            # Global variable reference relationships (available when include_paths provided)
+            for gref in fn.get("global_refs", []):
+                if isinstance(gref, dict):
+                    gname = gref.get("name") or gref.get("variable") or ""
+                    if gname:
+                        gid = EphemeralGraph._canonical_id(
+                            "SRC_GlobalVariable", {"name": gname, "module": mod})
+                        edge_props = {"_origin": "sandbox"}
+                        access = gref.get("access_type")
+                        if access:
+                            edge_props["access_type"] = access
+                        sandbox.graph.add_relationship(
+                            node_id, gid, "SRC_USES_GLOBAL", edge_props)
 
         return node_names
 
@@ -973,9 +1049,32 @@ class SandboxAdapter:
 
     # ── Shadow/Override Logic (Phase 5) ────────────────────────────────
 
+    # Relationship types the sandbox parser can reliably detect even
+    # without full include paths.  When a node is shadowed, prod edges
+    # of these types are cleared so the sandbox parser re-creates only
+    # what actually exists in the developer's modified code.  Prod edges
+    # for types NOT in this set (SRC_IMPLEMENTS_EA, etc.) are inherited.
+    SANDBOX_DETECTABLE_REL_TYPES = {"SRC_CALLS"}
+
+    # Extended set: when include_paths are provided, clang can also detect
+    # SFR accesses and global variable references reliably.
+    SANDBOX_DETECTABLE_REL_TYPES_WITH_INCLUDES = {
+        "SRC_CALLS", "SRC_ACCESSES_SFR", "SRC_USES_GLOBAL",
+    }
+
     def _add_node_with_shadow(self, sandbox: 'EphemeralSandbox', node_type: str,
-                              node_id: str, properties: Dict):
-        """Add node; if it shadows a prod node, mark the override."""
+                              node_id: str, properties: Dict,
+                              clear_rel_types: Optional[set] = None):
+        """Add node; if it shadows a prod node, mark the override.
+
+        Parameters
+        ----------
+        clear_rel_types : set | None
+            Outgoing prod edge types to remove from the shadowed node.
+            Defaults to SANDBOX_DETECTABLE_REL_TYPES.  These are edge
+            types the sandbox parser will re-create from the uploaded
+            source, so the stale prod versions must be cleared first.
+        """
         existing = sandbox.graph.get_node(node_id)
         if existing and existing.get("_origin") == "production":
             # Shadow: replace prod node with sandbox version
@@ -984,6 +1083,10 @@ class SandboxAdapter:
             properties["_original_prod_properties"] = {
                 k: v for k, v in existing.items() if not k.startswith("_")
             }
+            # Clear stale prod edges that sandbox will re-detect
+            types_to_clear = clear_rel_types if clear_rel_types is not None else self.SANDBOX_DETECTABLE_REL_TYPES
+            if types_to_clear:
+                sandbox.graph.remove_outgoing_edges_by_type(node_id, types_to_clear)
             sandbox.graph.update_node(node_id, properties)
         else:
             properties["_origin"] = "sandbox"
@@ -1324,6 +1427,575 @@ class HybridGraphService:
         elif tool_name in cls.DEEP_TOOLS:
             return "hybrid"
         return "sandbox"  # Default unclassified tools to sandbox
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  HybridTraversal — Seamless shadow → prod continuation
+# ═════════════════════════════════════════════════════════════════════════
+
+class HybridTraversal:
+    """Traverse the enriched shadow graph with seamless prod continuation.
+
+    When traversal hits a boundary leaf (a node with no further edges in
+    NetworkX), it fires a continuation query against prod Neo4j from that
+    node and stitches the results together. Re-entry detection prevents
+    following stale prod paths for nodes that have sandbox overrides.
+
+    Module-agnostic: works for any MCAL module or cross-module traversal.
+    """
+
+    def __init__(self, sandbox: "EphemeralSandbox", neo4j_driver=None,
+                 workspace_id: str = "illd"):
+        self._sandbox = sandbox
+        self._driver = neo4j_driver
+        self._workspace_id = workspace_id
+        # Shadow mask: canonical IDs that have sandbox overrides
+        self._shadow_mask: set = set()
+        self._build_shadow_mask()
+
+    def _build_shadow_mask(self):
+        """Collect canonical IDs of all sandbox-origin nodes."""
+        self._shadow_mask = {
+            nid for nid, data in self._sandbox.graph.get_all_nodes()
+            if data.get("_origin") == "sandbox"
+        }
+
+    def _resolve_database(self) -> str:
+        """Resolve Neo4j database name from workspace config."""
+        try:
+            from src.HybridRAG.code.neo4j_manager import get_instance_config
+            cfg = get_instance_config(self._workspace_id)
+            return cfg.database or "neo4j"
+        except Exception:
+            return "neo4j"
+
+    def _is_boundary_leaf(self, node_id: str, direction: str,
+                          rel_types: Optional[set] = None) -> bool:
+        """Check if a node is a boundary leaf (no further edges in NetworkX).
+
+        A node is a leaf if it exists in the graph but has no outgoing (or
+        incoming, depending on direction) edges matching the filter criteria.
+        """
+        g = self._sandbox.graph._graph
+        if node_id not in g:
+            return False
+        if direction in ("out", "both"):
+            out_edges = [
+                (s, t, d) for s, t, d in g.out_edges(node_id, data=True)
+                if rel_types is None or d.get("_rel_type") in rel_types
+            ]
+            if not out_edges:
+                return True
+        if direction in ("in", "both"):
+            in_edges = [
+                (s, t, d) for s, t, d in g.in_edges(node_id, data=True)
+                if rel_types is None or d.get("_rel_type") in rel_types
+            ]
+            if not in_edges:
+                return True
+        return False
+
+    def traverse(
+        self,
+        start_id: str,
+        direction: str = "out",
+        max_depth: int = 4,
+        rel_types: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Multi-hop traversal with seamless shadow → prod handoff.
+
+        Parameters
+        ----------
+        start_id : str
+            Canonical node ID to start traversal from.
+        direction : str
+            "out", "in", or "both".
+        max_depth : int
+            Maximum number of hops (across both shadow and prod combined).
+        rel_types : list of str, optional
+            Filter by relationship types. None = all types.
+        limit : int
+            Maximum total nodes to return.
+
+        Returns
+        -------
+        dict with:
+            "paths": list of path dicts (each: {nodes: [...], edges: [...]})
+            "nodes": list of unique node dicts
+            "boundary_continuations": int (how many times we jumped to prod)
+            "truncated": bool
+        """
+        rel_set = set(rel_types) if rel_types else None
+        visited: set = set()
+        all_nodes: Dict[str, Dict] = {}
+        all_edges: List[Dict] = []
+        boundary_hits: List[str] = []  # leaf IDs that triggered prod continuation
+        queue: List[tuple] = [(start_id, 0)]  # (node_id, current_depth)
+
+        # Phase 1: BFS in NetworkX
+        while queue and len(all_nodes) < limit:
+            current_id, depth = queue.pop(0)
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+
+            # Get node data from sandbox graph
+            node_data = self._sandbox.graph.get_node(current_id)
+            if node_data:
+                all_nodes[current_id] = {
+                    "node_id": current_id,
+                    "node_type": node_data.get("_node_type", "Unknown"),
+                    "origin": node_data.get("_origin", "unknown"),
+                    "properties": {k: v for k, v in node_data.items()
+                                   if not k.startswith("_")},
+                }
+
+            if depth >= max_depth:
+                continue
+
+            # Collect neighbors from NetworkX
+            g = self._sandbox.graph._graph
+            neighbors_found = False
+
+            if direction in ("out", "both"):
+                for _, tgt, edata in g.out_edges(current_id, data=True):
+                    rt = edata.get("_rel_type", "RELATED_TO")
+                    if rel_set and rt not in rel_set:
+                        continue
+                    neighbors_found = True
+                    all_edges.append({
+                        "source": current_id, "target": tgt,
+                        "rel_type": rt, "origin": edata.get("_origin", "unknown"),
+                    })
+                    if tgt not in visited:
+                        queue.append((tgt, depth + 1))
+
+            if direction in ("in", "both"):
+                for src, _, edata in g.in_edges(current_id, data=True):
+                    rt = edata.get("_rel_type", "RELATED_TO")
+                    if rel_set and rt not in rel_set:
+                        continue
+                    neighbors_found = True
+                    all_edges.append({
+                        "source": src, "target": current_id,
+                        "rel_type": rt, "origin": edata.get("_origin", "unknown"),
+                    })
+                    if src not in visited:
+                        queue.append((src, depth + 1))
+
+            # Boundary leaf detection: node exists but has no qualifying edges
+            if not neighbors_found and depth < max_depth:
+                boundary_hits.append((current_id, depth))
+
+        # Phase 2: Prod continuation from boundary leaves
+        prod_results = {}
+        if boundary_hits and self._driver:
+            remaining_capacity = limit - len(all_nodes)
+            if remaining_capacity > 0:
+                prod_results = self._continue_in_prod(
+                    boundary_hits, direction, max_depth,
+                    rel_set, remaining_capacity, visited,
+                )
+
+        # Merge prod continuation results
+        for nid, ndata in prod_results.get("nodes", {}).items():
+            if nid not in all_nodes:
+                all_nodes[nid] = ndata
+        all_edges.extend(prod_results.get("edges", []))
+
+        return {
+            "start": start_id,
+            "nodes": list(all_nodes.values()),
+            "edges": all_edges,
+            "total_nodes": len(all_nodes),
+            "total_edges": len(all_edges),
+            "boundary_continuations": len(prod_results.get("continued_from", [])),
+            "continued_from": prod_results.get("continued_from", []),
+            "truncated": len(all_nodes) >= limit,
+        }
+
+    def _continue_in_prod(
+        self,
+        boundary_leaves: List[tuple],
+        direction: str,
+        max_depth: int,
+        rel_types: Optional[set],
+        capacity: int,
+        already_visited: set,
+    ) -> Dict[str, Any]:
+        """Fire continuation queries to prod Neo4j from boundary leaf nodes.
+
+        For each boundary leaf, compute remaining depth and query prod.
+        Re-entry check: if prod returns a node whose canonical ID is in the
+        shadow mask, we stop following that path (sandbox has the truth).
+
+        Parameters
+        ----------
+        boundary_leaves : list of (node_id, depth_at_leaf)
+        direction, max_depth, rel_types : traversal params
+        capacity : max nodes we can still accept
+        already_visited : set of node IDs already in result
+
+        Returns
+        -------
+        dict with "nodes", "edges", "continued_from"
+        """
+        db = self._resolve_database()
+        nodes: Dict[str, Dict] = {}
+        edges: List[Dict] = []
+        continued_from: List[str] = []
+
+        # Build direction clause
+        if direction == "out":
+            path_pattern = "(start)-[r*1..{depth}]->(n)"
+        elif direction == "in":
+            path_pattern = "(start)<-[r*1..{depth}]-(n)"
+        else:
+            path_pattern = "(start)-[r*1..{depth}]-(n)"
+
+        for leaf_id, leaf_depth in boundary_leaves:
+            if len(nodes) >= capacity:
+                break
+
+            remaining_depth = max_depth - leaf_depth
+            if remaining_depth <= 0:
+                continue
+
+            # Extract name and module from canonical ID (e.g. "SRC_Function:Adc_Init:ADC")
+            parts = leaf_id.split(":")
+            if len(parts) < 3:
+                continue
+            node_type, name, module = parts[0], parts[1], parts[2]
+
+            # Build relationship type filter
+            rel_filter = ""
+            if rel_types:
+                rel_type_list = "|".join(rel_types)
+                rel_filter = f":{rel_type_list}"
+
+            # Build Cypher with literal depth (Neo4j 4.x limitation)
+            safe_depth = int(remaining_depth)
+            pattern = path_pattern.format(depth=safe_depth)
+            # Replace [r*1..N] with relationship type filter if needed
+            if rel_filter:
+                pattern = pattern.replace("[r*1..","[r" + rel_filter + "*1..")
+
+            cypher = f"""
+            MATCH (start)
+            WHERE (start.name = $name OR start.function_name = $name)
+              AND toUpper(COALESCE(start.module, '')) = $module_upper
+            WITH start LIMIT 1
+            MATCH path = {pattern}
+            WITH n, relationships(path) AS rels, length(path) AS hops
+            ORDER BY hops
+            LIMIT $node_limit
+            RETURN
+                toString(id(n)) AS neo4j_id,
+                labels(n)[0] AS node_type,
+                properties(n) AS props,
+                [rel IN rels |
+                    {{source: toString(id(startNode(rel))),
+                      target: toString(id(endNode(rel))),
+                      rel_type: type(rel)}}
+                ] AS path_rels
+            """
+
+            try:
+                with self._driver.session(database=db) as session:
+                    result = session.run(
+                        cypher,
+                        name=name,
+                        module_upper=module.upper(),
+                        node_limit=int(capacity - len(nodes)),
+                    )
+                    continued_from.append(leaf_id)
+
+                    for record in result:
+                        # Build canonical ID for this prod node
+                        props = record["props"] or {}
+                        prod_canonical = EphemeralGraph._canonical_id(
+                            record["node_type"], props
+                        )
+
+                        # Re-entry check: skip if this node is in shadow mask
+                        if prod_canonical in self._shadow_mask:
+                            logger.debug(
+                                "[HybridTraversal] Re-entry blocked: %s (shadow has override)",
+                                prod_canonical,
+                            )
+                            continue
+
+                        # Skip already visited
+                        if prod_canonical in already_visited:
+                            continue
+
+                        # Add node
+                        if prod_canonical not in nodes:
+                            nodes[prod_canonical] = {
+                                "node_id": prod_canonical,
+                                "node_type": record["node_type"],
+                                "origin": "production_continuation",
+                                "properties": {k: v for k, v in props.items()
+                                               if v is not None},
+                            }
+
+                        # Add edges from path
+                        for rel_info in (record["path_rels"] or []):
+                            # Map Neo4j IDs to canonical IDs where possible
+                            edge_entry = {
+                                "source": rel_info["source"],
+                                "target": rel_info["target"],
+                                "rel_type": rel_info["rel_type"],
+                                "origin": "production_continuation",
+                                "_neo4j_source": rel_info["source"],
+                                "_neo4j_target": rel_info["target"],
+                            }
+                            edges.append(edge_entry)
+
+            except Exception as e:
+                logger.warning(
+                    "[HybridTraversal] Prod continuation failed from %s: %s",
+                    leaf_id, e,
+                )
+                continue
+
+        return {"nodes": nodes, "edges": edges, "continued_from": continued_from}
+
+    def shortest_path(
+        self,
+        start_id: str,
+        end_id: str,
+        max_depth: int = 8,
+        rel_types: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Find shortest path between two nodes, spanning shadow + prod.
+
+        Strategy:
+        1. Try NetworkX first (if both nodes are in shadow graph).
+        2. If end_id not in shadow, traverse from start to boundary leaves,
+           then fire shortest_path from each leaf to end_id in prod.
+        3. Stitch: shadow_path + prod_path, pick shortest total.
+
+        Returns
+        -------
+        dict with "path_nodes", "path_edges", "total_hops", "segments"
+        or None if no path found.
+        """
+        import networkx as nx
+        g = self._sandbox.graph._graph
+        rel_set = set(rel_types) if rel_types else None
+
+        # Case 1: Both nodes in shadow graph — try direct NetworkX path
+        if start_id in g and end_id in g:
+            try:
+                if rel_set:
+                    # Filter graph to only edges with matching rel_types
+                    def edge_filter(u, v):
+                        return g.edges[u, v].get("_rel_type") in rel_set
+                    view = nx.subgraph_view(g, filter_edge=edge_filter)
+                    path = nx.shortest_path(view, start_id, end_id)
+                else:
+                    path = nx.shortest_path(g, start_id, end_id)
+                return self._format_path(path, g, "shadow_only")
+            except nx.NetworkXNoPath:
+                pass  # Fall through to hybrid approach
+            except nx.NodeNotFound:
+                pass
+
+        # Case 2: Hybrid — find boundary leaves reachable from start,
+        #          then shortest_path in prod from leaf to end
+        if not self._driver:
+            return None
+
+        # BFS from start to find boundary leaves (up to max_depth / 2)
+        shadow_depth = min(max_depth // 2, 4)
+        visited = set()
+        queue = [(start_id, [start_id])]  # (node_id, path_so_far)
+        leaf_paths: List[tuple] = []  # (leaf_id, path_to_leaf)
+
+        while queue:
+            current, path_so_far = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+
+            if len(path_so_far) > shadow_depth + 1:
+                continue
+
+            has_neighbors = False
+            for _, tgt, edata in g.out_edges(current, data=True):
+                if rel_set and edata.get("_rel_type") not in rel_set:
+                    continue
+                has_neighbors = True
+                if tgt not in visited:
+                    queue.append((tgt, path_so_far + [tgt]))
+
+            if not has_neighbors and current != start_id:
+                leaf_paths.append((current, path_so_far))
+
+        if not leaf_paths:
+            return None
+
+        # Try prod shortest_path from each leaf to end_id
+        db = self._resolve_database()
+        best_result = None
+        best_total_hops = float("inf")
+
+        # Parse end_id to get name/module for matching
+        end_parts = end_id.split(":")
+        end_name = end_parts[1] if len(end_parts) >= 2 else end_id
+        end_module = end_parts[2] if len(end_parts) >= 3 else ""
+
+        rel_filter = ""
+        if rel_types:
+            rel_filter = ":" + "|".join(rel_types)
+
+        for leaf_id, shadow_path in leaf_paths:
+            leaf_parts = leaf_id.split(":")
+            if len(leaf_parts) < 3:
+                continue
+            leaf_name, leaf_module = leaf_parts[1], leaf_parts[2]
+
+            safe_depth = int(max_depth - len(shadow_path) + 1)
+            if safe_depth <= 0:
+                continue
+
+            cypher = f"""
+            MATCH (start), (end)
+            WHERE (start.name = $start_name OR start.function_name = $start_name)
+              AND toUpper(COALESCE(start.module, '')) = $start_module
+              AND (end.name = $end_name OR end.function_name = $end_name
+                   OR end.requirement_id = $end_name OR end.test_case_id = $end_name)
+            WITH start, end LIMIT 1
+            MATCH path = shortestPath((start)-[*..{safe_depth}]-(end))
+            RETURN [n IN nodes(path) |
+                    {{neo4j_id: toString(id(n)),
+                      node_type: labels(n)[0],
+                      props: properties(n)}}
+                   ] AS path_nodes,
+                   [r IN relationships(path) |
+                    {{source: toString(id(startNode(r))),
+                      target: toString(id(endNode(r))),
+                      rel_type: type(r)}}
+                   ] AS path_rels,
+                   length(path) AS hops
+            """
+
+            try:
+                with self._driver.session(database=db) as session:
+                    result = session.run(
+                        cypher,
+                        start_name=leaf_name,
+                        start_module=leaf_module.upper(),
+                        end_name=end_name,
+                    )
+                    record = result.single()
+                    if record:
+                        total_hops = len(shadow_path) - 1 + record["hops"]
+                        if total_hops < best_total_hops:
+                            # Check re-entry for all nodes in prod path
+                            prod_nodes = record["path_nodes"] or []
+                            has_reentry = any(
+                                EphemeralGraph._canonical_id(pn["node_type"], pn["props"])
+                                in self._shadow_mask
+                                for pn in prod_nodes[1:]  # skip start (it's the leaf)
+                            )
+                            if not has_reentry:
+                                best_total_hops = total_hops
+                                best_result = {
+                                    "shadow_path": shadow_path,
+                                    "prod_path_nodes": prod_nodes,
+                                    "prod_path_rels": record["path_rels"],
+                                    "leaf_id": leaf_id,
+                                }
+            except Exception as e:
+                logger.debug(
+                    "[HybridTraversal] shortest_path continuation from %s failed: %s",
+                    leaf_id, e,
+                )
+                continue
+
+        if not best_result:
+            return None
+
+        # Stitch shadow path + prod path
+        path_nodes = []
+        path_edges = []
+
+        # Shadow segment
+        for i, nid in enumerate(best_result["shadow_path"]):
+            node_data = self._sandbox.graph.get_node(nid) or {}
+            path_nodes.append({
+                "node_id": nid,
+                "node_type": node_data.get("_node_type", "Unknown"),
+                "origin": node_data.get("_origin", "sandbox"),
+                "properties": {k: v for k, v in node_data.items()
+                               if not k.startswith("_")},
+            })
+            if i > 0:
+                prev = best_result["shadow_path"][i - 1]
+                edata = g.get_edge_data(prev, nid) or g.get_edge_data(nid, prev) or {}
+                path_edges.append({
+                    "source": prev, "target": nid,
+                    "rel_type": edata.get("_rel_type", "RELATED_TO"),
+                    "origin": "shadow",
+                })
+
+        # Prod segment (skip first node — it's the leaf, already in shadow path)
+        for pn in best_result["prod_path_nodes"][1:]:
+            canonical = EphemeralGraph._canonical_id(pn["node_type"], pn["props"])
+            path_nodes.append({
+                "node_id": canonical,
+                "node_type": pn["node_type"],
+                "origin": "production_continuation",
+                "properties": {k: v for k, v in pn["props"].items()
+                               if v is not None},
+            })
+        for pr in best_result["prod_path_rels"]:
+            path_edges.append({
+                "source": pr["source"],
+                "target": pr["target"],
+                "rel_type": pr["rel_type"],
+                "origin": "production_continuation",
+            })
+
+        return {
+            "path_nodes": path_nodes,
+            "path_edges": path_edges,
+            "total_hops": best_total_hops,
+            "segments": [
+                {"type": "shadow", "hops": len(best_result["shadow_path"]) - 1},
+                {"type": "production", "hops": len(best_result["prod_path_nodes"]) - 1},
+            ],
+        }
+
+    def _format_path(self, path: List[str], g, segment_type: str) -> Dict[str, Any]:
+        """Format a NetworkX path into standard output."""
+        path_nodes = []
+        path_edges = []
+        for i, nid in enumerate(path):
+            data = dict(g.nodes.get(nid, {}))
+            path_nodes.append({
+                "node_id": nid,
+                "node_type": data.get("_node_type", "Unknown"),
+                "origin": data.get("_origin", "unknown"),
+                "properties": {k: v for k, v in data.items() if not k.startswith("_")},
+            })
+            if i > 0:
+                prev = path[i - 1]
+                edata = g.get_edge_data(prev, nid) or {}
+                path_edges.append({
+                    "source": prev, "target": nid,
+                    "rel_type": edata.get("_rel_type", "RELATED_TO"),
+                    "origin": segment_type,
+                })
+        return {
+            "path_nodes": path_nodes,
+            "path_edges": path_edges,
+            "total_hops": len(path) - 1,
+            "segments": [{"type": segment_type, "hops": len(path) - 1}],
+        }
 
 
 # ═════════════════════════════════════════════════════════════════════════

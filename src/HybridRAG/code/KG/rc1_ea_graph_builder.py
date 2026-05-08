@@ -185,6 +185,8 @@ class RC1EAGraphBuilder:
         self.dry_run = dry_run
         self.clear = clear
         self.stats: Counter = Counter()
+        # Prefix for ea_id to prevent integer ID collisions across QEAX files
+        self.model_prefix = qeax_path.stem if qeax_path else DEFAULT_QEAX.stem
 
         # Neo4j config
         if neo4j_cfg is None:
@@ -350,7 +352,7 @@ class RC1EAGraphBuilder:
                 continue
             mapping = STEREOTYPE_MAP[stereo]
             props = {
-                "ea_id": obj_id,
+                "ea_id": f"{self.model_prefix}:{obj_id}",
                 "name": name or "",
                 "object_type": obj_type,
                 "stereotype": stereo,
@@ -359,6 +361,7 @@ class RC1EAGraphBuilder:
                 "module": self.module,
                 "project": PROJECT,
                 "label": mapping["label"],
+                "source_model": self.model_prefix,
             }
             if ea_guid:
                 props["feature_id"] = ea_guid.strip("{}")
@@ -545,7 +548,7 @@ class RC1EAGraphBuilder:
                 continue
             mapping = STEREOTYPE_MAP[stereo]
             props = {
-                "ea_id": obj_id,
+                "ea_id": f"{self.model_prefix}:{obj_id}",
                 "name": name or "",
                 "object_type": obj_type,
                 "stereotype": stereo,
@@ -554,6 +557,7 @@ class RC1EAGraphBuilder:
                 "module": self.module,
                 "project": PROJECT,
                 "label": mapping["label"],
+                "source_model": self.model_prefix,
             }
             if ea_guid:
                 props["feature_id"] = ea_guid.strip("{}")
@@ -739,8 +743,8 @@ class RC1EAGraphBuilder:
         by_rel = defaultdict(list)
         for conn in connectors:
             edge = {
-                "from_key": conn["from_id"],
-                "to_key": conn["to_id"],
+                "from_key": f"{self.model_prefix}:{conn['from_id']}",
+                "to_key": f"{self.model_prefix}:{conn['to_id']}",
             }
             if conn.get("name"):
                 edge["name"] = conn["name"]
@@ -759,7 +763,7 @@ class RC1EAGraphBuilder:
 
     def _ingest_belongs_to_module(self, elements: dict[int, dict]):
         """Create BELONGS_TO_MODULE relationships from all EA nodes to MCALModule."""
-        edges = [{"from_key": eid, "to_key": self.module} for eid in elements]
+        edges = [{"from_key": f"{self.model_prefix}:{eid}", "to_key": self.module} for eid in elements]
         if not edges:
             return
         for chunk in _chunked(edges, BATCH_SIZE):

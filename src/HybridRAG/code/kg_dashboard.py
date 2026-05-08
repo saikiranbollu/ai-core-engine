@@ -5,8 +5,8 @@ Streamlit dashboard for monitoring Neo4j KG performance, structure,
 and data quality.
 
 Usage:
-    streamlit run src/HybridRAG/code/kg_dashboard.py -- --profile test
     streamlit run src/HybridRAG/code/kg_dashboard.py -- --profile mcal
+    streamlit run src/HybridRAG/code/kg_dashboard.py -- --profile local
 """
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ STORAGE_CONFIG_PATH = _CODE_DIR.parent / "config" / "storage_config.yaml"
 def _parse_profile() -> str:
     """Read --profile from sys.argv (after the Streamlit '--' separator)."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", default="test")
+    parser.add_argument("--profile", default="mcal")
     # Streamlit passes its own args; only parse after '--'
     try:
         idx = sys.argv.index("--")

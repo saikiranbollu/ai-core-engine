@@ -175,10 +175,27 @@ def _get_cerbos_client():
 # Authorization Check — main entry point
 # ---------------------------------------------------------------------------
 
+_SAFETY_MODULES = {"adc", "dio", "port", "scu", "clocksc"}
+
+
+def _classify_api_key(api_key: str, registry: dict) -> str:
+    """Classify API key as 'internal', 'partner', or 'external'."""
+    entry = registry.get(api_key, {})
+    return entry.get("classification", "external")
+
+
+def _get_data_classification(module_name: str | None) -> str:
+    """Return data classification for a module."""
+    if module_name and module_name.lower() in _SAFETY_MODULES:
+        return "safety-critical"
+    return "general"
+
+
 def check_authorization(
     api_key: str,
     tool_name: str,
     workspace_id: str = "illd",
+    module_name: str | None = None,
 ) -> tuple[bool, str]:
     """Check whether *api_key* may invoke *tool_name* in *workspace_id*.
 
@@ -197,6 +214,7 @@ def check_authorization(
 
     # 3. Try Cerbos PDP if SDK is available
     if _CERBOS_SDK_AVAILABLE:
+        registry = load_api_keys()
         resource = Resource(
             id=tool_name,
             kind="mcp_tool",
@@ -204,6 +222,9 @@ def check_authorization(
                 "tool_name": tool_name,
                 "tier": tier,
                 "workspace_id": workspace_id,
+                "api_key_class": _classify_api_key(api_key, registry),
+                "data_classification": _get_data_classification(module_name),
+                "module_scope": module_name or "",
             },
         )
         try:

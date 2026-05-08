@@ -46,13 +46,9 @@ HEADER_MAP = {
     "Mcal_ExecutionContext.h": (
         "aurix3g_sw_mcal_tc4xx_platform", "Mcal_ExecutionContext.h",
     ),
-    # McalUtil repo  (McalLib, McalLib_OsCfg, Mcu_TimeDelay)
-    "McalLib.h": (
-        "aurix3g_sw_mcal_tc4xx_mcalutil_src", "ssc/inc/McalLib.h",
-    ),
-    "McalLib_OsCfg.h": (
-        "aurix3g_sw_mcal_tc4xx_mcalutil_src", "ssc/inc/McalLib_OsCfg.h",
-    ),
+    # McalLib.h / McalLib_OsCfg.h — no production version exists on
+    # Bitbucket; our stubs/ provide the definitive source for clang parsing.
+    # McalUtil repo (Mcu_TimeDelay)
     "Mcu_TimeDelay.h": (
         "aurix3g_sw_mcal_tc4xx_mcalutil_src", "ssc/inc/Mcu_TimeDelay.h",
     ),

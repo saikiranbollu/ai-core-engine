@@ -44,7 +44,7 @@ BITBUCKET_BASE_URL = "https://bitbucket.vih.infineon.com"
 # ---------------------------------------------------------------------------
 DEPENDENCY_MANIFEST: Dict[str, Dict[str, List[str]]] = {
     "aurix3g_sw_mcal_tc4xx_platform": {
-        # AUTOSAR platform type headers
+        # AUTOSAR platform type headers (root-level files)
         "": [
             "Std_Types.h",
             "Platform_Types.h",
@@ -254,14 +254,32 @@ class SumConfigFetcher:
         self.output_dir = Path(output_dir)
         self.module = module.upper()
         self.force = force
-        self._conn = None
+        self._connectors: Dict[str, object] = {}
 
     @property
     def _connector(self):
-        if self._conn is None:
-            repo = f"aurix3g_sw_mcal_tc4xx_dev_{self.module.lower()}_ver"
-            self._conn = _make_connector(repo)
-        return self._conn
+        """Return the first working Bitbucket connector.
+
+        For multi-repo modules (ETH) we try each sub-module's ver repo
+        and return the first one that connects.
+        """
+        if not self._connectors:
+            subs = MODULE_SUB_MODULES.get(self.module)
+            if subs:
+                for sub in subs:
+                    repo = f"aurix3g_sw_mcal_tc4xx_dev_{sub}_ver"
+                    self._connectors[sub] = _make_connector(repo)
+            else:
+                repo = f"aurix3g_sw_mcal_tc4xx_dev_{self.module.lower()}_ver"
+                self._connectors[self.module.lower()] = _make_connector(repo)
+        # Return first connector (primary sub-module)
+        return next(iter(self._connectors.values()))
+
+    @property
+    def _all_connectors(self) -> Dict[str, object]:
+        """Return all connectors (one per sub-module, or single for standard modules)."""
+        _ = self._connector  # ensure initialized
+        return self._connectors
 
     # -- public API --------------------------------------------------------
 
@@ -269,30 +287,45 @@ class SumConfigFetcher:
         """List available Sum config names from Bitbucket.
 
         Returns bare directory names (e.g. ``AS460_TC4D9_COM_Host_Config1``),
-        **not** full Bitbucket paths.
+        **not** full Bitbucket paths.  For multi-repo modules, aggregates
+        configs from all sub-module ver repos.
         """
-        try:
-            entries = self._connector.list_directory(SUM_BASE_PATH)
-            # e.path is repo-relative ("00_Arxml/Sum/ConfigX") — keep only the
-            # last component so callers can pass it straight to fetch_config().
-            names = sorted(
-                e.path.rsplit("/", 1)[-1]
-                for e in entries
-                if e.entry_type == "DIRECTORY"
-            )
-            logger.info("Discovered %d Sum configs for %s: %s",
-                        len(names), self.module, names)
-            return names
-        except Exception as exc:
-            logger.warning(
-                "Could not list Sum configs from Bitbucket: %s "
-                "-- falling back to defaults",
-                exc,
-            )
+        all_names: List[str] = []
+        for sub_name, conn in self._all_connectors.items():
+            try:
+                entries = conn.list_directory(SUM_BASE_PATH)
+                names = sorted(
+                    e.path.rsplit("/", 1)[-1]
+                    for e in entries
+                    if e.entry_type == "DIRECTORY"
+                )
+                logger.info("Discovered %d Sum configs for %s (%s): %s",
+                            len(names), self.module, sub_name, names)
+                all_names.extend(names)
+            except Exception as exc:
+                logger.warning(
+                    "Could not list Sum configs from %s: %s "
+                    "-- skipping",
+                    sub_name, exc,
+                )
+        if not all_names:
+            logger.warning("No Sum configs found — falling back to defaults")
             return list(DEFAULT_SUM_CONFIGS)
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for n in all_names:
+            if n not in seen:
+                seen.add(n)
+                unique.append(n)
+        return unique
 
     def fetch_config(self, config_name: str) -> Path:
-        """Download one Sum config.  Returns its local directory path."""
+        """Download one Sum config.  Returns its local directory path.
+
+        For multi-repo modules, tries each sub-module's ver repo until
+        one succeeds.
+        """
         config_dir = self.output_dir / config_name
         marker = config_dir / ".config_fetched"
         if marker.exists() and not self.force:
@@ -301,13 +334,27 @@ class SumConfigFetcher:
 
         remote_root = f"{SUM_BASE_PATH}/{config_name}"
         logger.info("Fetching Sum config %s from Bitbucket ...", config_name)
+
+        # Try each connector — config may live in any sub-module's ver repo
+        for sub_name, conn in self._all_connectors.items():
+            try:
+                total = self._download_tree(remote_root, config_dir, connector=conn)
+                if total > 0:
+                    marker.write_text(f"{total}\n", encoding="utf-8")
+                    logger.info(
+                        "Sum config %s: %d files downloaded from %s to %s",
+                        config_name, total, sub_name, config_dir,
+                    )
+                    return config_dir
+            except Exception as exc:
+                logger.debug("Config %s not in %s: %s", config_name, sub_name, exc)
+
+        # Fallback: use primary connector (will log its own errors)
         total = self._download_tree(remote_root, config_dir)
         marker.write_text(f"{total}\n", encoding="utf-8")
         logger.info(
             "Sum config %s: %d files downloaded to %s",
-            config_name,
-            total,
-            config_dir,
+            config_name, total, config_dir,
         )
         return config_dir
 
@@ -333,11 +380,13 @@ class SumConfigFetcher:
 
     # -- internal helpers --------------------------------------------------
 
-    def _download_tree(self, remote_dir: str, local_dir: Path) -> int:
+    def _download_tree(self, remote_dir: str, local_dir: Path,
+                        connector=None) -> int:
         """Recursively download every file under *remote_dir*."""
+        conn = connector or self._connector
         local_dir.mkdir(parents=True, exist_ok=True)
         try:
-            entries = self._connector.list_directory(remote_dir)
+            entries = conn.list_directory(remote_dir)
         except Exception as exc:
             logger.warning("  Cannot list %s: %s", remote_dir, exc)
             return 0
@@ -351,7 +400,7 @@ class SumConfigFetcher:
         if files:
             paths = [e.path for e in files]
             try:
-                results = self._connector.get_files_bulk(paths)
+                results = conn.get_files_bulk(paths)
                 for rpath, fc in results.items():
                     fname = Path(rpath).name
                     (local_dir / fname).write_text(fc.content, encoding="utf-8")
@@ -363,7 +412,7 @@ class SumConfigFetcher:
                 )
                 for fentry in files:
                     try:
-                        fc = self._connector.get_file_content(fentry.path)
+                        fc = conn.get_file_content(fentry.path)
                         fname = Path(fentry.path).name
                         (local_dir / fname).write_text(
                             fc.content, encoding="utf-8",
@@ -379,6 +428,7 @@ class SumConfigFetcher:
             total += self._download_tree(
                 d.path,
                 local_dir / dir_name,
+                connector=conn,
             )
 
         return total
@@ -393,6 +443,44 @@ _SHARED_REPOS: List[str] = [
     "aurix3g_sw_mcal_tc4xx_infra_sfr",
 ]
 
+# Modules whose Bitbucket repos use non-standard naming.
+# Key = canonical module name (uppercase), Value = list of Bitbucket sub-module
+# suffixes.  For these modules, repo slug generation expands into multiple repos.
+# E.g. ETH → eth_17_leth_src + eth_17_geth_src (instead of plain eth_src).
+MODULE_SUB_MODULES: Dict[str, List[str]] = {
+    "ETH": ["eth_17_leth", "eth_17_geth"],
+    "FEE": ["fee_dflash", "fee_drram"],
+    "CAN": ["can_17_mcmcan"],
+    "LIN": ["lin_17_asclin"],
+    "PWM": ["pwm_17_timerip"],
+    "WDG": ["wdg_17_wtu"],
+}
+
+# Cross-module source repos whose ssc/inc headers are needed for
+# resolving cross-module #includes (e.g. ADC includes Dma.h, Gtm.h).
+# These are shallow-cloned alongside the target module so that clang
+# can resolve ALL cross-module references without relying on stubs.
+_CROSS_MODULE_REPOS: List[str] = [
+    "aurix3g_sw_mcal_tc4xx_dma_src",
+    "aurix3g_sw_mcal_tc4xx_gtm_src",
+    "aurix3g_sw_mcal_tc4xx_cdsp_src",
+    "aurix3g_sw_mcal_tc4xx_mcalutil_src",
+    "aurix3g_sw_mcal_tc4xx_mcu_src",
+    "aurix3g_sw_mcal_tc4xx_port_src",
+    "aurix3g_sw_mcal_tc4xx_adc_src",
+    "aurix3g_sw_mcal_tc4xx_gpt_src",
+    "aurix3g_sw_mcal_tc4xx_spi_src",
+    "aurix3g_sw_mcal_tc4xx_icu_src",
+    "aurix3g_sw_mcal_tc4xx_pwm_17_timerip_src",
+    "aurix3g_sw_mcal_tc4xx_can_17_mcmcan_src",
+    "aurix3g_sw_mcal_tc4xx_lin_17_asclin_src",
+    "aurix3g_sw_mcal_tc4xx_eth_17_leth_src",
+    "aurix3g_sw_mcal_tc4xx_eth_17_geth_src",
+    "aurix3g_sw_mcal_tc4xx_fee_dflash_src",
+    "aurix3g_sw_mcal_tc4xx_fee_drram_src",
+    "aurix3g_sw_mcal_tc4xx_wdg_17_wtu_src",
+]
+
 
 def _repo_slug_for_module(module: str, kind: str) -> str:
     """Derive the Bitbucket repo slug from a module name and repo kind.
@@ -401,6 +489,8 @@ def _repo_slug_for_module(module: str, kind: str) -> str:
     ----------
     module:
         MCAL module name (e.g. ``"ADC"``, ``"DMA"``).
+        For multi-repo modules (ETH) pass the sub-module suffix directly
+        (e.g. ``"eth_17_leth"``).
     kind:
         One of ``"src"``, ``"val"``, ``"sfr"``.
 
@@ -417,6 +507,19 @@ def _repo_slug_for_module(module: str, kind: str) -> str:
     elif kind == "sfr":
         return "aurix3g_sw_mcal_tc4xx_infra_sfr"
     raise ValueError(f"Unknown repo kind: {kind!r}")
+
+
+def repo_slugs_for_module(module: str, kind: str) -> List[str]:
+    """Return all Bitbucket repo slugs for a module (handles multi-repo modules).
+
+    For standard modules returns a single-element list.
+    For multi-repo modules (e.g. ETH → eth_17_leth + eth_17_geth) returns
+    one slug per sub-module.
+    """
+    upper = module.upper()
+    if upper in MODULE_SUB_MODULES:
+        return [_repo_slug_for_module(sub, kind) for sub in MODULE_SUB_MODULES[upper]]
+    return [_repo_slug_for_module(module, kind)]
 
 
 class SourceRepoFetcher:
@@ -541,12 +644,24 @@ class SourceRepoFetcher:
     # -- Public API --------------------------------------------------------
 
     def fetch_source(self) -> Path:
-        """Clone/update the module source repo.
+        """Clone/update the module source repo(s).
 
-        Returns path like ``output_dir/aurix3g_sw_mcal_tc4xx_adc_src``.
+        For multi-repo modules (ETH), clones all sub-module repos and
+        returns the path to the first one.  Use ``fetch_source_all()``
+        to get all paths.
         """
-        slug = _repo_slug_for_module(self.module, "src")
-        return self._clone_or_update(slug)
+        slugs = repo_slugs_for_module(self.module, "src")
+        paths = [self._clone_or_update(slug) for slug in slugs]
+        return paths[0]
+
+    def fetch_source_all(self) -> List[Path]:
+        """Clone/update all source repos for the module.
+
+        Returns a list of paths (single element for standard modules,
+        multiple for multi-repo modules like ETH).
+        """
+        slugs = repo_slugs_for_module(self.module, "src")
+        return [self._clone_or_update(slug) for slug in slugs]
 
     def fetch_sfr(self) -> Path:
         """Clone/update the shared SFR infrastructure repo.
@@ -556,23 +671,72 @@ class SourceRepoFetcher:
         slug = _repo_slug_for_module(self.module, "sfr")
         return self._clone_or_update(slug)
 
-    def fetch_val(self) -> Path:
-        """Clone/update the module validation/test-spec repo.
+    def fetch_platform(self) -> Path:
+        """Clone/update the shared platform repo.
 
-        Returns path like ``output_dir/aurix3g_sw_mcal_tc4xx_val_adc``.
+        Contains Std_Types.h, Platform_Types.h, Mcal_ErrorTypes.h, and
+        other core AUTOSAR platform headers (at repo root).
+
+        Returns path like ``output_dir/aurix3g_sw_mcal_tc4xx_platform``.
         """
-        slug = _repo_slug_for_module(self.module, "val")
-        return self._clone_or_update(slug)
+        return self._clone_or_update("aurix3g_sw_mcal_tc4xx_platform")
+
+    def fetch_val(self) -> Path:
+        """Clone/update the module validation/test-spec repo(s).
+
+        For multi-repo modules, clones all sub-module val repos and
+        returns the first path.
+        """
+        slugs = repo_slugs_for_module(self.module, "val")
+        paths = [self._clone_or_update(slug) for slug in slugs]
+        return paths[0]
+
+    def fetch_cross_module_repos(self) -> Dict[str, Path]:
+        """Clone/update cross-module source repos for header resolution.
+
+        Ensures that ssc/inc from all MCAL modules is available locally
+        so clang can resolve cross-module #includes (e.g. ADC → Dma.h,
+        DMA → Gtm.h).  Skips the target module (already cloned by
+        ``fetch_source``).
+
+        Returns dict mapping repo_slug → local path.
+        """
+        results: Dict[str, Path] = {}
+        target_slugs = set(repo_slugs_for_module(self.module, "src"))
+        for slug in _CROSS_MODULE_REPOS:
+            if slug in target_slugs:
+                continue  # Already cloned as the primary source
+            try:
+                results[slug] = self._clone_or_update(slug)
+            except RuntimeError as exc:
+                # Non-fatal: some modules may not exist yet
+                logger.warning(
+                    "Could not clone cross-module repo %s (skipping): %s",
+                    slug, exc,
+                )
+        return results
 
     def fetch_all(self) -> Dict[str, Path]:
         """Clone/update all repos needed for a full module ingestion.
 
         Returns a dict mapping repo kind → local path::
 
-            {"src": Path(...), "sfr": Path(...), "val": Path(...)}
+            {"src": Path(...), "sfr": Path(...), "platform": Path(...),
+             "val": Path(...), "cross_module": {slug: Path, ...}}
         """
-        return {
+        result = {
             "src": self.fetch_source(),
             "sfr": self.fetch_sfr(),
             "val": self.fetch_val(),
         }
+        # Platform repo is optional — may not exist or user may lack access
+        try:
+            result["platform"] = self.fetch_platform()
+        except RuntimeError as exc:
+            logger.warning(
+                "Could not clone infra_platform repo (skipping — "
+                "stubs will be used as fallback): %s", exc,
+            )
+            result["platform"] = None
+        result["cross_module"] = self.fetch_cross_module_repos()
+        return result

@@ -91,7 +91,7 @@
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
       "targets": [
         {
-          "expr": "topk(10, sum(rate(aice_tool_requests_total{status=\"error\"}[5m])) by (tool))",
+          "expr": "topk(10, sum(rate(aice_tool_requests_total{status=\"error\", da_name=~\"$da_name\"}[5m])) by (tool))",
           "legendFormat": "{{ tool }}",
           "refId": "A"
         }
@@ -120,7 +120,7 @@
   ],
   "schemaVersion": 39,
   "tags": ["aice", "errors"],
-  "templating": { "list": [] },
+  "templating": { "list": [{ "name": "da_name", "label": "DA Name", "type": "query", "query": "label_values(aice_tool_requests_total, da_name)", "datasource": { "type": "prometheus" }, "includeAll": true, "allValue": ".*", "current": { "text": "All", "value": "$__all" }, "refresh": 2, "multi": true, "sort": 1 }] },
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",

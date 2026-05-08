@@ -1,6 +1,6 @@
 # AI Core Engine (AICE) — Complete Documentation
 
-**Version 2.1.0 | Sprint 25**
+**Version 2.1.0 | Sprint 9**
 **MCP Interface for Automotive Embedded Software Development**
 
 > **Getting started?** See [MCP_QUICKSTART.md](MCP_QUICKSTART.md) for a practical setup and configuration guide with examples.
@@ -35,9 +35,9 @@
 
 The **AI Core Engine (AICE)** is a knowledge-graph-backed MCP (Model Context Protocol) server purpose-built for **Infineon AURIX TC3xx** automotive embedded software development. It provides a unified AI-powered platform that serves multiple Domain Assistants (DAs) — specialized LLM-based agents — with structured knowledge about AUTOSAR MCAL drivers, iLLD reference software, hardware registers, requirements traceability, and compliance rules.
 
-AICE exposes **55 tools across 14 categories** (including Ephemeral Sandbox, HSI, and RLM extensions in Category 6 area), backed by a **Hybrid RAG** engine that combines Neo4j Knowledge Graph traversal with Qdrant vector similarity search, delivering precise and contextually rich responses for automotive software engineering tasks.
+AICE exposes **56 tools across 13 categories** (including Ephemeral Sandbox and RLM extensions in Category 6), backed by a **Hybrid RAG** engine that combines Neo4j Knowledge Graph traversal with Qdrant vector similarity search, delivering precise and contextually rich responses for automotive software engineering tasks.
 
-> **Note:** Run `python -c "from mcp.core.mcp_server import mcp; print(len(mcp._tools), 'tools registered')"` to verify the exact tool count in your deployment. The count includes 2 RLM tools, 4 Sandbox tools + `sandbox_diff`, 1 HSI tool (`get_function_hsi`), 5 Cache tools, and 1 GAP v2 tool (`query_enhance`). The 4 direct ingestion tools (`ingest_file`, `ingest_module_from_repo`, `batch_ingest_modules`, `ingest_repository`) were removed from MCP registration in Sprint 17 (Plan 2 Phase 2) — ingestion is now a platform-level operation.
+> **Note:** Run `python -c "from mcp.core.mcp_server import mcp; print(len(mcp._tools), 'tools registered')"` to verify the exact tool count in your deployment. The count includes 2 RLM tools and 4 Sandbox tools added in Sprint 5.
 
 ### 1.2 Target Domain
 
@@ -130,7 +130,7 @@ AICE serves 21+ Domain Assistants, each specialized for a phase of the V-Model l
 - **FR-8.3**: Preview mode for inspecting query plans before execution
 
 #### FR-9: Cache Layer
-- **FR-9.1**: Two-tier caching: LRU exact match + SemanticCache (sentence-transformers cosine similarity, in-process)
+- **FR-9.1**: Three-tier caching: LRU exact match + FAISS L1 semantic (in-process) + RediSearch L2 (shared, feature-flagged)
 - **FR-9.2**: TTL-based expiration with configurable thresholds
 - **FR-9.3**: Module-scoped and full cache invalidation
 - **FR-9.4**: Cache stats and performance monitoring
@@ -157,7 +157,7 @@ AICE serves 21+ Domain Assistants, each specialized for a phase of the V-Model l
 
 #### NFR-3: Performance
 - **NFR-3.1**: LRU cache ~2500x speedup for exact matches
-- **NFR-3.2**: SemanticCache cosine similarity scan ~5-10ms at ≤500 entries (in-process, O(n) scan via sentence-transformers)
+- **NFR-3.2**: FAISS L1 semantic cache sub-ms at 25K+ entries (vs ~5-10ms O(n) scan at 500 entries)
 - **NFR-3.3**: Expected ~60% cache hit rate under normal usage patterns
 - **NFR-3.4**: Configurable token budgets for context assembly (8K default)
 
@@ -204,7 +204,7 @@ AICE serves 21+ Domain Assistants, each specialized for a phase of the V-Model l
 | Context Builder (token-budget) | ✅ Complete | 2, 8 | Memory |
 | Ephemeral Sandbox | ✅ Complete | 3 | Memory |
 | RLM Orchestrator | ✅ Complete | 5 | Memory |
-| LRU + SemanticCache (2-tier) | ✅ Complete | 6, 9 | Performance |
+| LRU + FAISS L1 + RediSearch L2 Cache | ✅ Complete | 6, 9 | Performance |
 | Confidence Scoring | ✅ Complete | 4 | Quality |
 | Human Feedback Loop | ✅ Complete | 4 | Quality |
 | Review Gate Routing | ✅ Complete | 4 | Quality |
@@ -374,10 +374,8 @@ Client Request
 
 ### 3.4 Data Flow — Ingestion
 
-> Ingestion is a platform-level operation (not an MCP tool). The flow below shows how `IngestionService.ingest_file()` works internally.
-
 ```
-IngestionService.ingest_file(path, workspace, module)
+ingest_file(path, workspace, module)
      │
      ▼
 ┌───────────────────┐
@@ -587,28 +585,45 @@ Both workspaces share the same MCP server instance and tool set but use separate
   - `workspace` (str): Target workspace
 - **Returns**: Register-to-function mapping, undocumented access warnings
 
-### 4.5 Category 5: Ingestion Pipeline (0 MCP tools — platform operation)
+### 4.5 Category 5: Ingestion Pipeline (4 tools)
 
-> **Important**: The four direct ingestion MCP tools (`ingest_file`, `ingest_module_from_repo`, `batch_ingest_modules`, `ingest_repository`) were **removed from MCP registration** in Sprint 17 (Plan 2, Phase 2). The underlying `IngestionService` and all 17 parsers remain as library code used by the platform team for batch ingestion operations.
->
-> **For DA developers**: Use `sandbox_upload` (Category 6) to ingest user-provided documents into a per-session ephemeral store. For production knowledge base updates, contact the platform team.
+#### `ingest_file` — Single File Ingestion
+- **Tier**: admin
+- **Purpose**: Parse a single file and ingest extracted knowledge into the graph
+- **Parameters**:
+  - `file_path` (str, required): Path to file
+  - `workspace` (str, required): Target workspace
+  - `module` (str, required): Owner module
+  - `overwrite` (bool): Force replacement (default: false)
+- **Returns**: Job ID, parsed node/relationship counts
 
-#### Platform-Level Ingestion (not MCP tools)
+#### `ingest_module_from_repo` — Module Ingestion
+- **Tier**: admin
+- **Purpose**: Discover and ingest all artifacts for a given module
+- **Parameters**:
+  - `repo_path` (str, required): Root repository path
+  - `module` (str, required): Module name
+  - `workspace` (str, required): Target workspace
+- **Returns**: Aggregated job summary
 
-The following functions exist in the codebase (`src/IngestionPipeline/ingestion_service.py`) and can be invoked by the platform team:
+#### `batch_ingest_modules` — Batch Ingestion
+- **Tier**: admin
+- **Purpose**: Ingest multiple modules in parallel
+- **Parameters**:
+  - `repo_path` (str, required): Root repository path
+  - `modules` (list[str], required): Module names
+  - `workspace` (str, required): Target workspace
+- **Returns**: Per-module job summaries
 
-| Function | Purpose |
-|----------|---------|
-| `ingest_file(file_path, module, workspace)` | Parse and ingest a single file |
-| `ingest_module(repo_root, module, workspace)` | Ingest all files for a module |
-| `batch_ingest(lld_path, modules, workspace)` | Parallel multi-module ingestion |
-| `ingest_repository(repo_path, modules, workspace)` | Full repository ingestion |
+#### `ingest_repository` — Full Repository Ingestion
+- **Tier**: admin
+- **Purpose**: Discover and ingest all modules across the entire repository
+- **Parameters**:
+  - `repo_path` (str, required): Root repository path
+  - `workspace` (str, required): Target workspace
+- **Returns**: Repository-wide ingestion summary
 
-**Supported file types (17 parsers)**: `.c`, `.h`, `.arxml`, `.pdf`, `.xlsx`, `.puml`, `.rst`, `.json`, `.md`, `.txt`, `.csv`, `.ea` (Enterprise Architect), `.xml` (SFR/HW spec), `.swud` (SWUD docs), doxygen headers, HW spec PDFs, iLLD SWA docs
-
-**External connectors (3)**: Jama (requirements), Jenkins (CI/CD results), Polarion (ALM)
-
-### 4.6 Category 6: Memory & Context (5 Session + 5 Sandbox + 2 RLM = 12 tools) + Category 5b HSI (1 tool)
+### 4.6 Category 6: Memory & Context (5 + 4 Sandbox + 2 RLM = 11 tools)
 
 #### Session Lifecycle (5 tools)
 
@@ -617,9 +632,10 @@ The following functions exist in the codebase (`src/IngestionPipeline/ingestion_
 - **Purpose**: Initialize a working-memory session for a Domain Assistant
 - **Parameters**:
   - `session_id` (str, required): Unique session identifier (convention: `{DA}_{timestamp}`)
-  - `assistant_name` (str, optional): Domain Assistant name
-  - `module_context` (str, optional): Default module context (e.g. "Adc")
-- **Returns**: Session confirmation with metadata including `store_type` (RedisBackend or InMemoryBackend) and fixed `ttl_seconds: 3600`
+  - `assistant_name` (str, required): Domain Assistant name
+  - `module_context` (str): Default module context
+  - `ttl_seconds` (int): Session TTL (default: 3600)
+- **Returns**: Session confirmation with metadata
 
 #### `session_store` — Store Data
 - **Tier**: public
@@ -688,24 +704,6 @@ The following functions exist in the codebase (`src/IngestionPipeline/ingestion_
   - `session_id` (str, required): Active session
 - **Returns**: Confirmation
 
-#### `sandbox_diff` — Diff Sandbox vs Production
-- **Tier**: public
-- **Purpose**: Show what changed in the sandbox relative to production knowledge. Compares sandbox nodes against their production counterparts and reports nodes added, modified (with original properties), and unchanged production nodes.
-- **Parameters**:
-  - `session_id` (str, required): Active session with a sandbox
-- **Returns**: `{ "nodes_added": [str], "nodes_modified": [{node_id, original, current}], "nodes_unchanged": int, "edges_added": int, "edges_total": int }`
-
-### 4.5b Category 5b: HSI — Hardware-Software Interface (1 tool)
-
-#### `get_function_hsi` — HSI Section Extraction
-- **Tier**: public
-- **Purpose**: Extract the Hardware-Software Interface (HSI) section for a function in SWUD format. Returns SFR registers accessed (with access type, trust zone, line numbers), global/shared variables used, and events.
-- **Parameters**:
-  - `function_name` (str, required): Exact function name (e.g. "Adc_Init", "Can_Write")
-  - `module` (str): Module name (default: "Adc")
-  - `profile` (str): Ontology profile — "mcal" (default) or "illd"
-- **Returns**: `{ "function_name": str, "registers": [...], "global_variables": [...], "events": [], "summary_text": str }` — `summary_text` is a Markdown-formatted SWUD HSI section
-
 #### RLM (2 tools)
 
 #### `rlm_orchestrate` — Multi-Step Context
@@ -726,7 +724,7 @@ The following functions exist in the codebase (`src/IngestionPipeline/ingestion_
   - `task_type` (str): Task type hint
 - **Returns**: Planned sub-queries with alpha values and expected targets
 
-### 4.7 Category 7: Cache Management (5 tools)
+### 4.7 Category 7: Cache Management (4 tools)
 
 #### `cache_get` — Inspect Cache
 - **Tier**: developer
@@ -738,7 +736,7 @@ The following functions exist in the codebase (`src/IngestionPipeline/ingestion_
 #### `cache_stats` — Cache Metrics
 - **Tier**: developer
 - **Purpose**: Retrieve cache performance metrics
-- **Returns**: LRU and SemanticCache stats (hit rate, size, semantic cache enabled status, total entries)
+- **Returns**: LRU, FAISS L1 semantic, and RediSearch L2 cache stats (hit rate, size, FAISS enabled status, RediSearch availability)
 
 #### `cache_invalidate_module` — Module Invalidation
 - **Tier**: admin
@@ -753,12 +751,6 @@ The following functions exist in the codebase (`src/IngestionPipeline/ingestion_
 - **Parameters**:
   - `tier` (str): "lru", "semantic", or "all" (default: "all")
 - **Returns**: Confirmation with cleared entry count
-
-#### `cache_refresh_config` — Reload Cache Config
-- **Tier**: admin
-- **Purpose**: Reload cache configuration from environment variables without restarting the server. Re-reads `LRU_CACHE_SIZE`, `LRU_CACHE_TTL_HOURS`, `SEMANTIC_CACHE_MAX_SIZE`, `SEMANTIC_CACHE_THRESHOLD`, and `SEMANTIC_CACHE_TTL_DAYS`. Cached data is preserved; entries are only evicted if the new size is smaller.
-- **Parameters**: None
-- **Returns**: `{ "lru_max_size": {old, new}, "lru_default_ttl": {old, new}, "semantic_max_size": {old, new}, "semantic_threshold": {old, new}, "semantic_ttl_seconds": {old, new}, "evicted": int }`
 
 ### 4.8 Category 8: Feedback & Learning (4 tools)
 
@@ -940,30 +932,6 @@ The following functions exist in the codebase (`src/IngestionPipeline/ingestion_
 - **Purpose**: Force-refresh the GPT4IFX JWT using configured credentials
 - **Returns**: New token status
 
-### 4.14 Category 14: GAP v2 Tools (1 tool)
-
-#### `query_enhance` — Query Complexity Analysis
-- **Tier**: developer
-- **Purpose**: Classify query complexity and predict the optimal search strategy. Exposes the QueryEnhancer preprocessing stage for upstream analysis. Entirely rule-based with zero LLM dependency and sub-millisecond latency.
-- **Parameters**:
-  - `query` (str, required): Natural language query to analyze
-  - `include_synonyms` (bool): Include expanded domain synonyms (default: false)
-- **Returns**:
-  ```json
-  {
-    "original_query": "str",
-    "enhanced_query": "str",
-    "complexity": "SIMPLE | MEDIUM | COMPLEX",
-    "strategy": "GRAPH_HEAVY | VECTOR_HEAVY | HYBRID | EXACT",
-    "suggested_alpha": 0.5,
-    "suggested_max_results": 10,
-    "detected_entities": ["str"],
-    "detected_modules": ["str"],
-    "is_aggregation": false,
-    "token_budget_hint": 4096
-  }
-  ```
-
 ---
 
 ## 5. Authentication & Authorization
@@ -1009,8 +977,8 @@ HTTP Request
 | Tier | Tool Count | Access Level |
 |------|-----------|-------------|
 | **public** | 34 | Any authenticated caller |
-| **developer** | 16 | Developer + Admin API keys |
-| **admin** | 5 | Admin API keys only |
+| **developer** | 14 | Developer + Admin API keys |
+| **admin** | 8 | Admin API keys only |
 
 Hierarchy: `admin` can invoke all tools, `developer` can invoke developer + public tools, `public` can invoke only public tools.
 
@@ -1019,7 +987,7 @@ Hierarchy: `admin` can invoke all tools, `developer` can invoke developer + publ
 Policy files in `mcp/auth/policies/`:
 
 - **derived_roles.yaml**: Defines role inheritance (admin includes developer permissions, developer includes public)
-- **resource_mcp_tool.yaml**: Per-tool access control for all 55 active tools across the 3 tiers
+- **resource_mcp_tool.yaml**: Per-tool access control for all 56 tools across the 3 tiers
 
 ### 5.4 Transport Mode
 
@@ -1154,7 +1122,7 @@ The Ingestion Pipeline transforms raw artifacts (source code, requirements docum
 ### 7.4 Ingestion Flow
 
 ```
-1. Platform-level invocation (IngestionService.ingest_file / .ingest_module / .batch_ingest / .ingest_repository — not MCP tools)
+1. Tool invocation (ingest_file / ingest_module / batch_ingest / ingest_repository)
       │
       ▼
 2. Job creation → IngestionJobTracker assigns ID, status = "queued"
@@ -1415,7 +1383,7 @@ PatternIndex → Qdrant semantic index (for future similarity matching)
 
 ## 11. Cache Service
 
-### 11.1 Three-Tier Architecture
+### 11.1 Three-Tier Architecture (Sprint 9)
 
 ```
 Query arrives
@@ -1431,17 +1399,26 @@ Query arrives
        │ MISS
        ▼
 ┌─────────────────────────┐
-│ Tier 2: SemanticCache   │ ← In-process cosine similarity
-│ Model: MiniLM-L6-v2     │   sentence-transformers O(n) scan
-│ Max: 500 entries        │   cosine similarity ≥ 0.85
-│ Latency: ~5-10ms        │
+│ Tier 2: FAISS L1        │ ← In-process FAISS IndexFlatIP
+│ Model: MiniLM-L6-v2     │   Inner-product on normalized vectors
+│ Max: 500 entries        │   = cosine similarity ≥ 0.85
+│ Speedup: sub-ms at 25K+ │
+│ Fallback: np.dot O(n)   │   (if faiss-cpu not installed)
+└──────┬──────────────────┘
+       │ MISS
+       ▼
+┌─────────────────────────┐
+│ Tier 3: RediSearch L2   │ ← Shared HNSW vector index (optional)
+│ Feature flag:            │   AICE_CACHE_L2_REDIS=true
+│ Latency: ~1-5ms         │
+│ On hit: backfill L1+LRU │
 └──────┬──────────────────┘
        │ MISS
        ▼
   Full Hybrid RAG execution
        │
        ▼
-  Write-through to both tiers
+  Write-through to all tiers
 ```
 
 ### 11.2 Cache Key Dimensions
@@ -1461,7 +1438,7 @@ Different parameter combinations produce distinct cache entries, preventing cros
 - **Model**: `all-MiniLM-L6-v2` (Sentence Transformers)
 - **Dimension**: 384
 - **Local cache**: `local_models/` directory
-- **Fallback**: When `sentence-transformers` is unavailable, semantic cache is disabled (LRU-only mode).
+- **Fallback**: When `sentence-transformers` is unavailable, semantic cache is disabled (LRU-only mode). When `faiss-cpu` is unavailable, semantic cache falls back to O(n) NumPy dot-product scan. When `AICE_CACHE_L2_REDIS` is not set, RediSearch L2 is disabled (FAISS L1 only).
 
 ---
 
@@ -1699,16 +1676,19 @@ session_end(session_id="GEST_20260322_001")
 
 #### Ingesting New Knowledge
 
-> **Note**: Direct ingestion MCP tools were removed in Sprint 17. Contact the platform team to trigger production ingestion runs. Platform team invokes `IngestionService` directly.
-
-For DA developers who need to load user-provided documents into a session:
-
 ```python
-# Upload user documents to your per-session sandbox (available as MCP tool)
-sandbox_upload(session_id="YOUR_SESSION", file_path="/path/to/spec.pdf")
+# Ingest a single file
+ingest_file(file_path="/repo/Adc/src/Adc.c", workspace="illd", module="Adc")
 
-# Then query via search_database with session routing
-search_database(query="ADC init sequence", session_id="YOUR_SESSION", workspace_id="illd")
+# Ingest an entire module
+ingest_module_from_repo(repo_path="/repo", module="Adc", workspace="illd")
+
+# Batch ingest multiple modules
+batch_ingest_modules(repo_path="/repo", modules=["Adc", "Spi", "Can"],
+                     workspace="illd")
+
+# Full repository ingestion
+ingest_repository(repo_path="/repo", workspace="illd")
 ```
 
 #### Managing Cache
@@ -1897,7 +1877,7 @@ AICE implements the [Model Context Protocol (MCP)](https://modelcontextprotocol.
 
 ### 15.2 Response Envelope
 
-All 55 tools return data wrapped in a consistent envelope:
+All 56 tools return data wrapped in a consistent envelope:
 
 ```typescript
 // Success
@@ -2024,5 +2004,5 @@ ADC, CAN, Crypto, DIO, DMA, DMU, ETH, FLS, FlsLoader, GPT, GTM, I2C, ICU, IRQ, I
 
 ---
 
-*Document updated for Sprint 25 codebase. Version 2.1.0.*
+*Document generated from Sprint 9 codebase. Version 2.1.0.*
 *For questions or contributions, contact the AI Core Engine team.*

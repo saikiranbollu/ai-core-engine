@@ -100,6 +100,8 @@ class RC1EADiagramExtractor:
         self.dry_run = dry_run
         self.clear = clear
         self.stats: Counter = Counter()
+        # Prefix for ea_id to prevent integer ID collisions across QEAX files
+        self.model_prefix = qeax_path.stem if qeax_path else DEFAULT_QEAX.stem
 
         if neo4j_cfg is None:
             neo4j_cfg = self._load_neo4j_config()
@@ -237,7 +239,8 @@ class RC1EADiagramExtractor:
                 self.stats[f"diagrams:skipped:{dtype}"] += 1
                 continue
             diagrams.append({
-                "ea_id": did,
+                "ea_id": f"{self.model_prefix}:{did}",
+                "_raw_id": did,
                 "name": name or "",
                 "diagram_type": dtype,
                 "package_id": pkg_id,
@@ -247,6 +250,7 @@ class RC1EADiagramExtractor:
                 "link_count": link_count,
                 "module": self.module,
                 "project": PROJECT,
+                "source_model": self.model_prefix,
             })
         logger.info("Extracted %d diagrams", len(diagrams))
         return diagrams
@@ -310,21 +314,23 @@ class RC1EADiagramExtractor:
         node_props: dict[int, dict] = {}
 
         for diag in activity_diagrams:
-            did = diag["ea_id"]
+            did = diag["_raw_id"]
+            prefixed_did = diag["ea_id"]
             elements = diagram_elements.get(did, [])
             for obj_id, name, obj_type, stereo, seq in elements:
                 if obj_type not in ACTIVITY_NODE_TYPES:
                     continue
                 all_activity_obj_ids.add(obj_id)
-                obj_to_diagram[obj_id] = did
+                obj_to_diagram[obj_id] = prefixed_did
                 node_props[obj_id] = {
-                    "ea_id": obj_id,
+                    "ea_id": f"{self.model_prefix}:{obj_id}",
                     "name": name or "",
                     "node_type": obj_type,
                     "sequence": seq or 0,
-                    "diagram_id": did,
+                    "diagram_id": prefixed_did,
                     "module": self.module,
                     "project": PROJECT,
+                    "source_model": self.model_prefix,
                 }
 
         cf_connectors = self._extract_connectors_for_objects(
@@ -335,13 +341,13 @@ class RC1EADiagramExtractor:
         for r in cf_connectors:
             conn_id, conn_type, name, stereo, src_id, tgt_id, seq_no = r
             if src_id in all_activity_obj_ids and tgt_id in all_activity_obj_ids:
-                edge = {"from_key": src_id, "to_key": tgt_id}
+                edge = {"from_key": f"{self.model_prefix}:{src_id}", "to_key": f"{self.model_prefix}:{tgt_id}"}
                 if name:
                     edge["label"] = name
                 flow_edges.append(edge)
 
         n2d_edges = [
-            {"from_key": obj_id, "to_key": did}
+            {"from_key": f"{self.model_prefix}:{obj_id}", "to_key": did}
             for obj_id, did in obj_to_diagram.items()
         ]
 
@@ -365,22 +371,24 @@ class RC1EADiagramExtractor:
         participant_props: dict[int, dict] = {}
 
         for diag in seq_diagrams:
-            did = diag["ea_id"]
+            did = diag["_raw_id"]
+            prefixed_did = diag["ea_id"]
             elements = diagram_elements.get(did, [])
             for obj_id, name, obj_type, stereo, seq in elements:
                 if obj_type == "Note":
                     continue
                 all_participant_ids.add(obj_id)
-                participant_to_diagram[obj_id] = did
+                participant_to_diagram[obj_id] = prefixed_did
                 participant_props[obj_id] = {
-                    "ea_id": obj_id,
+                    "ea_id": f"{self.model_prefix}:{obj_id}",
                     "name": name or obj_type,
                     "participant_type": obj_type,
                     "stereotype": stereo or "",
                     "sequence": seq or 0,
-                    "diagram_id": did,
+                    "diagram_id": prefixed_did,
                     "module": self.module,
                     "project": PROJECT,
+                    "source_model": self.model_prefix,
                 }
 
         msg_connectors = self._extract_connectors_for_objects(
@@ -391,13 +399,13 @@ class RC1EADiagramExtractor:
         for r in msg_connectors:
             conn_id, conn_type, name, stereo, src_id, tgt_id, seq_no = r
             if src_id in all_participant_ids and tgt_id in all_participant_ids:
-                edge = {"from_key": src_id, "to_key": tgt_id, "seq_no": seq_no or 0}
+                edge = {"from_key": f"{self.model_prefix}:{src_id}", "to_key": f"{self.model_prefix}:{tgt_id}", "seq_no": seq_no or 0}
                 if name:
                     edge["message"] = name
                 message_edges.append(edge)
 
         p2d_edges = [
-            {"from_key": obj_id, "to_key": did}
+            {"from_key": f"{self.model_prefix}:{obj_id}", "to_key": did}
             for obj_id, did in participant_to_diagram.items()
         ]
 
@@ -421,21 +429,23 @@ class RC1EADiagramExtractor:
         state_props: dict[int, dict] = {}
 
         for diag in sc_diagrams:
-            did = diag["ea_id"]
+            did = diag["_raw_id"]
+            prefixed_did = diag["ea_id"]
             elements = diagram_elements.get(did, [])
             for obj_id, name, obj_type, stereo, seq in elements:
                 if obj_type not in STATE_NODE_TYPES:
                     continue
                 all_state_ids.add(obj_id)
-                state_to_diagram[obj_id] = did
+                state_to_diagram[obj_id] = prefixed_did
                 state_props[obj_id] = {
-                    "ea_id": obj_id,
+                    "ea_id": f"{self.model_prefix}:{obj_id}",
                     "name": name or "",
                     "state_type": obj_type,
                     "sequence": seq or 0,
-                    "diagram_id": did,
+                    "diagram_id": prefixed_did,
                     "module": self.module,
                     "project": PROJECT,
+                    "source_model": self.model_prefix,
                 }
 
         sf_connectors = self._extract_connectors_for_objects(
@@ -446,13 +456,13 @@ class RC1EADiagramExtractor:
         for r in sf_connectors:
             conn_id, conn_type, name, stereo, src_id, tgt_id, seq_no = r
             if src_id in all_state_ids and tgt_id in all_state_ids:
-                edge = {"from_key": src_id, "to_key": tgt_id}
+                edge = {"from_key": f"{self.model_prefix}:{src_id}", "to_key": f"{self.model_prefix}:{tgt_id}"}
                 if name:
                     edge["label"] = name
                 transition_edges.append(edge)
 
         s2d_edges = [
-            {"from_key": obj_id, "to_key": did}
+            {"from_key": f"{self.model_prefix}:{obj_id}", "to_key": did}
             for obj_id, did in state_to_diagram.items()
         ]
 
@@ -473,11 +483,12 @@ class RC1EADiagramExtractor:
 
         edges = []
         for diag in logical_diagrams:
-            did = diag["ea_id"]
+            did = diag["_raw_id"]
+            prefixed_did = diag["ea_id"]
             elements = diagram_elements.get(did, [])
             for obj_id, name, obj_type, stereo, seq in elements:
                 if stereo:
-                    edges.append({"from_key": obj_id, "to_key": did})
+                    edges.append({"from_key": f"{self.model_prefix}:{obj_id}", "to_key": prefixed_did})
 
         logger.info("Logical: %d APPEARS_IN links across %d diagrams",
                      len(edges), len(logical_diagrams))
@@ -500,8 +511,9 @@ class RC1EADiagramExtractor:
         logger.info("Created constraints for diagram labels")
 
     def _ingest_diagrams(self, diagrams: list[dict]):
-        self._merge_nodes("EA_Diagram", "ea_id", diagrams)
-        logger.info("  → %d EA_Diagram nodes", len(diagrams))
+        clean = [{k: v for k, v in d.items() if k != "_raw_id"} for d in diagrams]
+        self._merge_nodes("EA_Diagram", "ea_id", clean)
+        logger.info("  → %d EA_Diagram nodes", len(clean))
 
     def _ingest_activity(self, nodes, flow_edges, n2d_edges):
         if nodes:
@@ -637,7 +649,7 @@ class RC1EADiagramExtractor:
                 logger.warning("No diagrams found for module '%s'", self.module)
                 return
 
-            diagram_ids = [d["ea_id"] for d in diagrams]
+            diagram_ids = [d["_raw_id"] for d in diagrams]
             diagram_elements = self._extract_diagram_elements(diagram_ids)
 
             act_nodes, act_flows, act_n2d = self._build_activity_nodes_and_flows(

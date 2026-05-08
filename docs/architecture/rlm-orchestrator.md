@@ -28,7 +28,7 @@ The RLM (Retrieval-augmented Language Model) Orchestrator handles **complex mult
 
 However, two MCP tools are exposed at the **developer** tier for visibility and debugging:
 - `rlm_orchestrate` — execute a full orchestration
-- `rlm_plan_preview` — inspect the generated plan without executing it
+- `rlm_preview` — inspect the generated plan without executing it
 
 ---
 
@@ -206,7 +206,7 @@ The `run()` method accepts an optional `on_progress` callback `(step_index, tota
 - After each sub-query completion: reports step N/total
 - After synthesis: reports completion
 
-> **Implementation status**: The `on_progress` callback parameter exists in `RLMOrchestrator.run()` and is invoked at planning, each sub-query, and synthesis. However, the `rlm_orchestrate` MCP tool handler currently calls `rlm.run()` **without** passing any callback (`asyncio.to_thread(rlm.run, query=query, task_type=task_type, session_context=None)`). SSE/MCP streaming progress via `ctx.report_progress()` is not yet wired. This is a planned improvement.
+The `rlm_orchestrate` MCP tool passes a logger-based callback that writes progress to stderr, providing visibility into multi-step execution.
 
 ### Step 3: Build Per-Step Context
 
@@ -273,7 +273,7 @@ The synthesis choice depends on total token count — if concatenation fits with
 
 ## 8. Preview Mode
 
-`rlm_plan_preview` returns the generated plan **without executing** the sub-queries:
+`rlm_preview` returns the generated plan **without executing** the sub-queries:
 
 ```python
 preview = rlm.preview(query, task_type, workspace, module)

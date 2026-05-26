@@ -53,7 +53,7 @@ def resolve_principal(
 
     attr = {
         "workspace_id": workspace_id,
-        "api_key_hash": api_key[:8] + "…",
+        "api_key_hash": "sha256:" + __import__('hashlib').sha256(api_key.encode()).hexdigest()[:16],
     }
 
     if _CERBOS_SDK_AVAILABLE:

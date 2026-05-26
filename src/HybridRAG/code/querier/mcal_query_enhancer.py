@@ -27,6 +27,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 from .kg_node_utils import node_display_name, node_unique_id
 
 logger = logging.getLogger(__name__)
@@ -437,7 +439,13 @@ class McalQueryEnhancer:
     @staticmethod
     def _default_llm(system: str, user: str, max_tokens: int = 800) -> str:
         """Call LLM via GPT4IFX (reuses shared connection pool from RLM)."""
-        try:
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=4),
+            retry=retry_if_exception_type((TimeoutError, ConnectionError)),
+            reraise=True,
+        )
+        def _call():
             from src.HybridRAG.code.querier.rlm_orchestrator import _get_shared_openai_client
             client = _get_shared_openai_client()
             model = os.environ.get("QUERY_ENHANCER_MODEL", "gpt-5.2")
@@ -449,8 +457,10 @@ class McalQueryEnhancer:
                 ],
             )
             return resp.choices[0].message.content or ""
+        try:
+            return _call()
         except Exception as e:
-            logger.error("[QueryEnhancer] LLM call failed: %s", e)
+            logger.error("[QueryEnhancer] LLM call failed after retries: %s", e)
             return ""
 
     def enhance(self, query: str, module: Optional[str] = None) -> EnhancedQuery:

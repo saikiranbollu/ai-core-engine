@@ -277,7 +277,7 @@ def _authorize(tool_name: str, **kw) -> Optional[str]:
         try:
             pg.log_audit(
                 tool_name=tool_name, workspace_id=ws,
-                caller_api_key=api_key[:8] + "…",
+                caller_api_key="sha256:" + __import__('hashlib').sha256(api_key.encode()).hexdigest()[:16],
                 response_code="ok" if allowed else "denied",
             )
         except Exception:
@@ -367,6 +367,12 @@ _SESSION_TTL_SECONDS = _get_settings().session_ttl_seconds
 _neo4j_drivers: Dict[str, Any] = {}   # per-profile driver pool
 _qdrant_client = None
 
+# ── Negative caching for failed service init (MEG_SW-321) ──────────────
+_INIT_COOLDOWN_SECONDS = int(os.environ.get("AICE_INIT_COOLDOWN", "30"))
+_neo4j_fail_ts: Dict[str, float] = {}   # profile → timestamp of last failure
+_qdrant_fail_ts: float = 0.0
+_redis_fail_ts: float = 0.0
+
 # Config-driven default alpha (MEG_SW-308)
 try:
     from src.HybridRAG.code.env_config import get_default_search_alpha
@@ -414,6 +420,11 @@ def _get_neo4j(profile: str = "illd"):
     # Return cached driver if available (fast path, no lock)
     if instance in _neo4j_drivers:
         return _neo4j_drivers[instance]
+
+    # Negative cache: skip retry if last failure was recent (MEG_SW-321)
+    last_fail = _neo4j_fail_ts.get(instance, 0.0)
+    if last_fail and (time.time() - last_fail) < _INIT_COOLDOWN_SECONDS:
+        return None
 
     return _create_neo4j_driver(instance)
 
@@ -473,6 +484,7 @@ def _create_neo4j_driver(instance: str):
     except Exception as e:
         logger.error("Neo4j init for profile '%s': %s", instance, e)
         _classify_and_record_error(e, "neo4j")
+        _neo4j_fail_ts[instance] = time.time()
         return None
 
 def _get_qdrant():
@@ -488,8 +500,11 @@ def _get_qdrant():
       - External (HTTPS URL): use REST — the OpenShift edge-terminated
         ingress only supports HTTP/1.1.
     """
-    global _qdrant_client
+    global _qdrant_client, _qdrant_fail_ts
     if _qdrant_client is None:
+        # Negative cache: skip retry if last failure was recent (MEG_SW-321)
+        if _qdrant_fail_ts and (time.time() - _qdrant_fail_ts) < _INIT_COOLDOWN_SECONDS:
+            return None
         try:
             from qdrant_client import QdrantClient
             qdrant_url = None
@@ -576,11 +591,15 @@ def _get_qdrant():
         except Exception as e:
             logger.error("Qdrant init: %s", e)
             _classify_and_record_error(e, "qdrant")
+            _qdrant_fail_ts = time.time()
     return _qdrant_client
 
 def _get_redis():
-    global _redis_client
+    global _redis_client, _redis_fail_ts
     if _redis_client is None:
+        # Negative cache: skip retry if last failure was recent (MEG_SW-321)
+        if _redis_fail_ts and (time.time() - _redis_fail_ts) < _INIT_COOLDOWN_SECONDS:
+            return None
         try:
             import redis as _redis
             redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -596,6 +615,7 @@ def _get_redis():
         except Exception as e:
             logger.error("Redis init: %s", e)
             _classify_and_record_error(e, "redis")
+            _redis_fail_ts = time.time()
     return _redis_client
 
 # ── PostgreSQL (audit, feedback, sessions, ingestion tracking) ─────────────
@@ -2792,6 +2812,11 @@ async def sandbox_upload(
                     if not content:
                         continue
 
+                    # MEG_SW-309: Block path traversal in filenames
+                    if ".." in filename or filename.startswith("/") or filename.startswith("\\"):
+                        logger.warning("sandbox_upload: path traversal blocked in filename %s", filename)
+                        continue
+
                     # Base64 decode if needed
                     if encoding == "base64":
                         content_bytes = base64.b64decode(content)
@@ -2817,7 +2842,15 @@ async def sandbox_upload(
 
             elif file_paths:
                 for fp in file_paths:
-                    p = Path(fp)
+                    p = Path(fp).resolve()
+                    # MEG_SW-328: Block path traversal — only allow files under
+                    # known safe directories (tmp sandbox or repo root)
+                    _allowed_roots = [tmp_dir.resolve()]
+                    _repo_root = Path(__file__).resolve().parents[2]
+                    _allowed_roots.append(_repo_root)
+                    if not any(str(p).startswith(str(root)) for root in _allowed_roots):
+                        logger.warning("sandbox_upload: path traversal blocked for %s", fp)
+                        continue
                     if not p.exists():
                         logger.warning("sandbox_upload: %s not found, skipping", fp)
                         continue

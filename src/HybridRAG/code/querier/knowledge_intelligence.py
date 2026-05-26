@@ -15,6 +15,8 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
+from src.HybridRAG.code.KG._kg_safety import sanitize_label
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,7 +68,8 @@ class KnowledgeIntelligenceService:
         if not self._neo4j:
             return []
         try:
-            with self._neo4j.session(database=self._db(ws)) as s:
+            from neo4j import READ_ACCESS
+            with self._neo4j.session(database=self._db(ws), default_access_mode=READ_ACCESS) as s:
                 return [dict(r) for r in s.run(cypher, params)]
         except Exception as e:
             logger.error("Cypher failed: %s", e)
@@ -80,8 +83,9 @@ class KnowledgeIntelligenceService:
         """Search across multiple labels for a fuzzy name match."""
         kw = name.lower()
         for label in labels:
+            safe_label = sanitize_label(label)
             rows = self._run_cypher(
-                f"MATCH (n:{label}) WHERE toLower(coalesce(n.name,'')) CONTAINS $kw "
+                f"MATCH (n:{safe_label}) WHERE toLower(coalesce(n.name,'')) CONTAINS $kw "
                 f"OR toLower(coalesce(n.function_name,'')) CONTAINS $kw "
                 f"OR toLower(coalesce(n.type_name,'')) CONTAINS $kw "
                 f"OR toLower(coalesce(n.macro_name,'')) CONTAINS $kw "

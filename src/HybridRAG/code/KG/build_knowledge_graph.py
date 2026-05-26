@@ -37,6 +37,8 @@ import yaml
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError, TransientError
 
+from src.HybridRAG.code.KG._kg_safety import sanitize_label, sanitize_property
+
 # Retry decorator for transient Neo4j failures
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -862,9 +864,10 @@ class KnowledgeGraphBuilder:
         logger.info("Creating constraints and indexes…")
 
         for nt in self.node_types:
-            label = nt["name"]
+            label = sanitize_label(nt["name"])
             uid_prop = get_unique_id_property(nt)
             if uid_prop:
+                uid_prop = sanitize_property(uid_prop)
                 constraint_name = f"unique_{label}_{uid_prop}".lower()
                 cypher = (
                     f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
@@ -912,7 +915,7 @@ class KnowledgeGraphBuilder:
             if not nt_def:
                 continue
 
-            label = nt_def["name"]
+            label = sanitize_label(nt_def["name"])
             uid_prop = get_unique_id_property(nt_def)
             if not uid_prop:
                 logger.warning(
@@ -920,6 +923,8 @@ class KnowledgeGraphBuilder:
                     label, jama_type,
                 )
                 continue
+
+            uid_prop = sanitize_property(uid_prop)
 
             logger.info("Creating :%s nodes (%d items)…", label, len(items))
 
@@ -2115,16 +2120,17 @@ class ILLDKnowledgeGraphBuilder:
             by_type[n.type].append(props)
 
         for ntype, items in by_type.items():
-            logger.info("  Creating :%s (%d nodes)…", ntype, len(items))
+            safe_ntype = sanitize_label(ntype)
+            logger.info("  Creating :%s (%d nodes)…", safe_ntype, len(items))
             for chunk in self._chunked(items, self.BATCH_SIZE):
                 cypher = (
                     f"UNWIND $items AS props "
-                    f"MERGE (n:{ntype} {{id: props.id}}) "
+                    f"MERGE (n:{safe_ntype} {{id: props.id}}) "
                     f"ON CREATE SET n.global_id = randomUUID() "
                     f"SET n += props"
                 )
                 self._write_tx(cypher, {"items": chunk})
-            self.stats[f"nodes:{ntype}"] = len(items)
+            self.stats[f"nodes:{safe_ntype}"] = len(items)
 
     # -- Edge Creation (batched by type) ------------------------------------
 
@@ -2144,17 +2150,18 @@ class ILLDKnowledgeGraphBuilder:
             })
 
         for rtype, items in by_type.items():
-            logger.info("  Creating :%s (%d edges)…", rtype, len(items))
+            safe_rtype = sanitize_label(rtype)
+            logger.info("  Creating :%s (%d edges)…", safe_rtype, len(items))
             for chunk in self._chunked(items, self.BATCH_SIZE):
                 cypher = (
                     f"UNWIND $edges AS e "
                     f"MATCH (a {{id: e.source_id}}) "
                     f"MATCH (b {{id: e.target_id}}) "
-                    f"MERGE (a)-[r:{rtype}]->(b) "
+                    f"MERGE (a)-[r:{safe_rtype}]->(b) "
                     f"SET r += e.props"
                 )
                 self._write_tx(cypher, {"edges": chunk})
-            self.stats[f"rel:{rtype}"] = len(items)
+            self.stats[f"rel:{safe_rtype}"] = len(items)
 
     # -- Preview (dry-run) --------------------------------------------------
 
@@ -2570,10 +2577,12 @@ class TestSpecKnowledgeGraphBuilder:
         for node_type, uid_prop in self._UID_MAP.items():
             if node_type not in parsed:
                 continue
-            constraint_name = f"unique_{node_type}_{uid_prop}"
+            safe_node_type = sanitize_label(node_type)
+            safe_uid_prop = sanitize_property(uid_prop)
+            constraint_name = f"unique_{safe_node_type}_{safe_uid_prop}"
             cypher = (
                 f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
-                f"FOR (n:{node_type}) REQUIRE n.{uid_prop} IS UNIQUE"
+                f"FOR (n:{safe_node_type}) REQUIRE n.{safe_uid_prop} IS UNIQUE"
             )
             try:
                 self._write_tx(cypher)
@@ -2590,7 +2599,9 @@ class TestSpecKnowledgeGraphBuilder:
                 logger.warning("Unknown TS node type: %s – skipping", node_type)
                 continue
 
-            logger.info("  Creating :%s (%d nodes)…", node_type, len(items))
+            safe_node_type = sanitize_label(node_type)
+            safe_uid_prop = sanitize_property(uid_prop)
+            logger.info("  Creating :%s (%d nodes)…", safe_node_type, len(items))
 
             # Prepare items for Neo4j: convert lists to JSON strings,
             # remove None values
@@ -2609,14 +2620,14 @@ class TestSpecKnowledgeGraphBuilder:
             for chunk in self._chunked(batch, self.BATCH_SIZE):
                 cypher = (
                     f"UNWIND $items AS props "
-                    f"MERGE (n:{node_type} {{{uid_prop}: props.{uid_prop}}}) "
+                    f"MERGE (n:{safe_node_type} {{{safe_uid_prop}: props.{safe_uid_prop}}}) "
                     f"ON CREATE SET n.global_id = randomUUID() "
                     f"SET n += props"
                 )
                 self._write_tx(cypher, {"items": chunk})
 
-            self.stats[f"nodes:{node_type}"] = len(items)
-            logger.info("    → created/merged %d :%s nodes", len(items), node_type)
+            self.stats[f"nodes:{safe_node_type}"] = len(items)
+            logger.info("    → created/merged %d :%s nodes", len(items), safe_node_type)
 
     # -- Relationship Creation ----------------------------------------------
 
@@ -5162,10 +5173,12 @@ class SourceCodeKnowledgeGraphBuilder:
     def _create_constraints(self):
         """Create uniqueness constraints and indexes for SRC_ node types."""
         for node_type, uid_prop in self._UID_MAP.items():
-            constraint_name = f"unique_{node_type}_{uid_prop}"
+            safe_node_type = sanitize_label(node_type)
+            safe_uid_prop = sanitize_property(uid_prop)
+            constraint_name = f"unique_{safe_node_type}_{safe_uid_prop}"
             cypher = (
                 f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
-                f"FOR (n:{node_type}) REQUIRE n.{uid_prop} IS UNIQUE"
+                f"FOR (n:{safe_node_type}) REQUIRE n.{safe_uid_prop} IS UNIQUE"
             )
             try:
                 self._write_tx(cypher)
@@ -5217,9 +5230,11 @@ class SourceCodeKnowledgeGraphBuilder:
                 continue
 
             uid_prop = self._UID_MAP[node_type]
-            logger.info("  Creating :%s (%d nodes)ΓÇª", node_type, len(items))
+            safe_node_type = sanitize_label(node_type)
+            safe_uid_prop = sanitize_property(uid_prop)
+            logger.info("  Creating :%s (%d nodes)…", safe_node_type, len(items))
 
-            # Clean items for Neo4j ΓÇö remove internal keys, convert None
+            # Clean items for Neo4j — remove internal keys, convert None
             batch = []
             for item in items:
                 clean = {}
@@ -5234,14 +5249,14 @@ class SourceCodeKnowledgeGraphBuilder:
             for chunk in self._chunked(batch, self.BATCH_SIZE):
                 cypher = (
                     f"UNWIND $items AS props "
-                    f"MERGE (n:{node_type} {{{uid_prop}: props.{uid_prop}}}) "
+                    f"MERGE (n:{safe_node_type} {{{safe_uid_prop}: props.{safe_uid_prop}}}) "
                     f"ON CREATE SET n.global_id = randomUUID() "
                     f"SET n += props"
                 )
                 self._write_tx(cypher, {"items": chunk})
 
-            self.stats[f"nodes:{node_type}"] = len(items)
-            logger.info("    ΓåÆ created/merged %d :%s nodes", len(items), node_type)
+            self.stats[f"nodes:{safe_node_type}"] = len(items)
+            logger.info("    → created/merged %d :%s nodes", len(items), safe_node_type)
 
     # ======================================================================
     # STEP 5: CREATE RELATIONSHIPS
@@ -5277,16 +5292,18 @@ class SourceCodeKnowledgeGraphBuilder:
             if not edges:
                 continue
 
-            logger.info("  Creating SRC_DEFINED_IN for %s (%d edges)ΓÇª", node_type, len(edges))
+            safe_node_type = sanitize_label(node_type)
+            safe_uid_prop = sanitize_property(uid_prop)
+            logger.info("  Creating SRC_DEFINED_IN for %s (%d edges)…", safe_node_type, len(edges))
             for chunk in self._chunked(edges, self.BATCH_SIZE):
                 cypher = (
                     f"UNWIND $edges AS e "
-                    f"MATCH (n:{node_type} {{{uid_prop}: e.uid}}) "
+                    f"MATCH (n:{safe_node_type} {{{safe_uid_prop}: e.uid}}) "
                     f"MATCH (f:SRC_SourceFile {{file_id: e.file_id}}) "
                     f"MERGE (n)-[:SRC_DEFINED_IN]->(f)"
                 )
                 self._write_tx(cypher, {"edges": chunk})
-            self.stats[f"rel:SRC_DEFINED_IN({node_type})"] = len(edges)
+            self.stats[f"rel:SRC_DEFINED_IN({safe_node_type})"] = len(edges)
 
     def _create_call_graph_rels(self):
         """SRC_Function -[SRC_CALLS]→ SRC_Function (by function name)."""
@@ -6514,13 +6531,14 @@ class SFRKnowledgeGraphBuilder:
         nodes belonging to a different project (e.g. A3G vs RC1).
         """
         for label in self._SFR_NODE_LABELS:
+            safe_label = sanitize_label(label)
             cypher = (
-                f"MATCH (n:{label} {{module: $module}}) "
+                f"MATCH (n:{safe_label} {{module: $module}}) "
                 f"WHERE n.project IS NULL "
                 f"SET n.project = $project"
             )
             self._write_tx(cypher, {"module": self.module, "project": self.project})
-            logger.info("  Stamped project='%s' on %s nodes (module=%s)", self.project, label, self.module)
+            logger.info("  Stamped project='%s' on %s nodes (module=%s)", self.project, safe_label, self.module)
 
     # ======================================================================
     # CONSTRAINTS
@@ -6528,10 +6546,12 @@ class SFRKnowledgeGraphBuilder:
 
     def _create_constraints(self):
         for node_type, uid_prop in self._UID_MAP.items():
-            constraint_name = f"unique_{node_type}_{uid_prop}"
+            safe_node_type = sanitize_label(node_type)
+            safe_uid_prop = sanitize_property(uid_prop)
+            constraint_name = f"unique_{safe_node_type}_{safe_uid_prop}"
             cypher = (
                 f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
-                f"FOR (n:{node_type}) REQUIRE n.{uid_prop} IS UNIQUE"
+                f"FOR (n:{safe_node_type}) REQUIRE n.{safe_uid_prop} IS UNIQUE"
             )
             try:
                 self._write_tx(cypher)
@@ -6541,10 +6561,11 @@ class SFRKnowledgeGraphBuilder:
 
         # Name indexes for lookup
         for node_type in ("SFR_Register", "SFR_BitField"):
+            safe_nt = sanitize_label(node_type)
             try:
                 self._write_tx(
-                    f"CREATE INDEX idx_{node_type}_name IF NOT EXISTS "
-                    f"FOR (n:{node_type}) ON (n.name)"
+                    f"CREATE INDEX idx_{safe_nt}_name IF NOT EXISTS "
+                    f"FOR (n:{safe_nt}) ON (n.name)"
                 )
             except Exception:
                 pass
@@ -6565,7 +6586,9 @@ class SFRKnowledgeGraphBuilder:
                 continue
 
             uid_prop = self._UID_MAP[node_type]
-            logger.info("  Creating :%s (%d nodes)ΓÇª", node_type, len(items))
+            safe_node_type = sanitize_label(node_type)
+            safe_uid_prop = sanitize_property(uid_prop)
+            logger.info("  Creating :%s (%d nodes)…", safe_node_type, len(items))
 
             batch = []
             for item in items:
@@ -6576,14 +6599,14 @@ class SFRKnowledgeGraphBuilder:
             for chunk in self._chunked(batch, self.BATCH_SIZE):
                 cypher = (
                     f"UNWIND $items AS props "
-                    f"MERGE (n:{node_type} {{{uid_prop}: props.{uid_prop}}}) "
+                    f"MERGE (n:{safe_node_type} {{{safe_uid_prop}: props.{safe_uid_prop}}}) "
                     f"ON CREATE SET n.global_id = randomUUID() "
                     f"SET n += props"
                 )
                 self._write_tx(cypher, {"items": chunk})
 
-            self.stats[f"nodes:{node_type}"] = len(items)
-            logger.info("    → created/merged %d :%s nodes", len(items), node_type)
+            self.stats[f"nodes:{safe_node_type}"] = len(items)
+            logger.info("    → created/merged %d :%s nodes", len(items), safe_node_type)
 
     # ======================================================================
     # CROSS-MODULE SFR INGESTION

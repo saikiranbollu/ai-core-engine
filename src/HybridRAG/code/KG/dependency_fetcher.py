@@ -135,7 +135,7 @@ def _make_connector(repo: str):
         repo=repo,
         username=os.environ.get("IFX_USERNAME"),
         password=os.environ.get("IFX_PASSWORD"),
-        verify_ssl=False,
+        verify_ssl=os.environ.get("IFX_VERIFY_SSL", "true").lower() != "false",
         ref="master",
     )
 

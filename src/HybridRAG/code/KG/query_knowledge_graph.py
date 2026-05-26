@@ -47,6 +47,8 @@ import yaml
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError
 
+from src.HybridRAG.code.KG._kg_safety import sanitize_label
+
 # ---------------------------------------------------------------------------
 # Paths  (file lives at HybridRAG/code/KG/)
 # ---------------------------------------------------------------------------
@@ -576,14 +578,15 @@ class KnowledgeGraphQuerier:
         jid = node["n"]["jama_id"]
 
         def _fetch(rel: str, direction: str = "out") -> List[dict]:
+            safe_rel = sanitize_label(rel)
             if direction == "out":
                 cypher = (
-                    f"MATCH (n {{jama_id: $jid}})-[:{rel}]->(m) "
+                    f"MATCH (n {{jama_id: $jid}})-[:{safe_rel}]->(m) "
                     f"RETURN m, labels(m) AS labels"
                 )
             else:
                 cypher = (
-                    f"MATCH (n {{jama_id: $jid}})<-[:{rel}]-(m) "
+                    f"MATCH (n {{jama_id: $jid}})<-[:{safe_rel}]-(m) "
                     f"RETURN m, labels(m) AS labels"
                 )
             return self.run(cypher, {"jid": jid})
@@ -614,9 +617,10 @@ class KnowledgeGraphQuerier:
         Useful for ASPICE compliance auditing.
         """
         labels = self._resolve_labels(label)
+        safe_relationship = sanitize_label(relationship)
         cypher = (
             f"MATCH (n) WHERE {self._label_match('n', 'labels')} "
-            f"AND NOT (n)-[:{relationship}]->() "
+            f"AND NOT (n)-[:{safe_relationship}]->() "
             f"RETURN n ORDER BY n.name"
         )
         return self.run(cypher, {"labels": labels})

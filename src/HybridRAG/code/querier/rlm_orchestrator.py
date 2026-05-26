@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 from .context_builder import (
     AssembledContext, ContextBuilder, ContextBudget, ContextItem, ContextSlot,
 )
@@ -626,7 +628,13 @@ class RLMOrchestrator:
 
     def _default_llm(self, system: str, user: str, max_tokens: int = 1500) -> str:
         """Call LLM via GPT4IFX OpenAI-compatible proxy (shared connection pool)."""
-        try:
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=4),
+            retry=retry_if_exception_type((TimeoutError, ConnectionError)),
+            reraise=True,
+        )
+        def _call():
             client = _get_shared_openai_client()
             model = os.environ.get("RLM_ROOT_MODEL", "gpt-4o")
             resp = client.chat.completions.create(
@@ -634,8 +642,10 @@ class RLMOrchestrator:
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             )
             return resp.choices[0].message.content or ""
+        try:
+            return _call()
         except Exception as e:
-            logger.error("[RLM] LLM call failed: %s", e)
+            logger.error("[RLM] LLM call failed after retries: %s", e)
             return json.dumps({"reasoning": "LLM unavailable", "steps": [
                 {"step_id": 1, "intent": "fallback single query", "query": user[:200], "alpha": _get_default_alpha()}
             ]})

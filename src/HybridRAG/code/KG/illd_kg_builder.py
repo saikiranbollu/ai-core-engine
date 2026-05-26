@@ -47,6 +47,8 @@ from typing import Any, Dict, List, Optional
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError, TransientError
 
+from src.HybridRAG.code.KG._kg_safety import sanitize_label, sanitize_property
+
 logger = logging.getLogger("illd_kg_builder")
 
 # ---------------------------------------------------------------------------
@@ -197,16 +199,18 @@ class ILLDKGBuilder:
         # Force the pipeline module on every node (parsers may set their own)
         for item in items:
             item["module"] = self.module
-        logger.info("  Merging %d :%s nodes …", len(items), label)
+        safe_label = sanitize_label(label)
+        safe_uid_prop = sanitize_property(uid_prop)
+        logger.info("  Merging %d :%s nodes …", len(items), safe_label)
         for chunk in self._chunked(items):
             cypher = (
                 f"UNWIND $items AS props "
-                f"MERGE (n:{label} {{{uid_prop}: props.{uid_prop}}}) "
+                f"MERGE (n:{safe_label} {{{safe_uid_prop}: props.{safe_uid_prop}}}) "
                 f"ON CREATE SET n.global_id = randomUUID() "
                 f"SET n += props"
             )
             self._write(cypher, {"items": chunk})
-        self.stats[f"nodes:{label}"] += len(items)
+        self.stats[f"nodes:{safe_label}"] += len(items)
 
     def _merge_edges(self, rel_type: str, from_label: str, from_uid: str,
                      to_label: str, to_uid: str, edges: List[dict],
@@ -218,25 +222,31 @@ class ILLDKGBuilder:
         """
         if not edges:
             return
-        logger.info("  Merging %d :%s edges …", len(edges), rel_type)
+        safe_rel_type = sanitize_label(rel_type)
+        safe_from_label = sanitize_label(from_label)
+        safe_from_uid = sanitize_property(from_uid)
+        safe_to_label = sanitize_label(to_label)
+        safe_to_uid = sanitize_property(to_uid)
+        logger.info("  Merging %d :%s edges …", len(edges), safe_rel_type)
 
         # Build SET clause for edge properties
         set_parts = []
         if edge_props:
             for p in edge_props:
-                set_parts.append(f"r.{p} = e.{p}")
+                safe_p = sanitize_property(p)
+                set_parts.append(f"r.{safe_p} = e.{safe_p}")
         set_clause = "SET " + ", ".join(set_parts) if set_parts else ""
 
         for chunk in self._chunked(edges):
             cypher = (
                 f"UNWIND $edges AS e "
-                f"MATCH (a:{from_label} {{{from_uid}: e.from_key}}) "
-                f"MATCH (b:{to_label} {{{to_uid}: e.to_key}}) "
-                f"MERGE (a)-[r:{rel_type}]->(b) "
+                f"MATCH (a:{safe_from_label} {{{safe_from_uid}: e.from_key}}) "
+                f"MATCH (b:{safe_to_label} {{{safe_to_uid}: e.to_key}}) "
+                f"MERGE (a)-[r:{safe_rel_type}]->(b) "
                 f"{set_clause}"
             )
             self._write(cypher, {"edges": chunk})
-        self.stats[f"rel:{rel_type}"] += len(edges)
+        self.stats[f"rel:{safe_rel_type}"] += len(edges)
 
     @staticmethod
     def _safe_str(value) -> Optional[str]:

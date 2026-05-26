@@ -71,12 +71,16 @@ SAMPLE_REGISTRY = textwrap.dedent("""\
 @pytest.fixture(autouse=True)
 def _reset_registry():
     """Reset the cached API key registry and Cerbos client between tests."""
-    import core.auth_middleware as mod
-    mod._api_key_registry = None
-    mod._cerbos_client = None
+    import core.auth.api_key_registry as reg_mod
+    import core.auth.cerbos_client as cerb_mod
+    from core.config import get_settings
+    get_settings.cache_clear()
+    reg_mod._api_key_registry = None
+    cerb_mod._cerbos_client = None
     yield
-    mod._api_key_registry = None
-    mod._cerbos_client = None
+    reg_mod._api_key_registry = None
+    cerb_mod._cerbos_client = None
+    get_settings.cache_clear()
 
 
 @pytest.fixture()
@@ -263,7 +267,8 @@ class TestCheckAuthorization:
         assert not allowed
         assert "Unknown tool" in msg
 
-    @patch("core.auth_middleware.CerbosClient")
+    @patch("core.auth.cerbos_client.CerbosClient")
+    @patch("core.auth.cerbos_client._CERBOS_SDK_AVAILABLE", True)
     def test_cerbos_allows(self, mock_cls, registry_path: Path):
         load_api_keys(registry_path)
         mock_client = MagicMock()
@@ -276,7 +281,8 @@ class TestCheckAuthorization:
         assert allowed
         assert msg == "allowed"
 
-    @patch("core.auth_middleware.CerbosClient")
+    @patch("core.auth.cerbos_client.CerbosClient")
+    @patch("core.auth.cerbos_client._CERBOS_SDK_AVAILABLE", True)
     def test_cerbos_denies(self, mock_cls, registry_path: Path):
         load_api_keys(registry_path)
         mock_client = MagicMock()
@@ -289,7 +295,8 @@ class TestCheckAuthorization:
         assert not allowed
         assert "Insufficient" in msg
 
-    @patch("core.auth_middleware.CerbosClient")
+    @patch("core.auth.cerbos_client.CerbosClient")
+    @patch("core.auth.cerbos_client._CERBOS_SDK_AVAILABLE", True)
     def test_cerbos_connection_failure(self, mock_cls, registry_path: Path):
         """When Cerbos PDP is unreachable, fall back to local tier enforcement."""
         load_api_keys(registry_path)
@@ -299,7 +306,8 @@ class TestCheckAuthorization:
         assert allowed
         assert msg == "allowed"
 
-    @patch("core.auth_middleware.CerbosClient")
+    @patch("core.auth.cerbos_client.CerbosClient")
+    @patch("core.auth.cerbos_client._CERBOS_SDK_AVAILABLE", True)
     def test_workspace_scoped_deny(self, mock_cls, registry_path: Path):
         """Developer on illd (public on mcal) denied a dev tool on mcal."""
         load_api_keys(registry_path)

@@ -22,6 +22,7 @@ import asyncio
 import contextvars
 import json, logging, os, sys, time
 import uuid as _uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,9 +118,12 @@ except ImportError:
     ERROR_TOTAL = _noop
     INGESTION_DURATION = _noop
 
+from .config import get_settings as _get_settings
+_get_settings.cache_clear()  # ensure fresh settings on module reload
+
 logging.basicConfig(
     stream=sys.stderr,
-    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO")),
+    level=getattr(logging, _get_settings().log_level),
     format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
 )
 
@@ -235,7 +239,7 @@ _current_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_current_request_id", default="",
 )
 
-_SANITIZE_ERRORS = os.environ.get("SANITIZE_ERRORS", "true").lower() in ("true", "1", "yes")
+_SANITIZE_ERRORS = _get_settings().sanitize_errors
 
 def _resolve_da_name(api_key: str) -> str:
     """Look up the principal_id (DA name) for an API key."""
@@ -256,7 +260,7 @@ def _authorize(tool_name: str, **kw) -> Optional[str]:
     _tool_name_ctx.set(tool_name)
     _tool_start_time.set(time.time())
 
-    api_key = _current_api_key.get("") or os.environ.get("MCP_API_KEY", "")
+    api_key = _current_api_key.get("") or _get_settings().mcp_api_key
     if not api_key:
         return _err_permission_denied("No API key provided (set MCP_API_KEY env var or send Authorization header)")
 
@@ -306,9 +310,11 @@ def with_session_routing(tool_name: str):
                     from src.MemoryLayer.memory.ephemeral_sandbox import (
                         HybridGraphService, HybridTraversal,
                     )
-                    ws = kwargs.get("workspace_id", "illd")
+                    ws = kwargs.get("workspace_id", "mcal")
                     driver = _get_neo4j(ws)
-                    hybrid = HybridGraphService(sandbox, driver)
+                    hybrid = HybridGraphService(sandbox, driver,
+                                                qdrant_client=_get_qdrant(),
+                                                workspace_id=ws)
                     traversal = HybridTraversal(sandbox, driver, ws)
                     classification = HybridGraphService.classify_tool(tool_name)
 
@@ -326,8 +332,23 @@ def with_session_routing(tool_name: str):
                 filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
 
             if "session_id" in sig.parameters:
-                return await fn(*args, session_id=session_id, **filtered_kwargs)
-            return await fn(*args, **filtered_kwargs)
+                coro = fn(*args, session_id=session_id, **filtered_kwargs)
+            else:
+                coro = fn(*args, **filtered_kwargs)
+
+            # ── MEG_SW-333: Async cancellation & timeout ──
+            try:
+                return await asyncio.wait_for(
+                    coro,
+                    timeout=_get_settings().tool_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                timeout = _get_settings().tool_timeout_seconds
+                logger.warning("Tool %s timed out after %ds", tool_name, timeout)
+                return _err("TIMEOUT", f"Tool execution exceeded {timeout}s limit")
+            except asyncio.CancelledError:
+                logger.warning("Tool %s was cancelled", tool_name)
+                return _err("CANCELLED", "Tool execution was cancelled by client")
         return wrapper
     return decorator
 
@@ -340,11 +361,18 @@ def with_session_routing(tool_name: str):
 #   MCP_NEO4J_INSTANCE env var provides a fallback override.
 #   Drivers are cached per-profile for connection reuse.
 #
-_NEO4J_INSTANCE: str = os.environ.get("MCP_NEO4J_INSTANCE", "")
-_DEFAULT_MAX_DEPTH = int(os.environ.get("MAX_DEPENDENCIES_DEPTH", "3"))
-_SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "3600"))
+_NEO4J_INSTANCE: str = _get_settings().mcp_neo4j_instance
+_DEFAULT_MAX_DEPTH = _get_settings().max_dependencies_depth
+_SESSION_TTL_SECONDS = _get_settings().session_ttl_seconds
 _neo4j_drivers: Dict[str, Any] = {}   # per-profile driver pool
 _qdrant_client = None
+
+# Config-driven default alpha (MEG_SW-308)
+try:
+    from src.HybridRAG.code.env_config import get_default_search_alpha
+    _DEFAULT_SEARCH_ALPHA = get_default_search_alpha()
+except Exception:
+    _DEFAULT_SEARCH_ALPHA = 0.6
 _redis_client = None
 
 def _load_neo4j_profile_config(profile: str) -> Optional[Dict[str, Any]]:
@@ -356,7 +384,11 @@ def _load_neo4j_profile_config(profile: str) -> Optional[Dict[str, Any]]:
             _sys.path.insert(0, _code_dir)
         from src.HybridRAG.code.neo4j_manager import get_instance_config
         cfg = get_instance_config(profile)
-        return {"uri": cfg.uri, "username": cfg.username, "password": cfg.password,
+        # Prefer in_cluster_uri when running inside Kubernetes
+        uri = cfg.uri
+        if os.environ.get("KUBERNETES_SERVICE_HOST") and getattr(cfg, "in_cluster_uri", None):
+            uri = cfg.in_cluster_uri
+        return {"uri": uri, "username": cfg.username, "password": cfg.password,
                 "database": cfg.database}
     except Exception as e:
         logger.debug("Could not load neo4j config for profile '%s' from storage_config: %s", profile, e)
@@ -400,7 +432,7 @@ def _create_neo4j_driver(instance: str):
             uri = env_uri
             auth = (os.environ.get("NEO4J_USERNAME", "neo4j"),
                     os.environ.get("NEO4J_PASSWORD", ""))
-            logger.info("[Neo4j] Connecting profile '%s' → %s (NEO4J_URI override)", profile, uri)
+            logger.info("[Neo4j] Connecting profile '%s' → %s (NEO4J_URI override)", instance, uri)
         else:
             # Try profile-specific config from storage_config.yaml
             cfg = _load_neo4j_profile_config(instance)
@@ -415,7 +447,7 @@ def _create_neo4j_driver(instance: str):
                 uri = "bolt://localhost:7687"
                 auth = (os.environ.get("NEO4J_USERNAME", "neo4j"),
                         os.environ.get("NEO4J_PASSWORD", ""))
-                logger.info("[Neo4j] Connecting profile '%s' → %s (default fallback)", profile, uri)
+                logger.info("[Neo4j] Connecting profile '%s' → %s (default fallback)", instance, uri)
 
         # Pool config from storage_config.yaml (or sensible defaults)
         pool_kwargs = {}
@@ -599,7 +631,10 @@ class _WorkingMemorySessionAdapter:
         self._workspace_id = workspace_id
 
     def _purge(self):
-        self._wm.purge_expired_sessions()
+        purged = self._wm.purge_expired_sessions()
+        if purged:
+            for _ in range(purged):
+                ACTIVE_SESSIONS.dec()
 
     def create(self, session_id: str, assistant_name: str = "",
                module_context: str = "", ttl_seconds: int = 3600,
@@ -638,6 +673,7 @@ class _WorkingMemorySessionAdapter:
         if session is None or session.is_expired:
             if session is not None:
                 self._wm.close_session(session_id)
+                ACTIVE_SESSIONS.dec()
             return None
         return SimpleNamespace(
             session_id=session.session_id,
@@ -859,9 +895,12 @@ def _get_sandbox_manager():
     global _sandbox_manager
     if _sandbox_manager is None:
         try:
-            from src.MemoryLayer.memory.ephemeral_sandbox import SandboxManager
-            _sandbox_manager = SandboxManager(max_chunks=5000)
-            logger.info("[MCP] SandboxManager initialized")
+            from src.MemoryLayer.memory.ephemeral_sandbox import (
+                SandboxManager, _SentenceTransformerEmbedder,
+            )
+            embedder = _SentenceTransformerEmbedder()
+            _sandbox_manager = SandboxManager(embedder=embedder, max_chunks=5000)
+            logger.info("[MCP] SandboxManager initialized (with real embedder)")
         except Exception as e:
             logger.warning("[MCP] SandboxManager init failed: %s", e)
     return _sandbox_manager
@@ -1190,7 +1229,7 @@ async def health_check(verbose: bool = False, include_test_query: bool = False) 
 async def search_database(
     query: str, max_results: int = 10, include_relationships: bool = False,
     filter_by_module: Optional[str] = None, filter_by_node_type: Optional[List[str]] = None,
-    offset: int = 0, workspace_id: str = "illd", alpha: float = 0.6,
+    offset: int = 0, workspace_id: str = "illd", alpha: float = _DEFAULT_SEARCH_ALPHA,
     session_id: Optional[str] = None,
     query_mode: Optional[str] = None,
     graph_service: Optional[Any] = None,
@@ -2643,7 +2682,7 @@ async def session_end(session_id: str, persist_audit: bool = True) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  CATEGORY 6+ — EPHEMERAL SANDBOX (4 tools) — Sprint 3
+# #  CATEGORY 6+ — EPHEMERAL SANDBOX (4 tools) — Sprint 3
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
@@ -2733,8 +2772,9 @@ async def sandbox_upload(
         dispatcher = SandboxParserDispatcher(
             include_paths=resolved_include_paths,
             skip_default_stubs=skip_default_stubs,
+            workspace_id=workspace_id,
         )
-        adapter = SandboxAdapter()
+        adapter = SandboxAdapter(workspace_id=workspace_id)
         tmp_dir = Path(f"/tmp/sandbox_{session_id}")
 
         try:
@@ -2789,8 +2829,18 @@ async def sandbox_upload(
             # ── Resolve module name (uppercase to match Neo4j convention) ──
             detected_module = module or _detect_module_from_names(all_node_names)
 
-            # ── Auto-discover include paths if requested ──
-            if _auto_discover_includes and detected_module:
+            # F-CB-10: refuse to pull traceability when module could not be
+            # detected — otherwise the prod-overlay Cypher matches against
+            # module="UNKNOWN" and silently returns zero nodes.
+            if detected_module == "unknown" and trace_depth > 0:
+                return _err(
+                    "INVALID_INPUT",
+                    "Could not detect module from uploaded files. "
+                    "Provide module= explicitly (e.g., module='Can').",
+                )
+
+            # ── Auto-discover include paths if requested (MCAL only) ──
+            if _auto_discover_includes and detected_module and workspace_id != "illd":
                 resolved_include_paths = _auto_discover_module_include_paths(detected_module)
                 if resolved_include_paths:
                     skip_default_stubs = True
@@ -2798,6 +2848,7 @@ async def sandbox_upload(
                     dispatcher = SandboxParserDispatcher(
                         include_paths=resolved_include_paths,
                         skip_default_stubs=True,
+                        workspace_id=workspace_id,
                     )
                     # Re-parse files with proper include paths
                     all_node_names = []
@@ -2852,11 +2903,34 @@ async def sandbox_upload(
 
             # ── Plan 2 Phase 5 FIX: NOW ingest sandbox files (shadow detection works correctly) ──
             parsed_results = []
+            parser_diagnostics = []
             for parsed, filename in parsed_files:
                 node_names = adapter.ingest_parsed(sandbox, parsed, filename,
                                                    module=detected_module,
                                                    has_include_paths=has_includes)
-                parsed_results.append({"filename": filename, "nodes": len(node_names)})
+                file_info = {"filename": filename, "nodes": len(node_names)}
+                # Surface clang parser statistics (SFR, globals, calls)
+                stats = parsed.get("statistics")
+                if isinstance(stats, dict):
+                    file_info["parser_stats"] = {
+                        k: v for k, v in stats.items()
+                        if k in ("total_functions", "total_sfr_accesses",
+                                 "total_global_refs", "total_calls")
+                    }
+                # Surface critical clang diagnostics (errors only, capped)
+                diags = parsed.get("diagnostics")
+                if isinstance(diags, list):
+                    errors = [d for d in diags
+                              if isinstance(d, dict) and d.get("severity") == "error"]
+                    if errors:
+                        parser_diagnostics.append({
+                            "filename": filename,
+                            "error_count": len(errors),
+                            "first_errors": [
+                                d.get("message", "")[:120] for d in errors[:5]
+                            ],
+                        })
+                parsed_results.append(file_info)
 
             # ── Phase 2: Boundary Resolution (cross-module Unknown → typed prod nodes) ──
             boundary_stats = {"boundary_candidates": 0, "boundary_resolved": 0}
@@ -2886,7 +2960,7 @@ async def sandbox_upload(
                             resolution = sandbox.graph.resolve_boundary(name_to_canonical)
                             boundary_stats["boundary_resolved"] = resolution.get("boundary_resolved", 0)
 
-            return _ok({
+            response = {
                 "session_id": session_id,
                 "files_ingested": len(parsed_results),
                 "nodes_created": sandbox.graph.node_count,
@@ -2894,8 +2968,12 @@ async def sandbox_upload(
                 "include_paths_used": len(resolved_include_paths),
                 **prod_stats,
                 **boundary_stats,
+                "parsed_files": parsed_results,
                 "sandbox_status": sandbox.status(),
-            })
+            }
+            if parser_diagnostics:
+                response["parser_diagnostics"] = parser_diagnostics
+            return _ok(response)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -2912,13 +2990,16 @@ def _auto_discover_module_include_paths(module: str) -> List[str]:
     1. ``INCLUDE_HEADERS_DIR`` env var  (default ``/app/include_headers``)
     2. Local pipeline ``temporary_data/`` relative to this source tree
 
-    Within the chosen base directory the function searches for:
-    - Module CfgMcal config headers  (``<mod>_cfgmcal/inc``)
-    - Shared dependency headers       (``rc1_deps/``)
-    - SFR device headers              (a3g: ``aurix3g_…_infra_sfr/<Device>/``,
-                                       rc1: ``aurix_rc1_sw_mcal_sfr/ssc/<Device>/inc/``)
-    - Module source API headers       (a3g: ``aurix3g_…_<mod>_src/ssc/{inc,src}``,
-                                       rc1: ``aurix_rc1_sw_mcal_dev_<mod>/ssc/{inc,src}``)
+    Within the chosen base directory the function searches for
+    (mirrors production _build_sum_include_paths order):
+    1. Module CfgMcal config headers  (``<mod>_cfgmcal/inc``)
+    2. MemMap generated headers        (``<mod>_cfgmcal/MemMap_GenFiles``)
+    3. SchM generated headers          (``<mod>_cfgmcal/SchM_GenFiles``)
+    4. Shared dependency headers       (``rc1_deps/``)
+    5. Platform headers                (``aurix3g_…_platform``)
+    6. Cross-module source headers     (``ssc/inc`` from other ``*_src`` repos)
+    7. SFR device headers              (a3g or rc1 layout)
+    8. Module source API headers       (``ssc/{inc,src}``)
 
     The logic is project-agnostic — it checks both a3g and rc1 naming
     conventions and includes whichever directories exist.
@@ -2941,17 +3022,60 @@ def _auto_discover_module_include_paths(module: str) -> List[str]:
     mod_lower = module.lower()
     include_paths: List[str] = []
 
-    # 1. CfgMcal headers: <mod>_cfgmcal/inc
-    cfgmcal = base / f"{mod_lower}_cfgmcal" / "inc"
-    if cfgmcal.is_dir():
-        include_paths.append(str(cfgmcal))
+    # Determine the module source directory name (for exclusion from cross-module scan)
+    own_src_names = {
+        f"aurix3g_sw_mcal_tc4xx_{mod_lower}_src",
+        f"aurix_rc1_sw_mcal_dev_{mod_lower}",
+    }
 
-    # 2. Shared dependency headers: rc1_deps
+    # 1. CfgMcal headers: <mod>_cfgmcal/inc
+    cfgmcal_base = base / f"{mod_lower}_cfgmcal"
+    cfgmcal_inc = cfgmcal_base / "inc"
+    if cfgmcal_inc.is_dir():
+        include_paths.append(str(cfgmcal_inc))
+
+    # 2-3. Sum config generated files (SchM + MemMap) — aggregated directory
+    #      Contains all SchM_*.h and *_MemMap.h from all modules' ver repos.
+    sum_gen = base / "sum_gen_files"
+    if sum_gen.is_dir():
+        include_paths.append(str(sum_gen))
+    else:
+        # Fallback: try module-specific cfgmcal directories (legacy layout)
+        memmap = cfgmcal_base / "MemMap_GenFiles"
+        if memmap.is_dir():
+            include_paths.append(str(memmap))
+        schm = cfgmcal_base / "SchM_GenFiles"
+        if schm.is_dir():
+            include_paths.append(str(schm))
+
+    # 4. Shared dependency headers: rc1_deps
     deps = base / "rc1_deps"
     if deps.is_dir():
         include_paths.append(str(deps))
 
-    # 3. SFR device headers — supports both a3g and rc1 layouts
+    # 5. Platform headers (Std_Types.h, Mcal_ErrorTypes.h, etc.)
+    for platform_name in ("aurix3g_sw_mcal_tc4xx_platform",
+                          "aurix_rc1_sw_mcal_platform"):
+        platform_dir = base / platform_name
+        if platform_dir.is_dir():
+            include_paths.append(str(platform_dir))
+            break
+
+    # 6. Cross-module source headers (ssc/inc from other *_src repos)
+    #    Ensures Dma.h, Gtm.h, McalLib.h, etc. resolve without stubs
+    if base.is_dir():
+        for child in sorted(base.iterdir()):
+            if not child.is_dir():
+                continue
+            if not child.name.endswith("_src"):
+                continue
+            if child.name in own_src_names:
+                continue
+            ssc_inc = child / "ssc" / "inc"
+            if ssc_inc.is_dir():
+                include_paths.append(str(ssc_inc))
+
+    # 7. SFR device headers — supports both a3g and rc1 layouts
     #    a3g:  aurix3g_sw_mcal_tc4xx_infra_sfr/<TC49xN>/  (headers directly in device dir)
     #    rc1:  aurix_rc1_sw_mcal_sfr/ssc/<RC1S16>/inc/    (headers under inc/)
     sfr_candidates = [
@@ -2977,7 +3101,7 @@ def _auto_discover_module_include_paths(module: str) -> List[str]:
         inc_subdir = chosen / "inc"
         include_paths.append(str(inc_subdir) if inc_subdir.is_dir() else str(chosen))
 
-    # 4. Module source headers — supports both a3g and rc1 naming
+    # 8. Module source headers — supports both a3g and rc1 naming
     #    a3g: aurix3g_sw_mcal_tc4xx_<mod>_src/ssc/{inc,src}
     #    rc1: aurix_rc1_sw_mcal_dev_<mod>/ssc/{inc,src}
     src_patterns = [
@@ -2995,20 +3119,40 @@ def _auto_discover_module_include_paths(module: str) -> List[str]:
         if ssc_src.is_dir():
             include_paths.append(str(ssc_src))
 
+    logger.info("_auto_discover_module_include_paths(%s): %d paths found", module, len(include_paths))
+    for p in include_paths:
+        logger.info("  include: %s", p)
+
     return include_paths
 
 
 def _detect_module_from_names(node_names: List[str]) -> str:
-    """Heuristic: extract module name from function names (e.g. Adc_Init → ADC).
+    """Heuristic: extract module name from function names.
 
-    Returns uppercase to match Neo4j convention (module property is uppercase).
+    Handles both MCAL (``Adc_Init``) and iLLD (``IfxCan_init``,
+    ``IfxCan_Node_init``) naming. F-CB-10: returns the *mode* (most common
+    prefix) instead of the first one, and skips noise prefixes that come
+    from std/utility headers (``Std_*``, bare ``Ifx_*``). Returns uppercase
+    to match the Neo4j ``module`` property convention. Falls back to
+    ``"unknown"`` when no usable prefix can be found.
     """
+    prefixes: List[str] = []
     for name in node_names:
-        if "_" in name:
-            prefix = name.split("_")[0]
-            if len(prefix) >= 2:
-                return prefix.upper()
-    return "unknown"
+        if "_" not in name:
+            continue
+        prefix = name.split("_", 1)[0]
+        # Strip iLLD "Ifx" prefix (IfxCan -> Can, IfxAdc -> Adc).
+        if prefix.startswith("Ifx") and len(prefix) > 3:
+            prefix = prefix[3:]
+        # Skip too-short prefixes and known noise tokens.
+        if len(prefix) < 2:
+            continue
+        if prefix in ("Std", "Ifx"):
+            continue
+        prefixes.append(prefix.upper())
+    if not prefixes:
+        return "unknown"
+    return Counter(prefixes).most_common(1)[0][0]
 
 # @mcp.tool()  # Deprecated: use search_database(session_id=...) instead (Plan 2 Phase 6)
 async def _sandbox_query(session_id: str, query: str, top_k: int = 10) -> str:
@@ -4031,124 +4175,112 @@ async def get_graph_statistics(workspace_id: str = "illd", session_id: Optional[
 
 @mcp.tool()
 @with_session_routing("list_available_modules")
-async def list_available_modules(include_stats: bool = False, limit: int = 50, offset: int = 0,
+async def list_available_modules(include_stats: bool = False,
     workspace_id: str = "illd", session_id: Optional[str] = None) -> str:
-    """List all modules known to the knowledge graph (Neo4j) and vector store (Qdrant).
+    """List all available modules for the given workspace.
 
-    Returns a merged, deduplicated list of modules from both backends.
-    Use this tool to discover valid module names for other tools that
-    require a module_name parameter. Access tier: public.
+    - **ILLD workspace**: queries Qdrant and returns all single-word
+      collection names (no underscores) — these are the ILLD modules.
+    - **MCAL workspace**: queries the MCAL Neo4j instance and returns
+      distinct module names from the knowledge graph.
+
+    No pagination — always returns the complete list.
+    Use this tool to discover valid module names for other tools
+    that require a module_name parameter. Access tier: public.
 
     Parameters:
-        include_stats (bool): Include per-module statistics — Neo4j node
-            counts and Qdrant vector point counts. Default False.
-        limit (int): Max modules to return per page. Default 50.
-        offset (int): Pagination offset. Default 0.
-        workspace_id (str): Target workspace — "illd" or "mcal". Default "illd".
+        include_stats (bool): Include per-module statistics
+            (vector point counts for ILLD, node counts for MCAL).
+            Default False.
+        workspace_id (str): Target workspace — "illd" or "mcal".
+            Default "illd".
 
     Returns (JSON):
         {
-          "modules": [{
-            "module": str, "sources": ["neo4j", "qdrant"],
-            "neo4j": {"node_count": int, ...} | null,
-            "qdrant": {"vector_points": int, ...} | null
-          }],
-          "total_count": int, "has_more": bool
+          "modules": [{"module": str, "source": str, ...}],
+          "total_count": int,
+          "workspace": str
         }
     """
     denied = _authorize("list_available_modules")
     if denied: return denied
     try:
-        # ── Neo4j modules ─────────────────────────────────────────────
-        neo4j_modules: list = []
-        try:
-            obs = _get_observability_service(workspace_id)
-            if obs:
-                result = obs.list_modules(include_stats, limit, offset, profile=workspace_id)
-                neo4j_modules = result.get("modules", []) if isinstance(result, dict) else []
-        except Exception as neo_exc:
-            logger.warning("list_available_modules: Neo4j query failed: %s", neo_exc)
-
-        # ── Qdrant collections (filtered by profile) ─────────────────
-        qdrant_collections: dict = {}
-        try:
-            qc = _get_qdrant()
-            if qc:
-                cols = qc.get_collections()
-                for col in cols.collections:
-                    col_name = col.name
-                    has_underscore = "_" in col_name
-                    # ILLD collections: single word, no underscores (e.g. "cxpi", "lin")
-                    # MCAL collections: multi-word with underscores (e.g. "adc_swa_architecture")
-                    if workspace_id == "illd" and has_underscore:
-                        continue
-                    if workspace_id == "mcal" and not has_underscore:
-                        continue
-                    # For MCAL, extract the module name (first segment before _swa_ or _swud_)
-                    # e.g. "adc_swa_architecture" → "adc"
-                    if workspace_id == "mcal" and has_underscore:
-                        module_prefix = col_name.split("_")[0]
-                        if module_prefix in qdrant_collections:
-                            # Already seen this module — aggregate stats if needed
-                            if include_stats:
-                                try:
-                                    ci = qc.get_collection(col_name)
-                                    prev_pts = qdrant_collections[module_prefix].get("vector_points") or 0
-                                    cur_pts = getattr(ci, "points_count", 0) or 0
-                                    qdrant_collections[module_prefix]["vector_points"] = prev_pts + cur_pts
-                                    existing = qdrant_collections[module_prefix].get("collections", [])
-                                    existing.append(col_name)
-                                    qdrant_collections[module_prefix]["collections"] = existing
-                                except Exception:
-                                    pass
-                            continue
-                        display_name = module_prefix
-                    else:
-                        display_name = col_name
-                    info: dict = {"name": display_name}
-                    if workspace_id == "mcal":
-                        info["collections"] = [col_name]
-                    if include_stats:
-                        try:
-                            ci = qc.get_collection(col_name)
-                            info["vector_points"] = getattr(ci, "points_count", None)
-                            vc_cfg = getattr(ci, "config", None)
-                            if vc_cfg:
-                                vp = getattr(vc_cfg, "params", None)
-                                if vp:
-                                    vs = getattr(vp, "vectors", None)
-                                    if vs and hasattr(vs, "size"):
-                                        info["vector_dimension"] = vs.size
-                        except Exception:
-                            pass
-                    qdrant_collections[display_name] = info
-        except Exception as qdrant_exc:
-            logger.warning("list_available_modules: Qdrant query failed: %s", qdrant_exc)
-
-        # ── Merge results ─────────────────────────────────────────────
-        merged: dict = {}
-        for mod in neo4j_modules:
-            name = mod if isinstance(mod, str) else mod.get("name", mod.get("module", str(mod)))
-            key = name.lower() if isinstance(name, str) else str(name).lower()
-            entry = {"module": key, "sources": ["neo4j"]}
-            if isinstance(mod, dict):
-                entry["neo4j"] = {k: v for k, v in mod.items() if k not in ("name", "module")}
-            merged[key] = entry
-
-        for col_name, col_info in qdrant_collections.items():
-            key = col_name.lower()
-            if key in merged:
-                merged[key]["sources"].append("qdrant")
-            else:
-                merged[key] = {"module": key, "sources": ["qdrant"]}
-            merged[key]["qdrant"] = col_info
-
-        modules_list = sorted(merged.values(), key=lambda m: m["module"])
-        total = len(modules_list)
-        paged = modules_list[offset:offset + limit]
-        return _ok({"modules": paged, "total_count": total,
-                     "has_more": offset + limit < total})
+        if workspace_id == "illd":
+            return await _list_illd_modules(include_stats)
+        elif workspace_id == "mcal":
+            return await _list_mcal_modules(include_stats)
+        else:
+            return _err("INVALID_INPUT", f"Unknown workspace_id '{workspace_id}'. Use 'illd' or 'mcal'.")
     except Exception as e: return _err("INTERNAL_ERROR", str(e))
+
+
+async def _list_illd_modules(include_stats: bool) -> str:
+    """ILLD modules: all single-word (no underscore) Qdrant collections."""
+    modules: list = []
+    try:
+        qc = _get_qdrant()
+        if not qc:
+            return _err("SERVICE_UNAVAILABLE", "Qdrant client is not available.")
+        cols = await asyncio.to_thread(qc.get_collections)
+        for col in cols.collections:
+            col_name = col.name
+            # ILLD collections are single-word, no underscores
+            if "_" in col_name:
+                continue
+            entry: dict = {"module": col_name.upper(), "source": "qdrant",
+                           "collection": col_name}
+            if include_stats:
+                try:
+                    ci = await asyncio.to_thread(qc.get_collection, col_name)
+                    entry["vector_points"] = getattr(ci, "points_count", None)
+                except Exception:
+                    entry["vector_points"] = None
+            modules.append(entry)
+    except Exception as exc:
+        logger.warning("list_available_modules(illd): Qdrant query failed: %s", exc)
+        return _err("INTERNAL_ERROR", f"Qdrant query failed: {exc}")
+
+    modules.sort(key=lambda m: m["module"])
+    return _ok({"modules": modules, "total_count": len(modules),
+                "workspace": "illd"})
+
+
+async def _list_mcal_modules(include_stats: bool) -> str:
+    """MCAL modules: EA_Function modules that have matching SRC_Function or SRC_Macro."""
+    modules: list = []
+    try:
+        driver = _get_neo4j("mcal")
+        if not driver:
+            return _err("SERVICE_UNAVAILABLE", "Neo4j MCAL driver is not available.")
+
+        from src.HybridRAG.code.neo4j_manager import get_instance_config
+        db_name = get_instance_config("mcal").database
+
+        def _query():
+            with driver.session(database=db_name) as s:
+                result = s.run(
+                    "MATCH (ea:EA_Function) "
+                    "WHERE ea.module IS NOT NULL AND ea.project IS NOT NULL "
+                    "WITH DISTINCT ea.project AS project, ea.module AS module "
+                    "OPTIONAL MATCH (src:SRC_Function {module: module, project: project}) "
+                    "WITH project, module, count(src) > 0 AS has_src_func "
+                    "OPTIONAL MATCH (srcm:SRC_Macro {module: module, project: project}) "
+                    "WITH project, module, has_src_func, count(srcm) > 0 AS has_src_macro "
+                    "WHERE has_src_func OR has_src_macro "
+                    "RETURN project, module "
+                    "ORDER BY project, module"
+                )
+                return [{"project": r["project"], "module": r["module"]} for r in result]
+
+        rows = await asyncio.to_thread(_query)
+        for r in rows:
+            modules.append({"module": r["module"], "project": r["project"], "source": "neo4j"})
+    except Exception as exc:
+        logger.warning("list_available_modules(mcal): Neo4j query failed: %s", exc)
+        return _err("INTERNAL_ERROR", f"Neo4j MCAL query failed: {exc}")
+
+    return _ok({"modules": modules, "total_count": len(modules),
+                "workspace": "mcal"})
 
 @mcp.tool()
 @with_session_routing("get_distribution")
@@ -4496,7 +4628,8 @@ def _build_asgi_app(transport: str):
             yield
 
     app = Starlette(routes=routes, lifespan=_lifespan)
-    logger.info("[Swagger] API docs available at / and /docs")
+    logger.info("[Website] Landing page at /")
+    logger.info("[Swagger] API docs available at /docs")
 
     return _APIKeyMiddleware(app)
 

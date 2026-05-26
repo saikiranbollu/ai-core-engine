@@ -26,7 +26,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
+import yaml as _yaml
+
 logger = logging.getLogger(__name__)
+
+# Config-driven default alpha (MEG_SW-308)
+try:
+    _cfg_path = Path(__file__).resolve().parents[2] / "HybridRAG" / "config" / "storage_config.yaml"
+    with open(_cfg_path, "r", encoding="utf-8") as _fh:
+        _DEFAULT_SEARCH_ALPHA: float = float(
+            _yaml.safe_load(_fh).get("hybrid_search", {}).get("default_alpha", 0.6)
+        )
+except Exception:
+    _DEFAULT_SEARCH_ALPHA = 0.6
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -82,6 +94,41 @@ class _FallbackEmbedder:
             vec = [v / norm for v in vec] if norm > 0 else vec
             results.append(vec)
         return results
+
+
+class _SentenceTransformerEmbedder:
+    """Production embedder using the shared SentenceTransformer singleton.
+
+    Falls back to _FallbackEmbedder if sentence-transformers is not installed.
+    """
+
+    def __init__(self):
+        self._model = None
+        self._fallback = None
+        self._initialized = False
+
+    def _init(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        try:
+            from src.Configuration.embedding_singleton import get_shared_model
+            self._model = get_shared_model()
+        except Exception:
+            pass
+        if self._model is None:
+            self._fallback = _FallbackEmbedder()
+            logger.warning("[Sandbox] sentence-transformers unavailable — using hash fallback")
+
+    def embed(self, texts: List[str]) -> List[List[float]]:
+        self._init()
+        if self._model is None:
+            return self._fallback.embed(texts)
+        import numpy as np
+        embeddings = self._model.encode(texts, normalize_embeddings=True)
+        if isinstance(embeddings, np.ndarray):
+            return embeddings.tolist()
+        return [e.tolist() if hasattr(e, 'tolist') else list(e) for e in embeddings]
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -685,9 +732,11 @@ class SandboxParserDispatcher:
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
     def __init__(self, include_paths: Optional[List[str]] = None,
-                 skip_default_stubs: bool = False):
+                 skip_default_stubs: bool = False,
+                 workspace_id: str = "mcal"):
         self._include_paths = include_paths or []
         self._skip_default_stubs = skip_default_stubs
+        self._workspace_id = workspace_id
 
     def parse(self, file_path: Path) -> Dict[str, Any]:
         """Parse a file and return standardized dict."""
@@ -715,6 +764,12 @@ class SandboxParserDispatcher:
             return {"type": "generic", "content": "", "file": str(p)}
 
     def _parse_c(self, p: Path, ext: str, fname_lower: str) -> Dict:
+        # Route iLLD-specific header patterns to dedicated parsers
+        if self._workspace_id == "illd" and ext == ".h":
+            if "_swa" in fname_lower:
+                return self._parse_illd_swa(p)
+            if "_regdef" in fname_lower:
+                return self._parse_sfr(p)
         try:
             from src.IngestionPipeline.Parsers.c_parser import parse as c_parse
             parsed = c_parse(
@@ -751,12 +806,67 @@ class SandboxParserDispatcher:
                 return {"type": "testspec", "nodes": nodes, "file": str(p)}
             except (ImportError, Exception):
                 pass
+
+        # iLLD Jama xlsx export detection (workspace_id == "illd")
+        if self._workspace_id == "illd":
+            result = self._try_parse_illd_jama_xlsx(p)
+            if result is not None:
+                return result
+
         try:
             from src.IngestionPipeline.Parsers.xlsx_parser import parse as xlsx_parse
             sheets = xlsx_parse(str(p))
             return {"type": "xlsx", "sheets": sheets, "file": str(p)}
         except ImportError:
             return {"type": "xlsx", "sheets": {}, "file": str(p)}
+
+    def _try_parse_illd_jama_xlsx(self, p: Path) -> Optional[Dict]:
+        """Detect and parse iLLD Jama requirement export xlsx.
+
+        Format: R3/C1=module, R4=headers (ID,...), R5+=data rows,
+        C1=Jama ID (AURC1-REQA-*), C7=Name, C12=Status.
+        Sentinel: row starting with "Total Items:".
+        """
+        try:
+            import openpyxl
+        except ImportError:
+            return None
+
+        try:
+            wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+            ws = wb.active
+            # Check header row (row 4) — col 1 should be "ID"
+            header_val = ws.cell(row=4, column=1).value
+            if not header_val or str(header_val).strip().upper() != "ID":
+                wb.close()
+                return None
+
+            module_name = str(ws.cell(row=3, column=1).value or "").strip()
+            requirements = []
+            for row in ws.iter_rows(min_row=5, values_only=True):
+                if not row or not row[0]:
+                    continue
+                cell0 = str(row[0]).strip()
+                if cell0.startswith("Total Items:"):
+                    break
+                req_id = cell0
+                # C7 = Name (index 6), C12 = Status (index 11)
+                name = str(row[6]).strip() if len(row) > 6 and row[6] else ""
+                status = str(row[11]).strip() if len(row) > 11 and row[11] else ""
+                requirements.append({
+                    "requirement_id": req_id,
+                    "name": name,
+                    "status": status,
+                })
+            wb.close()
+            return {
+                "type": "illd_xlsx_req",
+                "requirements": requirements,
+                "module": module_name,
+                "file": str(p),
+            }
+        except Exception:
+            return None
 
     def _parse_arxml(self, p: Path) -> Dict:
         try:
@@ -790,6 +900,36 @@ class SandboxParserDispatcher:
             data = {}
         return {"type": "json", "data": data, "file": str(p)}
 
+    def _parse_illd_swa(self, p: Path) -> Dict:
+        """Route SWA headers to illd_swa_parser (regex-based, no includes)."""
+        try:
+            from src.IngestionPipeline.Parsers.illd_swa_parser import parse as swa_parse
+            result = swa_parse(str(p), enrich=False)
+            result["type"] = "illd_swa"
+            result.setdefault("file", str(p))
+            # Attach raw content for vector chunking
+            result["content"] = p.read_text(encoding="utf-8", errors="replace")
+            return result
+        except ImportError:
+            content = p.read_text(encoding="utf-8", errors="replace")
+            return {"type": "illd_swa", "content": content, "file": str(p),
+                    "functions": [], "structs": [], "enums": [],
+                    "typedefs": [], "macros": []}
+
+    def _parse_sfr(self, p: Path) -> Dict:
+        """Route SFR regdef headers to sfr_parser (regex-based, no includes)."""
+        try:
+            from src.IngestionPipeline.Parsers.sfr_parser import parse as sfr_parse
+            result = sfr_parse(str(p))
+            result["type"] = "illd_sfr"
+            result.setdefault("file", str(p))
+            result["content"] = p.read_text(encoding="utf-8", errors="replace")
+            return result
+        except ImportError:
+            content = p.read_text(encoding="utf-8", errors="replace")
+            return {"type": "illd_sfr", "content": content, "file": str(p),
+                    "registers": {}}
+
     def _parse_text(self, p: Path, ext: str) -> Dict:
         content = p.read_text(encoding="utf-8", errors="replace")
         return {"type": "text", "content": content, "file": str(p)}
@@ -808,8 +948,9 @@ class SandboxAdapter:
     the sandbox version *shadows* it (preserving the original properties).
     """
 
-    def __init__(self, chunk_size: int = 500):
+    def __init__(self, chunk_size: int = 500, workspace_id: str = "mcal"):
         self._chunk_size = chunk_size
+        self._workspace_id = workspace_id
 
     def _extract_node_names_from_parsed(self, parsed: Dict) -> List[str]:
         """Extract node names from parsed data WITHOUT ingesting into sandbox.
@@ -825,6 +966,25 @@ class SandboxAdapter:
                 name = fn.get("name")
                 if name:
                     node_names.append(name)
+        elif ptype == "illd_swa":
+            for fn in parsed.get("functions", []):
+                if isinstance(fn, dict) and fn.get("name"):
+                    node_names.append(fn["name"])
+            for s in parsed.get("structs", []):
+                if isinstance(s, dict) and s.get("name"):
+                    node_names.append(s["name"])
+            for e in parsed.get("enums", []):
+                if isinstance(e, dict) and e.get("name"):
+                    node_names.append(e["name"])
+        elif ptype == "illd_sfr":
+            for reg_name in parsed.get("registers", {}):
+                node_names.append(reg_name)
+        elif ptype == "illd_xlsx_req":
+            for req in parsed.get("requirements", []):
+                if isinstance(req, dict):
+                    rid = req.get("requirement_id")
+                    if rid:
+                        node_names.append(rid)
         elif ptype == "json":
             data = parsed.get("data", {})
             reqs = data.get("requirements") if isinstance(data, dict) else None
@@ -849,12 +1009,28 @@ class SandboxAdapter:
         """Convert one parser result dict into sandbox graph nodes + vector chunks."""
         ptype = parsed.get("type", "")
         node_names = []
+        illd_semantic_chunks = False  # Flag to skip generic chunking for iLLD
 
-        if ptype in ("c_source", "c_header"):
+        if ptype == "illd_swa":
+            node_names = self._ingest_swa_header(sandbox, parsed, filename, module)
+            illd_semantic_chunks = True
+        elif ptype == "illd_sfr":
+            node_names = self._ingest_sfr(sandbox, parsed, filename, module)
+            illd_semantic_chunks = True
+        elif ptype == "illd_xlsx_req":
+            node_names = self._ingest_xlsx_requirements_illd(sandbox, parsed, filename, module)
+            illd_semantic_chunks = True
+        elif ptype in ("c_source", "c_header") and self._workspace_id == "illd":
+            node_names = self._ingest_c_illd(sandbox, parsed, filename, module)
+            illd_semantic_chunks = True
+        elif ptype in ("c_source", "c_header"):
             node_names = self._ingest_c(sandbox, parsed, filename, module,
                                         has_include_paths=has_include_paths)
         elif ptype == "json":
-            node_names = self._ingest_json(sandbox, parsed, filename, module)
+            if self._workspace_id == "illd":
+                node_names = self._ingest_requirements_illd(sandbox, parsed, filename, module)
+            else:
+                node_names = self._ingest_json(sandbox, parsed, filename, module)
         elif ptype in ("pdf", "text", "rst", "generic"):
             self._ingest_document(sandbox, parsed, filename, module)
         elif ptype == "xlsx":
@@ -864,13 +1040,14 @@ class SandboxAdapter:
         elif ptype == "arxml":
             self._ingest_arxml(sandbox, parsed, filename, module)
 
-        # Always create vector chunks for textual content
-        content = self._extract_text_content(parsed)
-        if content:
-            chunks = self._chunk_text(content, filename)
-            # Remove existing chunks for the same source file (vector shadow)
-            sandbox.vectors.remove_by_metadata(source_file=filename)
-            sandbox.vectors.add_chunks(chunks)
+        # Create vector chunks — iLLD uses semantic per-entity chunks (already created
+        # inside the _ingest_*_illd methods), so skip the generic text splitter.
+        if not illd_semantic_chunks:
+            content = self._extract_text_content(parsed)
+            if content:
+                chunks = self._chunk_text(content, filename)
+                sandbox.vectors.remove_by_metadata(source_file=filename)
+                sandbox.vectors.add_chunks(chunks)
 
         sandbox.files_ingested.append({
             "filename": filename, "source": "parser_dispatch",
@@ -938,6 +1115,14 @@ class SandboxAdapter:
                     if reg_name:
                         sfr_id = EphemeralGraph._canonical_id(
                             "SFR_Register", {"name": reg_name, "module": mod})
+                        # Create the SFR_Register node explicitly (not as Unknown)
+                        if sandbox.graph.get_node(sfr_id) is None:
+                            sandbox.graph.add_node("SFR_Register", sfr_id, {
+                                "name": reg_name,
+                                "module": mod,
+                                "register_name": reg_name,
+                                "_origin": "sandbox",
+                            })
                         edge_props = {"_origin": "sandbox"}
                         access_type = sfr_entry.get("access_type")
                         if access_type:
@@ -955,6 +1140,13 @@ class SandboxAdapter:
                     if gname:
                         gid = EphemeralGraph._canonical_id(
                             "SRC_GlobalVariable", {"name": gname, "module": mod})
+                        # Create the SRC_GlobalVariable node explicitly (not as Unknown)
+                        if sandbox.graph.get_node(gid) is None:
+                            sandbox.graph.add_node("SRC_GlobalVariable", gid, {
+                                "name": gname,
+                                "module": mod,
+                                "_origin": "sandbox",
+                            })
                         edge_props = {"_origin": "sandbox"}
                         access = gref.get("access_type")
                         if access:
@@ -1047,6 +1239,391 @@ class SandboxAdapter:
             props = {"name": mod_name, "source_file": filename, "module": mod}
             self._add_node_with_shadow(sandbox, node_type, node_id, props)
 
+    # ── iLLD-specific Ingestion Methods ────────────────────────────────
+
+    def _ingest_c_illd(self, sandbox, parsed, filename, module) -> List[str]:
+        """Ingest C/H parsed functions into iLLD-typed graph nodes.
+
+        Creates Function nodes with CALLS_INTERNALLY edges (matching prod KG).
+        """
+        node_names = []
+        mod = module or "unknown"
+
+        for fn in self._iter_c_functions(parsed):
+            name = fn.get("name")
+            if not name:
+                continue
+            node_type = "Function"
+            node_id = EphemeralGraph._canonical_id(node_type, {"name": name, "module": mod})
+            props = {
+                "name": name,
+                "id": f"FUNC_{name}",
+                "module": mod,
+                "return_type": fn.get("return_type", ""),
+                "parameters": fn.get("parameters", ""),
+                "source_file": filename,
+                "source": "Source_Code",
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props,
+                                       clear_rel_types=self.ILLD_DETECTABLE_REL_TYPES)
+            node_names.append(name)
+
+            # Call graph edges (CALLS_INTERNALLY matching prod)
+            for call_entry in fn.get("internal_calls", []):
+                if isinstance(call_entry, dict):
+                    callee = call_entry.get("function", "")
+                else:
+                    callee = str(call_entry)
+                if callee and callee != name:
+                    callee_id = EphemeralGraph._canonical_id(
+                        "Function", {"name": callee, "module": mod})
+                    sandbox.graph.add_relationship(
+                        node_id, callee_id, "CALLS_INTERNALLY",
+                        {"_origin": "sandbox"})
+
+        # Semantic per-entity vector chunks for iLLD
+        sandbox.vectors.remove_by_metadata(source_file=filename)
+        for fn in self._iter_c_functions(parsed):
+            name = fn.get("name")
+            if not name:
+                continue
+            text = f"Function: {name}\nReturn: {fn.get('return_type', 'void')}\nParams: {fn.get('parameters', '')}"
+            chunk = Chunk(
+                text=text,
+                metadata={"source_file": filename, "node_type": "Function",
+                          "node_id": f"Function:{name}:{mod.upper()}", "module": mod},
+            )
+            sandbox.vectors.add_chunks([chunk])
+
+        return node_names
+
+    def _ingest_swa_header(self, sandbox, parsed, filename, module) -> List[str]:
+        """Ingest SWA parser output → Function, Struct, StructMember, Enum, EnumValue, Typedef nodes.
+
+        Matches production node types and IDs from illd_kg_builder.py.
+        """
+        node_names = []
+        mod = module or "unknown"
+        sandbox.vectors.remove_by_metadata(source_file=filename)
+
+        # Functions
+        for fn in parsed.get("functions", []):
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name", "")
+            if not name:
+                continue
+            node_type = "Function"
+            node_id = EphemeralGraph._canonical_id(node_type, {"name": name, "module": mod})
+            props = {
+                "name": name,
+                "id": f"FUNC_{name}",
+                "brief": fn.get("brief", ""),
+                "return_type": fn.get("return_type", ""),
+                "source": "SWA_Functions",
+                "module": mod,
+                "source_file": filename,
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props,
+                                       clear_rel_types=self.ILLD_DETECTABLE_REL_TYPES)
+            node_names.append(name)
+            # Semantic chunk
+            brief = fn.get("brief", "")
+            text = f"Function: {name}\nReturn: {fn.get('return_type', 'void')}\nBrief: {brief}"
+            sandbox.vectors.add_chunks([Chunk(
+                text=text,
+                metadata={"source_file": filename, "node_type": "Function",
+                          "node_id": node_id, "module": mod},
+            )])
+
+            # Dependencies (function → function)
+            for dep in fn.get("dependencies", []):
+                if dep and isinstance(dep, str):
+                    dep_id = EphemeralGraph._canonical_id("Function", {"name": dep, "module": mod})
+                    sandbox.graph.add_relationship(
+                        node_id, dep_id, "DEPENDS_ON", {"_origin": "sandbox"})
+
+        # Structs + StructMembers
+        for s in parsed.get("structs", []):
+            if not isinstance(s, dict):
+                continue
+            sname = s.get("name", "")
+            if not sname:
+                continue
+            node_type = "Struct"
+            node_id = EphemeralGraph._canonical_id(node_type, {"name": sname, "module": mod})
+            props = {
+                "name": sname,
+                "id": f"STRUCT_{sname}",
+                "brief": s.get("brief", ""),
+                "source": "SWA_Structs",
+                "module": mod,
+                "source_file": filename,
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props)
+            node_names.append(sname)
+            # Semantic chunk
+            members_text = ", ".join(m.get("name", "") for m in s.get("members", []) if isinstance(m, dict))
+            text = f"Struct: {sname}\nBrief: {s.get('brief', '')}\nMembers: {members_text}"
+            sandbox.vectors.add_chunks([Chunk(
+                text=text,
+                metadata={"source_file": filename, "node_type": "Struct",
+                          "node_id": node_id, "module": mod},
+            )])
+
+            # Members → StructMember nodes + HAS_MEMBER edges
+            for m in s.get("members", []):
+                if not isinstance(m, dict):
+                    continue
+                mname = m.get("name", "")
+                if not mname:
+                    continue
+                m_node_type = "StructMember"
+                mid = f"MEMBER_{sname}_{mname}"
+                m_node_id = EphemeralGraph._canonical_id(m_node_type, {"name": mid, "module": mod})
+                m_props = {
+                    "name": mname,
+                    "id": mid,
+                    "type": m.get("type", "unknown"),
+                    "description": m.get("description", ""),
+                    "module": mod,
+                    "source_file": filename,
+                }
+                self._add_node_with_shadow(sandbox, m_node_type, m_node_id, m_props)
+                sandbox.graph.add_relationship(
+                    node_id, m_node_id, "HAS_MEMBER", {"_origin": "sandbox"})
+
+        # Enums + EnumValues
+        for e in parsed.get("enums", []):
+            if not isinstance(e, dict):
+                continue
+            ename = e.get("name", "")
+            if not ename:
+                continue
+            node_type = "Enum"
+            node_id = EphemeralGraph._canonical_id(node_type, {"name": ename, "module": mod})
+            props = {
+                "name": ename,
+                "id": f"ENUM_{ename}",
+                "brief": e.get("brief", ""),
+                "source": "SWA_Enums",
+                "module": mod,
+                "source_file": filename,
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props)
+            node_names.append(ename)
+            # Semantic chunk
+            vals_text = ", ".join(v.get("name", "") for v in e.get("values", []) if isinstance(v, dict))
+            text = f"Enum: {ename}\nBrief: {e.get('brief', '')}\nValues: {vals_text}"
+            sandbox.vectors.add_chunks([Chunk(
+                text=text,
+                metadata={"source_file": filename, "node_type": "Enum",
+                          "node_id": node_id, "module": mod},
+            )])
+
+            # Values → EnumValue nodes + HAS_VALUE edges
+            for v in e.get("values", []):
+                if not isinstance(v, dict):
+                    continue
+                vname = v.get("name", "")
+                if not vname:
+                    continue
+                v_node_type = "EnumValue"
+                vid = f"ENUMVAL_{vname}"
+                v_node_id = EphemeralGraph._canonical_id(v_node_type, {"name": vid, "module": mod})
+                v_props = {
+                    "name": vname,
+                    "id": vid,
+                    "value": v.get("value", ""),
+                    "description": v.get("description", ""),
+                    "module": mod,
+                    "source_file": filename,
+                }
+                self._add_node_with_shadow(sandbox, v_node_type, v_node_id, v_props)
+                sandbox.graph.add_relationship(
+                    node_id, v_node_id, "HAS_VALUE", {"_origin": "sandbox"})
+
+        # Typedefs
+        for td in parsed.get("typedefs", []):
+            if not isinstance(td, dict):
+                continue
+            tname = td.get("name", "")
+            if not tname:
+                continue
+            node_type = "Typedef"
+            node_id = EphemeralGraph._canonical_id(node_type, {"name": tname, "module": mod})
+            props = {
+                "name": tname,
+                "id": f"TYPEDEF_{tname}",
+                "brief": td.get("brief", ""),
+                "underlying_type": td.get("type", ""),
+                "source": "SWA_Typedefs",
+                "module": mod,
+                "source_file": filename,
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props)
+            node_names.append(tname)
+
+        # Macros (not in prod KG as separate nodes, but useful for vector search)
+        for macro in parsed.get("macros", []):
+            if not isinstance(macro, dict):
+                continue
+            mname = macro.get("name", "")
+            if not mname:
+                continue
+            text = f"Macro: {mname}\nValue: {macro.get('value', '')}\nDescription: {macro.get('description', '')}"
+            sandbox.vectors.add_chunks([Chunk(
+                text=text,
+                metadata={"source_file": filename, "node_type": "Macro",
+                          "node_id": f"MACRO:{mname}:{mod.upper()}", "module": mod},
+            )])
+
+        return node_names
+
+    def _ingest_sfr(self, sandbox, parsed, filename, module) -> List[str]:
+        """Ingest SFR parser output → Register + BitField nodes + HAS_BITFIELD edges.
+
+        Matches production node types from illd_kg_builder.py.
+        """
+        node_names = []
+        mod = module or "unknown"
+        registers_dict = parsed.get("registers", {})
+        sandbox.vectors.remove_by_metadata(source_file=filename)
+
+        for reg_name, bitfields in registers_dict.items():
+            if not isinstance(bitfields, list):
+                continue
+
+            node_type = "Register"
+            node_id = EphemeralGraph._canonical_id(
+                node_type, {"name": reg_name, "module": mod})
+            props = {
+                "register_name": reg_name,
+                "name": reg_name,
+                "module": mod,
+                "source_file": filename,
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props)
+            node_names.append(reg_name)
+
+            # Semantic chunk for the register
+            bf_text = ", ".join(bf.get("name", "") for bf in bitfields if isinstance(bf, dict))
+            text = f"Register: {reg_name}\nBitfields: {bf_text}"
+            sandbox.vectors.add_chunks([Chunk(
+                text=text,
+                metadata={"source_file": filename, "node_type": "Register",
+                          "node_id": node_id, "module": mod},
+            )])
+
+            # Bitfield nodes
+            for bf in bitfields:
+                if not isinstance(bf, dict):
+                    continue
+                bfname = bf.get("name", "")
+                if not bfname:
+                    continue
+                bf_node_type = "BitField"
+                bfid = f"BITFIELD_{reg_name}_{bfname}"
+                bf_node_id = EphemeralGraph._canonical_id(
+                    bf_node_type, {"name": bfid, "module": mod})
+                bf_props = {
+                    "name": bfname,
+                    "id": bfid,
+                    "bit_range": bf.get("bit_range", ""),
+                    "width": bf.get("width", ""),
+                    "description": bf.get("description", ""),
+                    "module": mod,
+                    "source_file": filename,
+                }
+                self._add_node_with_shadow(sandbox, bf_node_type, bf_node_id, bf_props)
+                sandbox.graph.add_relationship(
+                    node_id, bf_node_id, "HAS_BITFIELD", {"_origin": "sandbox"})
+
+        return node_names
+
+    def _ingest_xlsx_requirements_illd(self, sandbox, parsed, filename, module) -> List[str]:
+        """Ingest iLLD requirements from xlsx Jama export.
+
+        Expected parsed format (from _parse_xlsx detecting iLLD Jama pattern):
+          {"type": "illd_xlsx_req", "requirements": [...], "module": str}
+        """
+        node_names = []
+        mod = module or parsed.get("module", "unknown")
+        sandbox.vectors.remove_by_metadata(source_file=filename)
+
+        for req in parsed.get("requirements", []):
+            if not isinstance(req, dict):
+                continue
+            req_id = req.get("requirement_id", "")
+            if not req_id:
+                continue
+            node_type = "Requirement"
+            node_id = EphemeralGraph._canonical_id(
+                node_type, {"name": req_id, "module": mod})
+            props = {
+                "requirement_id": req_id,
+                "name": req.get("name", req_id),
+                "module": mod,
+                "status": req.get("status", ""),
+                "source_file": filename,
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props)
+            node_names.append(req_id)
+            # Semantic chunk
+            text = f"Requirement: {req_id}\nName: {req.get('name', '')}"
+            sandbox.vectors.add_chunks([Chunk(
+                text=text,
+                metadata={"source_file": filename, "node_type": "Requirement",
+                          "node_id": node_id, "module": mod},
+            )])
+
+        return node_names
+
+    def _ingest_requirements_illd(self, sandbox, parsed, filename, module) -> List[str]:
+        """Ingest iLLD requirements from JSON (Jama API export format).
+
+        Expected parsed format:
+          {"type": "json", "data": {"requirements": [...]}}
+        """
+        node_names = []
+        mod = module or "unknown"
+        data = parsed.get("data", {})
+        reqs = data.get("requirements") if isinstance(data, dict) else None
+        if not isinstance(reqs, list):
+            return node_names
+
+        sandbox.vectors.remove_by_metadata(source_file=filename)
+        for req in reqs:
+            if not isinstance(req, dict):
+                continue
+            req_id = (req.get("document_key") or req.get("requirement_id")
+                      or req.get("id") or "")
+            if not req_id:
+                continue
+            node_type = "Requirement"
+            node_id = EphemeralGraph._canonical_id(
+                node_type, {"name": req_id, "module": mod})
+            props = {
+                "requirement_id": req_id,
+                "name": req.get("name", req_id),
+                "description": req.get("description", ""),
+                "module": mod,
+                "status": str(req.get("status", "")),
+                "source_file": filename,
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props)
+            node_names.append(req_id)
+            # Semantic chunk
+            desc = req.get("description", "")
+            text = f"Requirement: {req_id}\nName: {req.get('name', '')}\nDescription: {desc[:300]}"
+            sandbox.vectors.add_chunks([Chunk(
+                text=text,
+                metadata={"source_file": filename, "node_type": "Requirement",
+                          "node_id": node_id, "module": mod},
+            )])
+
+        return node_names
+
     # ── Shadow/Override Logic (Phase 5) ────────────────────────────────
 
     # Relationship types the sandbox parser can reliably detect even
@@ -1061,6 +1638,9 @@ class SandboxAdapter:
     SANDBOX_DETECTABLE_REL_TYPES_WITH_INCLUDES = {
         "SRC_CALLS", "SRC_ACCESSES_SFR", "SRC_USES_GLOBAL",
     }
+
+    # iLLD-specific: call-graph edges that the sandbox can reliably detect
+    ILLD_DETECTABLE_REL_TYPES = {"CALLS_INTERNALLY"}
 
     def _add_node_with_shadow(self, sandbox: 'EphemeralSandbox', node_type: str,
                               node_id: str, properties: Dict,
@@ -1188,7 +1768,7 @@ class TraceabilityPuller:
 
     def pull_neighbors(
         self, node_names: List[str], module: str,
-        workspace_id: str = "illd", depth: int = 1,
+        workspace_id: str = "mcal", depth: int = 1,
     ) -> tuple:
         """Pull nodes ±depth hops from the named nodes in prod KG.
 
@@ -1204,7 +1784,15 @@ class TraceabilityPuller:
         # depth and max_nodes are injected as literals because Neo4j 4.x
         # does not allow parameters inside [*1..N] or list slices [0..N].
         # elementId() replaced with toString(id()) for Neo4j 4.x compat.
+        # F-CB-01: bound depth to 1..5 as defense-in-depth before literal
+        # interpolation. MCP layer already validates trace_depth in 0..2,
+        # but callers from other paths must not be able to inject Cypher
+        # via crafted depth values or run unbounded variable-length paths.
         safe_depth = int(depth)
+        if not 1 <= safe_depth <= 5:
+            raise ValueError(
+                f"TraceabilityPuller.pull_neighbors: depth must be 1..5, got {depth!r}"
+            )
         safe_max = int(self.MAX_PULL_NODES)
         cypher = f"""
         MATCH (n)
@@ -1260,7 +1848,7 @@ class TraceabilityPuller:
             return [], []
 
     def pull_boundary_nodes(
-        self, names: List[str], workspace_id: str = "illd",
+        self, names: List[str], workspace_id: str = "mcal",
     ) -> List[Dict]:
         """Resolve boundary node names against prod KG (cross-module).
 
@@ -1331,17 +1919,148 @@ class HybridGraphService:
         "execute_cypher",
     }
 
-    def __init__(self, sandbox: EphemeralSandbox, neo4j_driver=None):
+    def __init__(self, sandbox: EphemeralSandbox, neo4j_driver=None,
+                 qdrant_client=None, workspace_id: str = "mcal"):
         self._sandbox = sandbox
         self._driver = neo4j_driver
+        self._qdrant = qdrant_client
+        self._workspace_id = workspace_id
 
-    def search(self, query: str, top_k: int = 15, alpha: float = 0.5) -> List[SearchResult]:
-        """Shallow query — search sandbox graph + vectors."""
+    def search(self, query: str, top_k: int = 15, alpha: float = _DEFAULT_SEARCH_ALPHA,
+               filter_by_module: Optional[str] = None) -> List[SearchResult]:
+        """Hybrid query — sandbox graph + vectors + production Qdrant.
+
+        Merges sandbox results with production Qdrant results.
+        Sandbox results always take priority. Prod Qdrant results from files
+        that were uploaded to the sandbox are EXCLUDED (shadowed).
+        """
+        # Sandbox results (graph keyword + ephemeral vectors)
         querier = SandboxQuerier(self._sandbox)
-        results = querier.search(query, top_k=top_k, alpha=alpha)
-        return results
+        sandbox_results = querier.search(query, top_k=top_k, alpha=alpha)
 
-    def deep_query(self, cypher: str, params: Dict, workspace_id: str = "illd") -> List[Dict]:
+        # Collect filenames uploaded to sandbox — these shadow prod versions
+        sandbox_files = set()
+        for f in self._sandbox.files_ingested:
+            if isinstance(f, dict) and f.get("filename"):
+                sandbox_files.add(f["filename"].lower())
+
+        # Production Qdrant results (G1 fix) — excluding shadowed files
+        prod_results = self._query_prod_qdrant(query, top_k=top_k,
+                                                filter_by_module=filter_by_module,
+                                                exclude_files=sandbox_files)
+
+        # Merge: sandbox results take priority (higher boost for user's own data)
+        seen = {}
+        for r in sandbox_results:
+            seen[r.node_id] = r
+        for r in prod_results:
+            if r.node_id not in seen:
+                seen[r.node_id] = r
+
+        merged = sorted(seen.values(), key=lambda x: -x.score)
+        return merged[:top_k]
+
+    def _query_prod_qdrant(self, query: str, top_k: int = 10,
+                           filter_by_module: Optional[str] = None,
+                           exclude_files: Optional[set] = None) -> List[SearchResult]:
+        """Query production Qdrant for additional context not in the sandbox.
+
+        Results from files in `exclude_files` are filtered out (those files
+        have been re-uploaded to the sandbox and their prod versions are stale).
+        """
+        if not self._qdrant:
+            return []
+        exclude_files = exclude_files or set()
+        try:
+            # Use the same embedder as the sandbox vectors
+            embedder = self._sandbox.vectors._embedder
+            embedding = embedder.embed([query])
+            if not embedding or not embedding[0]:
+                return []
+            q_vec = embedding[0]
+
+            # Resolve collection(s) — iLLD uses module name, MCAL uses sub-collections
+            module = filter_by_module
+            if not module:
+                # Try to infer module from sandbox context
+                files = self._sandbox.files_ingested
+                for f in files:
+                    if isinstance(f, dict) and f.get("filename"):
+                        # Module is typically uppercase in sandbox
+                        pass
+            collections = self._resolve_qdrant_collections(module)
+            if not collections:
+                return []
+
+            results = []
+            for collection in collections[:5]:  # Limit to 5 collections max
+                try:
+                    response = self._qdrant.query_points(
+                        collection_name=collection,
+                        query=q_vec,
+                        limit=top_k,
+                        with_payload=True,
+                    )
+                    hits = response.points if hasattr(response, 'points') else response
+                    for hit in hits:
+                        payload = hit.payload or {}
+
+                        # Shadow filter: skip chunks from files uploaded to sandbox
+                        source_file = (payload.get("source_file")
+                                       or payload.get("file")
+                                       or payload.get("filename") or "")
+                        if source_file:
+                            # Compare basename (prod may store full path)
+                            basename = source_file.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+                            if basename in exclude_files:
+                                continue
+
+                        node_id = (payload.get("_original_id")
+                                   or payload.get("document_id")
+                                   or payload.get("name")
+                                   or str(hit.id))
+                        content = (payload.get("document")
+                                   or payload.get("text")
+                                   or payload.get("content") or "")
+                        node_type = (payload.get("node_type")
+                                     or payload.get("type") or "Unknown")
+                        results.append(SearchResult(
+                            node_id=node_id,
+                            content=content[:500],
+                            score=float(hit.score) * 0.9,  # Slight discount vs sandbox
+                            origin="prod_qdrant",
+                            metadata={"collection": collection, **payload},
+                        ))
+                except Exception as e:
+                    logger.debug("[HybridGraphService] Qdrant collection '%s' query failed: %s",
+                                 collection, e)
+                    continue
+
+            results.sort(key=lambda r: -r.score)
+            return results[:top_k]
+        except Exception as e:
+            logger.warning("[HybridGraphService] Prod Qdrant query failed: %s", e)
+            return []
+
+    def _resolve_qdrant_collections(self, module: Optional[str]) -> List[str]:
+        """Resolve which Qdrant collections to query."""
+        if module:
+            return [module.lower()]
+        # Discover all collections for the workspace
+        try:
+            all_cols = self._qdrant.get_collections().collections
+            names = [c.name for c in all_cols]
+            if self._workspace_id == "illd":
+                # iLLD: bare module names or rag_* collections
+                return [n for n in names if not any(p in n for p in
+                        ("_swa_", "_swud_", "_testspec_", "_jama_"))][:5]
+            else:
+                mcal_prefixes = ("_swa_", "_swud_", "_testspec_", "_jama_")
+                return [n for n in names if any(p in n for p in mcal_prefixes)][:5]
+        except Exception:
+            return []
+
+    def deep_query(self, cypher: str, params: Dict, workspace_id: str = "mcal") -> List[Dict]:
         """Deep traversal — run against prod Neo4j, patch with sandbox overrides.
 
         Returns list of dicts, each with _origin and optional _patched/_injected flags.
@@ -1445,7 +2164,7 @@ class HybridTraversal:
     """
 
     def __init__(self, sandbox: "EphemeralSandbox", neo4j_driver=None,
-                 workspace_id: str = "illd"):
+                 workspace_id: str = "mcal"):
         self._sandbox = sandbox
         self._driver = neo4j_driver
         self._workspace_id = workspace_id
@@ -2009,7 +2728,7 @@ class SandboxQuerier:
         self._sandbox = sandbox
         self._boost = boost
 
-    def search(self, query: str, top_k: int = 15, alpha: float = 0.5) -> List[SearchResult]:
+    def search(self, query: str, top_k: int = 15, alpha: float = _DEFAULT_SEARCH_ALPHA) -> List[SearchResult]:
         """Combined graph keyword + vector semantic search."""
         graph_results = []
         vector_results = []

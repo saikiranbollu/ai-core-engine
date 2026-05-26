@@ -26,8 +26,9 @@ RUN apt-get update && \
 # Copy Cerbos binary from stage 1
 COPY --from=cerbos /cerbos /usr/local/bin/cerbos
 
-# Install CPU-only PyTorch: use --no-deps to prevent pulling ~2.2GB of NVIDIA/CUDA packages.
-# torch works fine for CPU inference without nvidia-* deps.
+# Install CPU-only PyTorch from the official CPU index (no NVIDIA/CUDA deps).
+# The CPU wheel's metadata has zero nvidia-* dependencies, so sentence-transformers
+# won't pull ~2 GB of GPU packages when it resolves torch>=1.11.0.
 COPY requirements.txt .
 RUN pip install --no-cache-dir --timeout 120 \
     --index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pypi-org/simple \
@@ -41,6 +42,7 @@ RUN pip install --no-cache-dir --timeout 120 \
     --index-url https://artifactory.intra.infineon.com/artifactory/api/pypi/pypi-pypi-org/simple \
     --trusted-host artifactory.intra.infineon.com \
     gunicorn uvicorn[standard]
+
 
 # Pre-download the sentence-transformers embedding model into the image
 # so the first search_database call doesn't block on a network download.
@@ -70,6 +72,12 @@ COPY mcp/auth/policies/ /policies/
 # (default /.cache is not writable in many pod configurations)
 # Created after COPY steps and with open permissions so any runtime UID can write
 RUN mkdir -p /app/.cache/sentence_transformers && chmod -R 777 /app/.cache
+
+# DeepEval creates a .deepeval directory on import for config/telemetry.
+# Pre-create it with open permissions so any runtime UID can write.
+RUN mkdir -p /app/.deepeval && chmod 777 /app/.deepeval
+ENV DEEPEVAL_RESULTS_FOLDER=/app/.deepeval \
+    DEEPEVAL_TELEMETRY_OPT_OUT=YES
 
 # Make all src packages importable
 ENV PYTHONPATH="/app/src:/app/src/HybridRAG/code:/app/src/MemoryLayer:/app/aice_mcp"

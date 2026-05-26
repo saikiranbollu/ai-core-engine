@@ -297,6 +297,7 @@ GLOBAL_REFS_C_CODE = textwrap.dedent("""\
     static PartitionDataType GlobalData;
     static uint32 GlobalCounter;
     static const ConfigType *ConfigPtr;
+    static uint32 *GlobalPtr;
 
     /* ── Helper functions ── */
     static void helper_read_only(const PartitionDataType *const ptr) {
@@ -348,6 +349,49 @@ GLOBAL_REFS_C_CODE = textwrap.dedent("""\
     static void func_scalar_copy(void) {
         uint32 localVal = GlobalCounter;
         localVal = localVal + 1;
+    }
+
+    /* ── Increment/decrement (read+write) ── */
+    static void func_increment(void) {
+        GlobalCounter++;
+    }
+
+    static void func_prefix_decrement(void) {
+        --GlobalCounter;
+    }
+
+    /* ── Dereference write (Issue 11): *GlobalPtr = val ── */
+    static void func_deref_write(void) {
+        *GlobalPtr = 42;
+    }
+
+    /* ── Pointer chain patterns (Issue 11/7) ── */
+    static PartitionDataType *GlobalPtrArray[4];
+
+    static void func_ptr_array_chain_read(void) {
+        /* GlobalPtrArray[i]->field = val: array is READ (navigates chain) */
+        GlobalPtrArray[0]->count = 99;
+    }
+
+    static void func_ptr_array_element_write(void) {
+        /* GlobalPtrArray[i] = val: array element IS written */
+        GlobalPtrArray[0] = &GlobalData;
+    }
+
+    static void func_ptr_deref_chain_read(void) {
+        /* *GlobalPtrArray[i]->field: array is READ */
+        volatile uint32 x = GlobalPtrArray[0]->status;
+    }
+
+    static void func_ptr_arrow_field_write(void) {
+        /* GlobalPtr->field: pointer is READ, write goes to pointed-to struct */
+        ConfigPtr->PartitionPtr;
+    }
+
+    static void func_ptr_array_no_assign_read(void) {
+        /* GlobalPtrArray[i] used as RHS: array is READ */
+        PartitionDataType *local = GlobalPtrArray[1];
+        volatile uint32 x = local->status;
     }
 """)
 
@@ -486,3 +530,225 @@ class TestEnhancedGlobalRefs:
         # GlobalCounter should still appear as DIRECT
         direct = [r for r in refs if r.get("access_context") == "DIRECT"]
         assert any(r["name"] == "GlobalCounter" for r in direct)
+
+    # ── Increment/decrement detection ─────────────────────────────
+
+    def test_postfix_increment_is_write(self, global_refs_c_file):
+        """GlobalCounter++ should be detected as WRITE (read+write)."""
+        refs = self._get_refs(global_refs_c_file, "func_increment")
+        names = [r["name"] for r in refs]
+        assert "GlobalCounter" in names
+        gr = next(r for r in refs if r["name"] == "GlobalCounter")
+        assert gr["access_type"] == "WRITE"
+
+    def test_prefix_decrement_is_write(self, global_refs_c_file):
+        """--GlobalCounter should be detected as WRITE (read+write)."""
+        refs = self._get_refs(global_refs_c_file, "func_prefix_decrement")
+        names = [r["name"] for r in refs]
+        assert "GlobalCounter" in names
+        gr = next(r for r in refs if r["name"] == "GlobalCounter")
+        assert gr["access_type"] == "WRITE"
+
+    # ── Dereference write (Issue 11) ──────────────────────────────
+
+    def test_deref_write_is_read(self, global_refs_c_file):
+        """*GlobalPtr = 42 is a READ of GlobalPtr (provides address),
+        the WRITE goes to pointed-to memory."""
+        refs = self._get_refs(global_refs_c_file, "func_deref_write")
+        names = [r["name"] for r in refs]
+        assert "GlobalPtr" in names
+        gr = next(r for r in refs if r["name"] == "GlobalPtr")
+        assert gr["access_type"] == "READ", (
+            "*ptr = val should classify ptr as READ, not WRITE"
+        )
+
+    # ── Pointer chain patterns (Issue 11/7) ───────────────────────
+
+    def test_ptr_array_chain_is_read(self, global_refs_c_file):
+        """GlobalPtrArray[i]->field = val: array is READ (chain navigation)."""
+        refs = self._get_refs(global_refs_c_file, "func_ptr_array_chain_read")
+        gpa = [r for r in refs if r["name"] == "GlobalPtrArray"]
+        assert len(gpa) >= 1, "Should detect GlobalPtrArray reference"
+        for r in gpa:
+            assert r["access_type"] == "READ", (
+                f"ptr_array[i]->field = val should be READ, got {r['access_type']}"
+            )
+
+    def test_ptr_array_element_write(self, global_refs_c_file):
+        """GlobalPtrArray[i] = val: array element IS written."""
+        refs = self._get_refs(global_refs_c_file, "func_ptr_array_element_write")
+        gpa = [r for r in refs if r["name"] == "GlobalPtrArray"]
+        assert len(gpa) >= 1, "Should detect GlobalPtrArray reference"
+        writes = [r for r in gpa if r["access_type"] == "WRITE"]
+        assert len(writes) >= 1, (
+            "ptr_array[i] = val should have at least one WRITE"
+        )
+
+    def test_ptr_array_no_assign_is_read(self, global_refs_c_file):
+        """GlobalPtrArray[i] used on RHS: array is READ."""
+        refs = self._get_refs(global_refs_c_file, "func_ptr_array_no_assign_read")
+        gpa = [r for r in refs if r["name"] == "GlobalPtrArray"]
+        assert len(gpa) >= 1, "Should detect GlobalPtrArray reference"
+        for r in gpa:
+            assert r["access_type"] == "READ", (
+                f"ptr_array[i] on RHS should be READ, got {r['access_type']}"
+            )
+
+
+# ===================================================================
+# Register access extractor tests (Issue 9: SWPMSK + SFRWRITE)
+# ===================================================================
+
+class TestRegisterAccessExtractor:
+    """Tests for _RegisterAccessExtractor SWPMSK detection."""
+
+    def test_swpmsk_standalone_emits_read_and_write(self):
+        """MCALUTIL_SWPMSK with register.U argument → both READ and WRITE."""
+        code = '    MCALUTIL_SWPMSK(&EvaAdcSFR->ADC_CLKEN.U, mask, val);\n'
+        extractor = c_parser._RegisterAccessExtractor(code)
+        accesses = extractor.extract_function_accesses("test", code)
+        regs = [a for a in accesses if a["register"] == "ADC_CLKEN"]
+        types = {a["access_type"] for a in regs}
+        assert "READ" in types, f"Expected READ in {types}"
+        assert "WRITE" in types, f"Expected WRITE in {types}"
+
+    def test_sfrwrite_with_swpmsk_on_same_line(self):
+        """MCALUTIL_SFRWRITE + MCALUTIL_SWPMSK on same line → register in both READ and WRITE."""
+        code = '    MCALUTIL_SFRWRITE(EvaAdcSFR->ADC_CLKEN_TMADC.U, MCALUTIL_SWPMSK(regval, mask, val));\n'
+        extractor = c_parser._RegisterAccessExtractor(code)
+        accesses = extractor.extract_function_accesses("test", code)
+        regs = [a for a in accesses if a["register"] == "ADC_CLKEN_TMADC"]
+        types = {a["access_type"] for a in regs}
+        assert "READ" in types, f"Expected READ for SWPMSK-assisted SFRWRITE, got: {types}"
+        assert "WRITE" in types, f"Expected WRITE for SFRWRITE, got: {types}"
+
+    def test_sfrwrite_without_swpmsk(self):
+        """Plain MCALUTIL_SFRWRITE without SWPMSK → WRITE present (READ may also come from Pattern 1)."""
+        code = '    MCALUTIL_SFRWRITE(EvaAdcSFR->ADC_CFG.U, configval);\n'
+        extractor = c_parser._RegisterAccessExtractor(code)
+        accesses = extractor.extract_function_accesses("test", code)
+        regs = [a for a in accesses if a["register"] == "ADC_CFG"]
+        types = {a["access_type"] for a in regs}
+        assert "WRITE" in types
+
+    def test_swpmsk_with_volatile_cast_emits_read_and_write(self):
+        """MCALUTIL_SWPMSK with (volatile uint32 *) cast → both READ and WRITE."""
+        code = '    (void)MCALUTIL_SWPMSK((volatile uint32 *)&ADC_CLKEN_TMADC.U, ~HwClockEn, HwClockEn);\n'
+        extractor = c_parser._RegisterAccessExtractor(code)
+        accesses = extractor.extract_function_accesses("test", code)
+        regs = [a for a in accesses if a["register"] == "ADC_CLKEN_TMADC"]
+        types = {a["access_type"] for a in regs}
+        assert "READ" in types, f"Expected READ for SWPMSK with cast, got: {types}"
+        assert "WRITE" in types, f"Expected WRITE for SWPMSK with cast, got: {types}"
+
+
+# ===================================================================
+# Struct member access direction tests (Issue 8: ++ detection)
+# ===================================================================
+
+class TestStructMemberWriteDetection:
+    """Tests for _is_write_on_line and _is_read_on_line heuristics."""
+
+    def test_postfix_increment_is_write(self):
+        """field++ should be detected as write."""
+        src_lines = ["    GrpData->CurrSampCount++;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "CurrSampCount")
+        assert result is True
+
+    def test_postfix_increment_is_also_read(self):
+        """field++ should also be read (increment reads before writing)."""
+        src_lines = ["    GrpData->CurrSampCount++;\n"]
+        result = c_parser._ClangAnalyzer._is_read_on_line(src_lines, 1, "CurrSampCount")
+        assert result is True
+
+    def test_prefix_increment_is_write(self):
+        """++field should be detected as write."""
+        src_lines = ["    ++GrpData->CurrSampCount;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "CurrSampCount")
+        assert result is True
+
+    def test_prefix_decrement_is_write(self):
+        """--field should be detected as write."""
+        src_lines = ["    --GrpData->CurrSampCount;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "CurrSampCount")
+        assert result is True
+
+    def test_compound_assign_is_write(self):
+        """field += val should be detected as write."""
+        src_lines = ["    GrpData->CurrSampCount += 1;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "CurrSampCount")
+        assert result is True
+
+    def test_simple_read_is_not_write(self):
+        """Reading a field should NOT be write."""
+        src_lines = ["    x = GrpData->CurrSampCount;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "CurrSampCount")
+        assert result is False
+
+    def test_pointer_subscript_assign_is_not_write(self):
+        """ptr[x] = val means ptr is READ (dereferenced), not WRITE."""
+        src_lines = ["    GrpData->ResultBufferPtr[idx] = adcResult;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ResultBufferPtr")
+        assert result is False, "ptr[x] = val should be READ of the pointer, not WRITE"
+
+    def test_array_subscript_assign_is_write(self):
+        """array[x] = val means the array member IS written (Issue 20)."""
+        src_lines = ["    HwUnitDataPtr->ActiveSRMap[SRId] = Group;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ActiveSRMap")
+        assert result is True, "array[idx] = val should be WRITE for non-pointer array member"
+
+    def test_array_subscript_compound_assign_is_write(self):
+        """array[x] |= val means the array member IS written."""
+        src_lines = ["    DataPtr->ActiveChMask[HwUnitIndex] |= ChMask;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ActiveChMask")
+        assert result is True
+
+    def test_array_subscript_deref_is_not_write(self):
+        """array[x]->member = val means array is READ (provides pointer)."""
+        src_lines = ["    HwUnitGroupMapPtr[HwUnitIndex]->HwUnitDataPtr = &Data;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "HwUnitGroupMapPtr")
+        assert result is False
+
+    def test_pointer_subscript_assign_is_read(self):
+        """ptr[x] = val means ptr is READ (dereferenced to get address)."""
+        src_lines = ["    GrpData->ResultBufferPtr[idx] = adcResult;\n"]
+        result = c_parser._ClangAnalyzer._is_read_on_line(src_lines, 1, "ResultBufferPtr")
+        assert result is True
+
+    def test_pointer_arrow_deref_is_not_write(self):
+        """ptr->member = val means ptr is READ, not WRITE."""
+        src_lines = ["    GrpData->ChannelPtr->Status = ADC_IDLE;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ChannelPtr")
+        assert result is False
+
+    def test_direct_pointer_assign_is_write(self):
+        """ptr = newAddr IS a write to the pointer field itself."""
+        src_lines = ["    GrpData->ResultBufferPtr = newBuffer;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ResultBufferPtr")
+        assert result is True
+
+    # -- Issue 11: Leading * dereference patterns --
+
+    def test_leading_deref_chain_field_is_not_write(self):
+        """*chain->field = val means field is READ (provides address for deref)."""
+        src_lines = ["    *Adc_kData[PartitionId]->ConfigPtr = ConfigPtr;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ConfigPtr")
+        assert result is False, "*chain->field = val: field is READ, write goes to *field"
+
+    def test_leading_deref_chain_field_is_read(self):
+        """*chain->field = val means field is READ."""
+        src_lines = ["    *Adc_kData[PartitionId]->ConfigPtr = ConfigPtr;\n"]
+        result = c_parser._ClangAnalyzer._is_read_on_line(src_lines, 1, "ConfigPtr")
+        assert result is True
+
+    def test_leading_deref_with_cast_is_not_write(self):
+        """*(type*)chain->field = val means field is READ."""
+        src_lines = ["    *(uint32*)RuntimeInfoPtr->StatusPtr = 0U;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "StatusPtr")
+        assert result is False
+
+    def test_no_leading_deref_field_is_write(self):
+        """chain->field = val (no leading *) IS a write to the field."""
+        src_lines = ["    Adc_kData[PartitionId]->ConfigPtr = newConfig;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ConfigPtr")
+        assert result is True

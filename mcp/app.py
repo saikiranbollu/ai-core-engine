@@ -142,12 +142,24 @@ def main() -> None:
             except Exception as e:
                 logger.debug("[Scheduler] Cache stats failed: %s", e)
 
+        def _session_reaper_job():
+            """Periodically purge expired sessions and update ACTIVE_SESSIONS gauge."""
+            try:
+                from core.mcp_server import _get_session_manager
+                mgr = _get_session_manager()
+                if mgr:
+                    mgr._purge()
+            except Exception as e:
+                logger.debug("[Scheduler] Session reaper failed: %s", e)
+
         scheduler.add_job(_health_check_job, IntervalTrigger(minutes=5),
                           id="health_check", replace_existing=True)
         scheduler.add_job(_cache_stats_job, IntervalTrigger(minutes=30),
                           id="cache_stats", replace_existing=True)
+        scheduler.add_job(_session_reaper_job, IntervalTrigger(minutes=2),
+                          id="session_reaper", replace_existing=True)
         scheduler.start()
-        logger.info("[Scheduler] APScheduler started with 2 periodic jobs")
+        logger.info("[Scheduler] APScheduler started with 3 periodic jobs")
 
         # Update shutdown handler to also stop scheduler
         _orig_shutdown = _shutdown

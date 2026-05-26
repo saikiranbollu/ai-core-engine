@@ -6,7 +6,10 @@ Role hierarchy:  admin ⊃ developer ⊃ public
   • public    → may invoke public tools only
 """
 from __future__ import annotations
-from typing import Dict, Optional, Set
+import inspect
+import logging
+import os
+from typing import Dict, List, Optional, Set
 
 # Tier constants
 PUBLIC = "public"
@@ -112,3 +115,52 @@ def validate_tool_registration(mcp_instance) -> None:
             "TOOL_TIERS entries with no matching @mcp.tool(): %s",
             sorted(orphan_tiers),
         )
+
+    # ── MEG_SW-338: Signature validation ──
+    sig_issues = validate_tool_signatures(mcp_instance)
+    if sig_issues:
+        _logger = logging.getLogger(__name__)
+        for issue in sig_issues:
+            _logger.warning("Signature issue: %s", issue)
+        if os.environ.get("STRICT_SIGNATURE_VALIDATION", "").lower() == "true":
+            raise RuntimeError(
+                f"{len(sig_issues)} tool signature validation failure(s)"
+            )
+
+
+# ── Injected params that are added by decorators, not by the caller ────────
+_INJECTED_PARAMS = frozenset({
+    "session_id", "graph_service", "hybrid_traversal",
+    "query_mode", "sandbox_ctx",
+})
+
+
+def validate_tool_signatures(mcp_instance) -> List[str]:
+    """Inspect every registered tool's signature for missing annotations.
+
+    Returns a list of human-readable issue strings (empty = all clean).
+    """
+    issues: List[str] = []
+    for tool_name, fn in mcp_instance._tool_manager._tools.items():
+        # Get the underlying function (unwrap the Tool object if needed)
+        handler = getattr(fn, "fn", fn)
+        if handler is None or not callable(handler):
+            continue
+        try:
+            sig = inspect.signature(handler)
+        except (ValueError, TypeError):
+            continue
+        for name, param in sig.parameters.items():
+            if name in _INJECTED_PARAMS:
+                continue
+            if param.annotation is inspect.Parameter.empty:
+                issues.append(
+                    f"{tool_name}: param '{name}' missing type annotation"
+                )
+            if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                issues.append(
+                    f"{tool_name}: uses *args (unsupported by MCP)"
+                )
+        if sig.return_annotation is inspect.Signature.empty:
+            issues.append(f"{tool_name}: missing return type annotation")
+    return issues

@@ -3,7 +3,8 @@ Swagger UI & OpenAPI spec generation for MCP tools.
 =====================================================
 
 Generates an OpenAPI 3.0 catalogue from the registered MCP tool functions
-and serves a Swagger UI page at ``/`` and ``/docs``.
+and serves a Swagger UI page at ``/docs``.  The website landing page is
+served at ``/`` from static files.
 
 This module is independent of the MCP server itself and is wired in by
 ``mcp_server._build_asgi_app``.
@@ -11,12 +12,17 @@ This module is independent of the MCP server itself and is wired in by
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from starlette.responses import HTMLResponse, JSONResponse
-from starlette.routing import Route
+from starlette.routing import Route, Mount
+from starlette.staticfiles import StaticFiles
 
 from .tool_tiers import TOOL_TIERS
+
+# Path to the website directory
+_WEBSITE_DIR = Path(__file__).resolve().parent.parent / "website"
 
 # ── Swagger UI HTML (CSS/JS loaded from CDN) ─────────────────────────────
 
@@ -190,7 +196,7 @@ def generate_openapi_spec(
 def swagger_routes(
     tool_functions: Dict[str, Callable],
 ) -> List[Route]:
-    """Return Starlette ``Route`` objects for Swagger UI and OpenAPI spec.
+    """Return Starlette ``Route`` objects for website, Swagger UI, and OpenAPI spec.
 
     Parameters
     ----------
@@ -207,8 +213,16 @@ def swagger_routes(
     async def _swagger_ui_handler(request):
         return HTMLResponse(SWAGGER_HTML)
 
-    return [
-        Route("/", _swagger_ui_handler),
+    async def _website_handler(request):
+        index_path = _WEBSITE_DIR / "index.html"
+        if index_path.exists():
+            return HTMLResponse(index_path.read_text(encoding="utf-8"))
+        return HTMLResponse("<h1>AI Core Engine</h1><p>Website files not found.</p>")
+
+    routes = [
+        Route("/", _website_handler),
         Route("/docs", _swagger_ui_handler),
         Route("/openapi.json", _openapi_handler),
+        Mount("/static", StaticFiles(directory=str(_WEBSITE_DIR)), name="static"),
     ]
+    return routes

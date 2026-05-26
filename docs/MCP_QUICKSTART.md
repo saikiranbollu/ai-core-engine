@@ -1,6 +1,6 @@
 # AICE MCP Server — Quick Start & Configuration Guide
 
-**Companion to [DOCUMENTATION.md](DOCUMENTATION.md) — practical setup and usage reference for Domain Assistant developers.**
+**Companion to [DETAILED_DOCUMENTATION.md](DETAILED_DOCUMENTATION.md) — practical setup and usage reference for Domain Assistant developers.**
 
 > **Deployment model:** The AICE MCP server, Neo4j, Qdrant, Redis, PostgreSQL, and Cerbos are **already deployed and running** on the Infineon Cloud. You do **not** need to install or configure any server-side infrastructure. This guide focuses on connecting your Domain Assistant (running locally or in CI/CD) to the cloud-hosted AICE server.
 
@@ -20,7 +20,7 @@
 
 ## 1. Overview
 
-The AI Core Engine (AICE) MCP server exposes **56 tools across 13 categories** for automotive embedded software development. Domain Assistants (DAs) connect via the Model Context Protocol (MCP) over HTTP (`streamable-http`).
+The AI Core Engine (AICE) MCP server exposes **55 active tools across 14 categories** for automotive embedded software development. Domain Assistants (DAs) connect via the Model Context Protocol (MCP) over HTTP (`streamable-http`). The legacy Category 5 admin ingestion tools (`ingest_file`, `ingest_module_from_repo`, `batch_ingest_modules`, `ingest_repository`) and `sandbox_query` were removed from MCP registration — file ingestion via MCP now flows through `sandbox_upload`, and `search_database(session_id=…)` queries the sandbox overlay.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -38,7 +38,7 @@ The AI Core Engine (AICE) MCP server exposes **56 tools across 13 categories** f
 │   ┌─────────────────────────┐               │
 │   │  AICE MCP Server        │               │
 │   │  ├── Cerbos Auth (RBAC) │               │
-│   │  └── 56 Tools           │               │
+│   │  └── 55 Tools           │               │
 │   ├─────────┬───────┬───────┤               │
 │   │ Neo4j   │Qdrant │ Redis │  PostgreSQL   │
 │   │ (KG)    │(Vecs) │(Cache)│  (Audit)      │
@@ -179,11 +179,11 @@ The AICE server uses a three-tier role-based access control system:
 
 | Tier | Access | Tool Count |
 |------|--------|-----------|
-| **public** | Basic search, sessions, feedback | 34 |
-| **developer** | + graph traversal, analytics, visualization | 14 |
-| **admin** | + ingestion, cache management, token refresh | 8 |
+| **public** | Basic search, sessions, sandbox, feedback, health, ontology | 34 |
+| **developer** | + graph traversal, analytics, RLM, visualization, validation | 16 |
+| **admin** | Cache management, ingestion of test results, token refresh | 5 |
 
-Hierarchy: `admin ⊃ developer ⊃ public` — higher tiers inherit all lower-tier permissions.
+Hierarchy: `admin ⊃ developer ⊃ public` — higher tiers inherit all lower-tier permissions. Source of truth: [`mcp/core/tool_tiers.py`](../mcp/core/tool_tiers.py).
 
 ### 4.2 How Auth Works
 
@@ -281,36 +281,35 @@ detect_polling_requirements(function_name="Adc_StartGroupConversion",
 
 ```python
 # Full V-Model trace chain
-find_requirement_traces(requirement_id="SHRQ-12345", workspace="mcal")
+find_requirement_traces(requirement_id="SHRQ-12345", workspace_id="mcal")
 
 # Module-wide traceability matrix
-build_traceability_matrix(module="Adc", format="html", workspace="mcal")
+build_traceability_matrix(module_name="Adc", output_format="html", workspace_id="mcal")
 
 # Find coverage gaps
-find_coverage_gaps(module="Adc", workspace="mcal")
+find_coverage_gaps(module_name="Adc", workspace_id="mcal")
 
 # HW-SW register mapping
-analyze_hw_sw_links(module="Adc", workspace="illd")
+analyze_hw_sw_links(module_name="Adc", workspace_id="illd")
 ```
 
-### 5.5 Ingestion (Category 5 — Admin)
+### 5.5 Ingestion — Use `sandbox_upload` (Category 5 removed from MCP)
+
+The legacy admin ingestion tools (`ingest_file`, `ingest_module_from_repo`, `batch_ingest_modules`, `ingest_repository`) were removed from MCP registration in Plan 2 Phase 2. Per-session ingestion via MCP now flows through `sandbox_upload`; repository-scale jobs invoke `IngestionService` directly from library code.
 
 ```python
-# Single file
-ingest_file(file_path="/repo/Adc/src/Adc.c",
-            workspace="illd", module="Adc")
+# Per-session ingestion via MCP (recommended for ad-hoc files)
+session_start(session_id="CIA_20260322_001", assistant_name="CIA")
+sandbox_upload(session_id="CIA_20260322_001",
+               file_path="/repo/Adc/src/Adc.c")
 
-# Entire module
-ingest_module_from_repo(repo_path="/repo", module="Adc",
-                        workspace="illd")
-
-# Multiple modules
-batch_ingest_modules(repo_path="/repo",
-                     modules=["Adc", "Spi", "Can"],
-                     workspace="illd")
-
-# Full repository
-ingest_repository(repo_path="/repo", workspace="illd")
+# Library-level ingestion (CI jobs, batch backfills) — Python, not MCP
+from src.IngestionPipeline.ingestion_service import IngestionService
+svc = IngestionService(neo4j_driver=driver)
+svc.ingest_file("/repo/Adc/src/Adc.c", "Adc", workspace_id="illd")
+svc.ingest_module("/repo", "Adc", workspace_id="illd")
+svc.batch_ingest("/repo", modules=["Adc", "Spi", "Can"], workspace_id="illd")
+svc.ingest_repository("/repo", workspace_id="illd")
 ```
 
 ### 5.6 Session & Context (Category 6)
@@ -345,12 +344,16 @@ session_end(session_id="CIA_20260322_001")
 sandbox_upload(session_id="CIA_20260322_001",
                file_path="/path/to/customer_spec.pdf")
 
-# Search within uploaded documents
-sandbox_query(session_id="CIA_20260322_001",
-              query="ADC timing requirements")
+# Search within uploaded documents — sandbox_query is deprecated;
+# use search_database with session_id to route through the sandbox overlay
+search_database(query="ADC timing requirements",
+                session_id="CIA_20260322_001")
 
 # Check sandbox status
 sandbox_status(session_id="CIA_20260322_001")
+
+# Diff sandbox vs production
+sandbox_diff(session_id="CIA_20260322_001")
 
 # Release sandbox storage
 sandbox_clear(session_id="CIA_20260322_001")
@@ -370,8 +373,9 @@ rlm_plan_preview(
 rlm_orchestrate(
     query="Generate tests for Adc_StartGroupConversion...",
     task_type="test_generation",
+    module="Adc",
+    profile="illd",
     session_id="GEST_20260322_001",
-    workspace="illd"
 )
 ```
 
@@ -385,10 +389,13 @@ cache_stats()
 cache_get(query="ADC initialization")
 
 # Invalidate after re-ingestion (admin)
-cache_invalidate_module(module="Adc")
+cache_invalidate_module(module_name="Adc")
 
-# Clear all caches (admin)
-cache_clear(tier="all")
+# Clear specific tiers (admin) — default: all tiers
+cache_clear(tiers=["lru", "semantic"])
+
+# Reload tunables from environment without restart (admin)
+cache_refresh_config()
 ```
 
 ### 5.10 Feedback & Learning (Category 8)
@@ -417,7 +424,7 @@ submit_human_feedback(
 # → Records failure pattern in PostgreSQL
 
 # View learning metrics (developer)
-get_learning_metrics(module="Adc", time_range="7d")
+get_learning_metrics(include_pattern_details=True)
 
 # Query failure patterns (developer)
 get_failure_patterns(module="Spi", category="missing_error_handling")
@@ -461,19 +468,19 @@ get_review_analytics()
 
 ```python
 # System health
-health_check(verbose=True)
+health_check(verbose=True, include_test_query=True)
 
 # Graph statistics
-get_graph_statistics(workspace="illd")
+get_graph_statistics(workspace_id="illd")
 
 # List known modules
-list_available_modules(workspace="illd")
+list_available_modules(workspace_id="illd")
 
 # Distribution analysis
-get_distribution(dimension="asil", workspace="mcal")
+get_distribution(dimension="asil", workspace_id="mcal")
 
 # Coverage report
-get_coverage_report(module="Adc", workspace="mcal")
+get_coverage_report(workspace_id="mcal")
 ```
 
 ---
@@ -534,10 +541,10 @@ call_tool("session_start", {
 # --- Step 2: Search for knowledge ---
 search_results = call_tool("search_database", {
     "query": "Adc_StartGroupConversion implementation requirements",
-    "workspace": WORKSPACE,
-    "module_filter": MODULE,
-    "alpha": 0.5,
-    "top_k": 10,
+    "workspace_id": WORKSPACE,
+    "filter_by_module": MODULE,
+    "alpha": 0.6,
+    "max_results": 10,
 })
 
 # --- Step 3: (Optional) Upload customer specification ---
@@ -632,7 +639,7 @@ curl -X POST "$AICE_URL" \
 ### 7.3 Getting Help
 
 - **Server-side issues** (backends down, ingestion problems, new API key requests): Contact the **platform team**.
-- **DA integration issues** (how to call tools, context assembly, session management): See [DOCUMENTATION.md](DOCUMENTATION.md) for the full technical reference.
+- **DA integration issues** (how to call tools, context assembly, session management): See [DETAILED_DOCUMENTATION.md](DETAILED_DOCUMENTATION.md) for the full technical reference.
 
 ---
 
@@ -648,8 +655,8 @@ curl -X POST "$AICE_URL" \
 | Auth | `Authorization: Bearer key-cia-001` header on every request |
 | Workspaces | `illd` (iLLD drivers) or `mcal` (AUTOSAR MCAL) |
 | Response format | `{"error": false, "data": {...}}` or `{"error": true, "error_code": "...", "message": "..."}` |
-| Need help? | Platform issues → platform team · DA integration → [DOCUMENTATION.md](DOCUMENTATION.md) |
+| Need help? | Platform issues → platform team · DA integration → [DETAILED_DOCUMENTATION.md](DETAILED_DOCUMENTATION.md) |
 
 ---
 
-*See [DOCUMENTATION.md](DOCUMENTATION.md) for the complete technical reference.*
+*See [DETAILED_DOCUMENTATION.md](DETAILED_DOCUMENTATION.md) for the complete technical reference.*

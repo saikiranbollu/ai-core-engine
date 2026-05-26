@@ -45,6 +45,7 @@ __all__ = [
     "puml_parser",
     "rst_parser",
     "sfr_parser",
+    "srs_dox_parser",
     "xlsx_parser",
 ]
 

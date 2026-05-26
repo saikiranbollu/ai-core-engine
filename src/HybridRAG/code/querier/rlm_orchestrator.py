@@ -42,6 +42,22 @@ logger = logging.getLogger(__name__)
 MAX_STEPS = 6
 SUB_BUDGET = 8000
 
+# ── Config-driven default alpha (MEG_SW-308) ─────────────────────────
+_DEFAULT_ALPHA: Optional[float] = None
+
+
+def _get_default_alpha() -> float:
+    """Return the default RRF blend factor from storage_config.yaml (cached)."""
+    global _DEFAULT_ALPHA
+    if _DEFAULT_ALPHA is not None:
+        return _DEFAULT_ALPHA
+    try:
+        from env_config import get_default_search_alpha
+        _DEFAULT_ALPHA = get_default_search_alpha()
+    except Exception:
+        _DEFAULT_ALPHA = 0.6
+    return _DEFAULT_ALPHA
+
 # ── Shared httpx + OpenAI client (connection pooling) ─────────────────
 import threading as _threading
 _rlm_client_lock = _threading.Lock()  # M08 fix: guard global mutable state
@@ -149,7 +165,7 @@ class SubQueryStep:
     step_id: int
     intent: str
     query: str
-    alpha: float = 0.5
+    alpha: float = field(default_factory=_get_default_alpha)
     answer: str = ""
     sources_n: int = 0
     tokens: int = 0
@@ -621,7 +637,7 @@ class RLMOrchestrator:
         except Exception as e:
             logger.error("[RLM] LLM call failed: %s", e)
             return json.dumps({"reasoning": "LLM unavailable", "steps": [
-                {"step_id": 1, "intent": "fallback single query", "query": user[:200], "alpha": 0.5}
+                {"step_id": 1, "intent": "fallback single query", "query": user[:200], "alpha": _get_default_alpha()}
             ]})
 
     # ── Public API ─────────────────────────────────────────────────────
@@ -704,11 +720,11 @@ class RLMOrchestrator:
                 plan = json.loads(json_match.group())
             else:
                 plan = {"reasoning": "No JSON in response", "steps": [
-                    {"step_id": 1, "intent": "direct query", "query": query[:200], "alpha": 0.5}
+                    {"step_id": 1, "intent": "direct query", "query": query[:200], "alpha": _get_default_alpha()}
                 ]}
         except json.JSONDecodeError:
             plan = {"reasoning": "JSON parse failed", "steps": [
-                {"step_id": 1, "intent": "direct query", "query": query[:200], "alpha": 0.5}
+                {"step_id": 1, "intent": "direct query", "query": query[:200], "alpha": _get_default_alpha()}
             ]}
 
         return plan, tokens
@@ -720,7 +736,7 @@ class RLMOrchestrator:
         step_id = step_data.get("step_id", 1)
         intent = step_data.get("intent", "")
         query = step_data.get("query", "")
-        alpha = step_data.get("alpha", 0.5)
+        alpha = step_data.get("alpha", _get_default_alpha())
 
         # Search
         sources_n = 0

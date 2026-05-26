@@ -221,7 +221,7 @@ RETURN req.requirement_id, count(test) > 0 AS has_test
 **Endpoint**: `/metrics` (mounted alongside FastMCP ASGI app via Starlette)
 **Dependency**: `prometheus_client>=0.21`
 
-The MCP server exposes Prometheus metrics at `/metrics`. All 56 tools are automatically instrumented via the `_ok()` / `_err()` return helpers — no per-tool code changes needed.
+The MCP server exposes Prometheus metrics at `/metrics`. All 55 tools are automatically instrumented via the `_ok()` / `_err()` return helpers — no per-tool code changes needed.
 
 ### Metric Types
 

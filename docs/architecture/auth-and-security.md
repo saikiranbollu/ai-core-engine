@@ -74,7 +74,7 @@ Tiers are hierarchical — higher tiers inherit all permissions from lower tiers
 admin ⊃ developer ⊃ public
 ```
 
-An admin API key can invoke all 56 tools. A developer key can invoke public + developer tools (50 tools). A public key is limited to 36 tools.
+An admin API key can invoke all 55 active tools. A developer key can invoke public + developer tools (50 tools). A public key is limited to 34 tools. Source of truth: [`mcp/core/tool_tiers.py`](../../mcp/core/tool_tiers.py).
 
 This inheritance is implemented via **Cerbos derived roles** in `policies/derived_roles.yaml`.
 
@@ -84,7 +84,7 @@ This inheritance is implemented via **Cerbos derived roles** in `policies/derive
 
 ```python
 TOOL_TIERS = {
-    # Category 1: Search — all public
+    # Category 1: Search — mostly public, advanced graph traversal is developer
     "search_database": "public",
     "search_nodes": "public",
     "get_node_by_id": "public",
@@ -92,15 +92,15 @@ TOOL_TIERS = {
     "shortest_path": "developer",    # path analysis
     "execute_cypher": "developer",   # raw Cypher
 
-    # Category 5: Ingestion — all admin
-    "ingest_file": "admin",
-    "ingest_module_from_repo": "admin",
-    "batch_ingest_modules": "admin",
-    "ingest_repository": "admin",
+    # Category 5: Ingestion (admin) — removed from MCP registration in Plan 2 Phase 2.
+    # ingest_file / ingest_module_from_repo / batch_ingest_modules / ingest_repository
+    # are no longer exposed as MCP tools; use sandbox_upload (public, per-session) or
+    # invoke IngestionService directly from library code. process_results remains admin.
+    "process_results": "admin",
 
-    # Category 6: RLM — developer
+    # Category 6: RLM — developer (orchestrate), public (plan preview)
     "rlm_orchestrate": "developer",
-    "rlm_preview": "developer",
+    "rlm_plan_preview": "public",
     ...
 }
 ```
@@ -121,31 +121,31 @@ API keys follow the convention `key-{da_code}-{number}`:
 Defined in `mcp/auth/api_keys.yaml`:
 
 ```yaml
-principals:
-  - id: "key-cia-001"
-    name: "CIA Domain Assistant"
+keys:
+  "key-cia-001":
+    principal_id: "cia_assistant"
     roles:
-      illd: "public"
-      mcal: "public"
+      illd: ["public"]
+      mcal: ["public"]
 
-  - id: "key-saga-001"
-    name: "SAGA Architecture Analyst"
+  "key-saga-001":
+    principal_id: "saga_assistant"
     roles:
-      illd: "developer"
-      mcal: "developer"
+      illd: ["developer"]
+      mcal: ["developer"]
 
-  - id: "key-admin-001"
-    name: "Platform Admin"
+  "key-admin-001":
+    principal_id: "platform_admin"
     roles:
-      illd: "admin"
-      mcal: "admin"
+      illd: ["admin"]
+      mcal: ["admin"]
 ```
 
 **Workspace-scoped roles**: A principal can have different roles in different workspaces. For example, a DA might have `developer` access to `illd` but only `public` access to `mcal`.
 
 ### Key Resolution
 
-`load_api_keys()` reads the YAML file at startup. `resolve_principal(api_key)` returns the principal with its workspace-scoped roles.
+`load_api_keys()` reads the YAML file at startup. `resolve_principal(api_key)` returns the principal with its workspace-scoped roles. The YAML schema is `keys: { "<api-key>": { principal_id, roles: { <workspace>: [<role>, ...] } } }` — each workspace maps to a **list** of roles. Use `"*"` as a wildcard workspace for global access.
 
 ---
 

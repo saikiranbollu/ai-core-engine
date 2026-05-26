@@ -4149,12 +4149,40 @@ profiles:
   illd:
     metadata:
       name: "Automotive Embedded LLD Ontology"
-      version: "2.0.0"
+      version: "3.0.0"
       domain: "automotive_embedded_lld"
       description: >
         Comprehensive ontology for low-level driver development lifecycle.
         Node labels and relationship types match the live ILLD Neo4j
         database (bolt-passthrough-neo4j-mcswai-legato).
+
+        Version 3.0.0 changes
+        ---------------------
+        * Collapsed dual labels:
+            - SFR ``Register``   ⟶ unified into ``HardwareRegister``
+            - SFR ``BitField``   ⟶ unified into ``RegisterField``
+          Origin is preserved via the ``sfr_source_file`` and
+          ``hwa_source_doc`` properties.  The old labels remain declared
+          (``deprecated: true``) so historical Cypher queries keep parsing
+          until re-ingestion completes.
+        * Architecture header ``Ifx<FB>_swa.h`` and the published
+          implementation header ``Ifx<FB>.h`` in ``_inc/`` are merged
+          into a single ``Function`` / ``Struct`` / ``Enum`` node per
+          C signature.  Provenance is captured by
+          ``Function.source_files`` (list) and ``Function.origin``
+          (``arch_only`` | ``impl_only`` | ``both``).
+        * New labels for HW-spec semantics:
+            - ``HwConstraint``       (timing / ordering / wait_loop / …)
+            - ``ProgrammingSequence`` (Init / Tx / Rx / Shutdown / …)
+            - ``SequenceStep``       (ordered step inside a sequence)
+            - ``HardwareSubModule``  (now with a full property block)
+        * New traceability edges (previously declared but empty):
+          ``ACCESSES_REGISTER``, ``BITFIELD_CONTROLS``, ``IMPLEMENTS``,
+          ``IMPLEMENTED_BY``, ``PARENT_REQUIREMENT``, ``RELATES_TO``,
+          ``PART_OF_SUBMODULE``, ``TRACES_TO``, ``VERIFIES``,
+          ``HAS_CASE``, ``HAS_CONSTRAINT``, ``HAS_STEP``, ``NEXT_STEP``,
+          ``STEP_OPERATION``, ``STEP_USES_REGISTER``,
+          ``REALIZES_SEQUENCE``.
       supported_modules:
         - "CXPI"
         - "CAN"
@@ -4237,51 +4265,109 @@ profiles:
             required: false
 
       # -- HardwareRegister --------------------------------------------------
+      # v3.0: Unified label.  Carries both the abstract HW-spec view
+      # (RC1_IP_* docs) and the concrete SFR-header view
+      # (Ifx<Mod>_regdef.h).  Dedup key is (module, name).
       - name: "HardwareRegister"
-        description: "Hardware register extracted from HW spec PDF/Markdown"
-        extraction_strategy: "llm"
-        source_formats: ["pdf", "md"]
+        description: >
+          Hardware register.  Single source of truth merged from the HW
+          specification document (timings, access constraints) and the
+          SFR register-definition header (address, width, reset value).
+        extraction_strategy: "hybrid"
+        source_formats: ["pdf", "md", "h"]
+        dedup_key: ["module", "name"]
         properties:
           - name: "id"
             data_type: "string"
             required: true
             unique: true
-            description: "Node ID (e.g. HWREG_CLC)"
+            description: "Node ID (e.g. HWREG_CXPI_CLC)"
           - name: "name"
             data_type: "string"
             required: true
             description: "Register name (e.g. CLC, ID, KRST0)"
+          - name: "module"
+            data_type: "string"
+            required: true
           - name: "description"
             data_type: "text"
             required: false
+          - name: "address"
+            data_type: "string"
+            required: false
+            description: "Absolute or base-offset address (hex)"
+            extraction_pattern: "^0x[0-9A-Fa-f]+$"
+          - name: "offset"
+            data_type: "string"
+            required: false
+            description: "Offset from sub-module base (hex)"
+          - name: "width"
+            data_type: "integer"
+            required: false
+            validation_rules:
+              allowed_values: [8, 16, 32, 64]
+          - name: "reset_value"
+            data_type: "string"
+            required: false
+          - name: "sfr_source_file"
+            data_type: "string"
+            required: false
+            description: "Originating SFR header (e.g. IfxCxpi_regdef.h)"
+          - name: "hwa_source_doc"
+            data_type: "string"
+            required: false
+            description: "Originating HW-arch / IP document (e.g. RC1_IP_CXPI.md)"
+          - name: "submodule"
+            data_type: "string"
+            required: false
+            description: "HardwareSubModule name (e.g. Cxpi0, Cxpi1)"
           - name: "label"
             data_type: "string"
             required: false
-            description: "Display label (same as name)"
           - name: "embedding"
             data_type: "vector"
             dimensions: 1536
             required: false
 
       # -- RegisterField -----------------------------------------------------
+      # v3.0: Unified label — absorbs the former SFR-only :BitField.
+      # Dedup key is (module, register, name).
       - name: "RegisterField"
-        description: "Individual field within a HardwareRegister (from HW spec)"
-        extraction_strategy: "llm"
-        source_formats: ["pdf", "md"]
+        description: >
+          Individual field of a HardwareRegister.  Single source of truth
+          merged from the HW spec (access semantics, description) and the
+          SFR header (exact bit range, reset value).
+        extraction_strategy: "hybrid"
+        source_formats: ["pdf", "md", "h"]
+        dedup_key: ["module", "register", "name"]
         properties:
           - name: "id"
             data_type: "string"
             required: true
             unique: true
-            description: "Node ID (e.g. REGFIELD_CLC_DISR)"
+            description: "Node ID (e.g. REGFIELD_CXPI_CLC_DISR)"
           - name: "name"
             data_type: "string"
             required: true
             description: "Field name (e.g. DISR, DISS, EDIS)"
+          - name: "register"
+            data_type: "string"
+            required: true
+            description: "Parent HardwareRegister name"
+          - name: "module"
+            data_type: "string"
+            required: true
           - name: "bits"
             data_type: "string"
             required: true
             description: "Bit position or range (e.g. '0', '1', '7:4')"
+          - name: "bit_range"
+            data_type: "string"
+            required: false
+            description: "Alias of 'bits' kept for SFR-style consumers"
+          - name: "width"
+            data_type: "string"
+            required: false
           - name: "access"
             data_type: "string"
             required: true
@@ -4292,17 +4378,23 @@ profiles:
           - name: "description"
             data_type: "text"
             required: false
-          - name: "register"
+          - name: "sfr_source_file"
             data_type: "string"
-            required: true
-            description: "Parent register name"
+            required: false
+          - name: "hwa_source_doc"
+            data_type: "string"
+            required: false
           - name: "label"
             data_type: "string"
             required: false
 
       # -- Register (SFR) ---------------------------------------------------
+      # DEPRECATED v3.0 — use :HardwareRegister.  Kept for backward-compat
+      # so legacy Cypher queries keep parsing until full re-ingestion.
       - name: "Register"
-        description: "SFR register definition from _regdef.h headers"
+        deprecated: true
+        replaced_by: "HardwareRegister"
+        description: "DEPRECATED. SFR register from _regdef.h — use HardwareRegister."
         extraction_strategy: "hybrid"
         source_formats: ["h"]
         properties:
@@ -4338,8 +4430,11 @@ profiles:
             required: true
 
       # -- BitField ----------------------------------------------------------
+      # DEPRECATED v3.0 — use :RegisterField.  Kept for backward-compat.
       - name: "BitField"
-        description: "SFR register bitfield from _regdef.h headers"
+        deprecated: true
+        replaced_by: "RegisterField"
+        description: "DEPRECATED. SFR bitfield — use RegisterField."
         extraction_strategy: "hybrid"
         source_formats: ["h"]
         properties:
@@ -4403,10 +4498,17 @@ profiles:
             required: false
 
       # -- Function ----------------------------------------------------------
+      # v3.0: Single node per C signature.  Arch (_swa.h) and published
+      # (.h in _inc/) headers are merged via signature_hash dedup.
       - name: "Function"
-        description: "C function from driver API (with Doxygen documentation)"
+        description: >
+          C function from driver API.  Merges the architecture header
+          (Ifx<FB>_swa.h) and the published implementation header
+          (Ifx<FB>.h in _inc/) into one node — see ``source_files`` and
+          ``origin`` for provenance.
         extraction_strategy: "hybrid"
         source_formats: ["h", "c"]
+        dedup_key: ["name", "signature_hash"]
         properties:
           - name: "id"
             data_type: "string"
@@ -4421,22 +4523,34 @@ profiles:
           - name: "brief"
             data_type: "string"
             required: false
-            description: "Brief description from Doxygen @brief"
           - name: "purpose"
             data_type: "text"
             required: false
-            description: "Detailed purpose / description"
           - name: "return_type"
             data_type: "string"
             required: false
-          - name: "source"
-            data_type: "string"
-            required: false
-            description: "Source origin (e.g. SWA_Functions)"
           - name: "signature"
             data_type: "string"
             required: false
-            description: "Full function signature"
+            description: "Full function signature, normalised whitespace"
+          - name: "signature_hash"
+            data_type: "string"
+            required: false
+            description: "SHA-1 of normalised signature; used for swa/inc merge"
+          - name: "source"
+            data_type: "string"
+            required: false
+            description: "Primary source bucket (e.g. SWA_Functions)"
+          - name: "origin"
+            data_type: "string"
+            required: false
+            description: "Provenance flag after swa/inc merge"
+            validation_rules:
+              allowed_values: ["arch_only", "impl_only", "both"]
+          - name: "source_files"
+            data_type: "list[string]"
+            required: false
+            description: "All header files that contributed this declaration"
           - name: "module"
             data_type: "string"
             required: false
@@ -5099,6 +5213,230 @@ profiles:
             data_type: "string"
             required: false
 
+      # -- HardwareSubModule (v3.0) -----------------------------------------
+      # A logical sub-instance of an IP block (e.g. Cxpi0, Cxpi1, Spi3).
+      # Carries the base address and the parent module name.
+      - name: "HardwareSubModule"
+        description: >
+          Logical sub-instance of an IP (e.g. CXPI0, CXPI1).  Groups
+          HardwareRegister nodes and carries the base address.
+        extraction_strategy: "hybrid"
+        source_formats: ["pdf", "md", "h"]
+        dedup_key: ["module", "name"]
+        properties:
+          - name: "id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Node ID (e.g. HWSUB_CXPI_CXPI0)"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Sub-module name (e.g. CXPI0, CXPI1)"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "Parent IP / module name (e.g. CXPI)"
+          - name: "base_address"
+            data_type: "string"
+            required: false
+            extraction_pattern: "^0x[0-9A-Fa-f]+$"
+          - name: "description"
+            data_type: "text"
+            required: false
+          - name: "hwa_source_doc"
+            data_type: "string"
+            required: false
+          - name: "label"
+            data_type: "string"
+            required: false
+
+      # -- HwConstraint (v3.0) ----------------------------------------------
+      # Captures HW-spec constraints that are not encodable in a simple
+      # access mode: wait loops, timing windows, ordering rules, allowed
+      # access widths, frequency limits, setup/hold, etc.
+      - name: "HwConstraint"
+        description: >
+          A hardware constraint extracted from the IP user manual /
+          HW-architecture document.  Attaches to HardwareRegister,
+          RegisterField, Operation, or ProgrammingSequence / SequenceStep.
+        extraction_strategy: "llm"
+        source_formats: ["pdf", "md"]
+        dedup_key: ["module", "id"]
+        properties:
+          - name: "id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Node ID (e.g. HWCON_CXPI_CLC_DISS_WAIT)"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Short human-readable constraint name"
+          - name: "kind"
+            data_type: "string"
+            required: true
+            description: "Constraint category"
+            validation_rules:
+              allowed_values:
+                - "timing"        # e.g. delay/latency between actions
+                - "wait_loop"     # poll-until-bit semantics
+                - "ordering"      # must happen before / after
+                - "access_width"  # 8/16/32-bit access required
+                - "frequency"     # max / min clock or update rate
+                - "setup_hold"    # signal setup / hold
+                - "atomicity"     # word-wise or RMW restrictions
+                - "preconditions" # other registers/state required first
+                - "side_effect"   # read-clears / write-1-to-clear, etc.
+          - name: "value"
+            data_type: "string"
+            required: false
+            description: "Numeric value or bound (e.g. '2', '100', '<= 50')"
+          - name: "unit"
+            data_type: "string"
+            required: false
+            description: "Unit of the value (e.g. cycles, ns, us, MHz, bits)"
+          - name: "condition"
+            data_type: "text"
+            required: false
+            description: "Triggering or applicability condition (free text)"
+          - name: "rationale"
+            data_type: "text"
+            required: false
+          - name: "source_section"
+            data_type: "string"
+            required: false
+            description: "Section/heading in the HW-arch doc (citation)"
+          - name: "hwa_source_doc"
+            data_type: "string"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: true
+          - name: "label"
+            data_type: "string"
+            required: false
+
+      # -- ProgrammingSequence (v3.0) ---------------------------------------
+      # A named programming sequence for a specific use-case
+      # (Init / Tx / Rx / Shutdown / SafetyCheck ...).  Made of ordered
+      # SequenceStep nodes chained by NEXT_STEP.
+      - name: "ProgrammingSequence"
+        description: >
+          Ordered programming sequence extracted from the HW manual
+          (e.g. CXPI Init, BTM Tx-burst).  Contains SequenceStep nodes
+          chained by NEXT_STEP.  Bound to a Function via REALIZES_SEQUENCE.
+        extraction_strategy: "llm"
+        source_formats: ["pdf", "md"]
+        dedup_key: ["module", "id"]
+        properties:
+          - name: "id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Node ID (e.g. PSEQ_CXPI_Init)"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Sequence name (e.g. 'Init', 'TxBurst', 'Shutdown')"
+          - name: "use_case"
+            data_type: "string"
+            required: false
+            validation_rules:
+              allowed_values:
+                - "Init"
+                - "Configure"
+                - "Tx"
+                - "Rx"
+                - "Shutdown"
+                - "SafetyCheck"
+                - "ErrorRecovery"
+                - "Calibration"
+                - "PowerDown"
+                - "WakeUp"
+                - "Other"
+          - name: "description"
+            data_type: "text"
+            required: false
+          - name: "step_count"
+            data_type: "integer"
+            required: false
+          - name: "module"
+            data_type: "string"
+            required: true
+          - name: "hwa_source_doc"
+            data_type: "string"
+            required: false
+          - name: "source_section"
+            data_type: "string"
+            required: false
+          - name: "label"
+            data_type: "string"
+            required: false
+          - name: "embedding"
+            data_type: "vector"
+            dimensions: 1536
+            required: false
+
+      # -- SequenceStep (v3.0) ----------------------------------------------
+      - name: "SequenceStep"
+        description: >
+          One ordered step within a ProgrammingSequence.  Linked to the
+          Operation it performs and/or the HardwareRegister it touches.
+        extraction_strategy: "llm"
+        source_formats: ["pdf", "md"]
+        dedup_key: ["sequence_id", "order"]
+        properties:
+          - name: "id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Node ID (e.g. PSTEP_CXPI_Init_03)"
+          - name: "sequence_id"
+            data_type: "string"
+            required: true
+            description: "Parent ProgrammingSequence ID"
+          - name: "order"
+            data_type: "integer"
+            required: true
+            description: "0-based ordinal position inside the sequence"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Short step name (e.g. 'Release reset', 'Poll BUSY=0')"
+          - name: "action"
+            data_type: "text"
+            required: false
+            description: "Imperative action text from HW manual"
+          - name: "step_type"
+            data_type: "string"
+            required: false
+            validation_rules:
+              allowed_values:
+                - "WriteRegister"
+                - "ReadRegister"
+                - "WaitBit"        # poll-until
+                - "Delay"          # fixed delay
+                - "EnableClock"
+                - "ReleaseReset"
+                - "AssertReset"
+                - "Configure"
+                - "Check"
+                - "Other"
+          - name: "expected_value"
+            data_type: "string"
+            required: false
+          - name: "timeout"
+            data_type: "string"
+            required: false
+            description: "For WaitBit/Delay steps"
+          - name: "module"
+            data_type: "string"
+            required: true
+          - name: "label"
+            data_type: "string"
+            required: false
+
     # -------------------------------------------------------------------------
     # RELATIONSHIP TYPES
     # -------------------------------------------------------------------------
@@ -5431,6 +5769,90 @@ profiles:
           - name: "evidence_path"
             data_type: "string"
 
+      # =================================================================
+      # HW Sub-module / Constraint / Programming-sequence (v3.0)
+      # =================================================================
+
+      - name: "PART_OF_SUBMODULE"
+        description: "HardwareRegister belongs to a HardwareSubModule"
+        from_types: ["HardwareRegister"]
+        to_types: ["HardwareSubModule"]
+        properties:
+          - name: "offset"
+            data_type: "string"
+            description: "Offset from the sub-module base address (hex)"
+
+      - name: "HAS_CONSTRAINT"
+        description: >
+          HW-spec constraint attached to a register, field, operation or
+          programming sequence (timing, ordering, wait-loop, etc.).
+        from_types:
+          - "HardwareRegister"
+          - "RegisterField"
+          - "Operation"
+          - "ProgrammingSequence"
+          - "SequenceStep"
+        to_types: ["HwConstraint"]
+        properties:
+          - name: "scope"
+            data_type: "string"
+            description: "Where the constraint applies (read|write|configure|wait|delay)"
+
+      - name: "HAS_STEP"
+        description: "ProgrammingSequence has an ordered step"
+        from_types: ["ProgrammingSequence"]
+        to_types: ["SequenceStep"]
+        properties:
+          - name: "order"
+            data_type: "integer"
+
+      - name: "NEXT_STEP"
+        description: "Ordered chain of SequenceStep nodes"
+        from_types: ["SequenceStep"]
+        to_types: ["SequenceStep"]
+        properties: []
+
+      - name: "STEP_OPERATION"
+        description: "SequenceStep performs an Operation"
+        from_types: ["SequenceStep"]
+        to_types: ["Operation"]
+        properties: []
+
+      - name: "STEP_USES_REGISTER"
+        description: "SequenceStep reads/writes a HardwareRegister or RegisterField"
+        from_types: ["SequenceStep"]
+        to_types: ["HardwareRegister", "RegisterField"]
+        properties:
+          - name: "access"
+            data_type: "string"
+            validation_rules:
+              allowed_values: ["Read", "Write", "ReadWrite", "Poll"]
+          - name: "expected_value"
+            data_type: "string"
+
+      - name: "REALIZES_SEQUENCE"
+        description: "Function realizes a HW programming sequence"
+        from_types: ["Function"]
+        to_types: ["ProgrammingSequence"]
+        properties:
+          - name: "coverage"
+            data_type: "string"
+            validation_rules:
+              allowed_values: ["Full", "Partial"]
+
+      # =================================================================
+      # Legacy alias (v3.0) — used only during the transition window so
+      # that any leftover :Register / :BitField nodes can be wired to
+      # their unified counterparts.  Re-ingestion eliminates the need.
+      # =================================================================
+
+      - name: "MAPS_TO"
+        description: "Deprecated alias edge from old SFR labels to unified labels"
+        from_types: ["Register", "BitField"]
+        to_types: ["HardwareRegister", "RegisterField"]
+        properties: []
+        deprecated: true
+
     # -------------------------------------------------------------------------
     # EXTRACTION PATTERNS
     # -------------------------------------------------------------------------
@@ -5520,3 +5942,63 @@ profiles:
       error_detection: |
         MATCH (e:Error)-[:DETECTED_BY]->(m:Mechanism)
         RETURN e.name AS error, m.name AS mechanism, e.description AS desc
+
+      # ----- v3.0 templates -------------------------------------------------
+
+      hw_constraints_for_register: |
+        MATCH (hr:HardwareRegister {module: $module, name: $reg_name})
+        OPTIONAL MATCH (hr)-[:HAS_CONSTRAINT]->(c:HwConstraint)
+        OPTIONAL MATCH (hr)-[:HAS_FIELD]->(rf:RegisterField)-[:HAS_CONSTRAINT]->(fc:HwConstraint)
+        RETURN hr.name AS register,
+               collect(DISTINCT {kind: c.kind, value: c.value, unit: c.unit,
+                                  condition: c.condition, src: c.source_section}) AS reg_constraints,
+               collect(DISTINCT {field: rf.name, kind: fc.kind, value: fc.value,
+                                  unit: fc.unit, condition: fc.condition}) AS field_constraints
+
+      programming_sequence_for: |
+        MATCH (ps:ProgrammingSequence {module: $module, name: $sequence_name})
+        MATCH (ps)-[:HAS_STEP]->(s:SequenceStep)
+        OPTIONAL MATCH (s)-[:STEP_OPERATION]->(op:Operation)
+        OPTIONAL MATCH (s)-[u:STEP_USES_REGISTER]->(reg)
+        OPTIONAL MATCH (s)-[:HAS_CONSTRAINT]->(sc:HwConstraint)
+        WITH ps, s, op, reg, u, collect(DISTINCT sc) AS step_constraints
+        ORDER BY s.order
+        RETURN ps.name AS sequence,
+               s.order AS step_order,
+               s.name AS step_name,
+               s.step_type AS step_type,
+               s.action AS action,
+               op.name AS operation,
+               labels(reg)[0] AS target_label,
+               reg.name AS target_name,
+               u.access AS access,
+               s.expected_value AS expected_value,
+               s.timeout AS timeout,
+               [c IN step_constraints WHERE c IS NOT NULL | c.kind + ':' + coalesce(c.value, '')] AS constraints
+
+      function_register_access_chain: |
+        MATCH (f:Function {name: $func_name})
+        OPTIONAL MATCH (f)-[a:ACCESSES_REGISTER]->(hr:HardwareRegister)
+        OPTIONAL MATCH (hr)-[:HAS_FIELD]->(rf:RegisterField)-[:BITFIELD_CONTROLS]->(op:Operation)
+        RETURN f.name AS function,
+               hr.name AS register,
+               a.access_type AS access,
+               collect(DISTINCT {field: rf.name, operation: op.name}) AS controls
+
+      requirement_to_test_to_code: |
+        MATCH (r:Requirement {requirement_id: $req_id})
+        OPTIONAL MATCH (r)<-[:IMPLEMENTS]-(f:Function)
+        OPTIONAL MATCH (r)<-[:TRACES_TO]-(ts:TestSpecification)
+        OPTIONAL MATCH (ts)<-[:VERIFIES]-(tr:TestResult)
+        OPTIONAL MATCH (f)-[:REALIZES_SEQUENCE]->(ps:ProgrammingSequence)
+        RETURN r.requirement_id AS requirement,
+               collect(DISTINCT f.name) AS functions,
+               collect(DISTINCT ts.test_id) AS test_specs,
+               collect(DISTINCT {test: tr.test_id, status: tr.status}) AS results,
+               collect(DISTINCT ps.name) AS sequences
+
+      submodule_register_map: |
+        MATCH (sm:HardwareSubModule {module: $module})
+        OPTIONAL MATCH (hr:HardwareRegister)-[p:PART_OF_SUBMODULE]->(sm)
+        RETURN sm.name AS submodule, sm.base_address AS base,
+               collect({register: hr.name, offset: p.offset, address: hr.address}) AS registers

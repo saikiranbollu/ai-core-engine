@@ -162,6 +162,37 @@ class TestTraceabilityPull:
         assert hasattr(puller, 'MAX_PULL_NODES')
         assert puller.MAX_PULL_NODES == 500
 
+    def test_pull_neighbors_uses_literal_depth(self):
+        """F-CB-01: Cypher must interpolate depth as a literal, not a $param.
+
+        Neo4j 4.x does not allow parameters inside [*1..N]. Regression
+        guard against re-introducing the silently-broken `$depth` form.
+        """
+        mock_driver = MagicMock()
+        mock_session = MagicMock()
+        mock_driver.session.return_value.__enter__.return_value = mock_session
+        mock_session.run.return_value.single.return_value = {
+            "nodes": [], "relationships": []
+        }
+
+        puller = TraceabilityPuller(mock_driver)
+        puller.pull_neighbors(
+            node_names=["Adc_Init"], module="Adc",
+            workspace_id="mcal", depth=2,
+        )
+        captured_cypher = mock_session.run.call_args[0][0]
+        assert "*1..2" in captured_cypher
+        assert "$depth" not in captured_cypher
+
+    def test_pull_neighbors_rejects_out_of_range_depth(self):
+        """F-CB-01: depth outside 1..5 must raise, not silently inject."""
+        puller = TraceabilityPuller(MagicMock())
+        import pytest
+        with pytest.raises(ValueError, match="depth must be 1..5"):
+            puller.pull_neighbors(
+                node_names=["x"], module="Adc", depth=99,
+            )
+
 
 class TestLoadProdNodes:
     """Test loading prod nodes into ephemeral graph."""

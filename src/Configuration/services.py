@@ -164,7 +164,6 @@ class OntologyService:
         return {"compliance_score": 1.0, "module": module_name, "profile": profile,
                 "issues": [], "note": "Full compliance check requires live Neo4j data"}
 
-
 # ═════════════════════════════════════════════════════════════════════════
 #  Category 11: Observability (remaining 5 tools)
 # ═════════════════════════════════════════════════════════════════════════
@@ -195,52 +194,39 @@ class ObservabilityService:
         except Exception as e:
             return {"error": str(e)}
 
-    def list_modules(self, include_stats: bool = False, limit: int = 50,
-                     offset: int = 0, profile: str = "illd") -> Dict:
-        if not self._neo4j:
-            # Return known modules from ontology
-            modules = OntologyLoader().get_supported_modules(profile)
-            return {"modules": [{"name": m} for m in modules[offset:offset+limit]],
-                    "total_count": len(modules), "has_more": offset + limit < len(modules)}
-        try:
-            db = _resolve_db(profile)
-            with self._neo4j.session(database=db) as s:
-                # Query Module / MCALModule node types first
-                result = s.run(
-                    "MATCH (n) WHERE any(lbl IN labels(n) WHERE lbl IN $mod_labels) "
-                    "OPTIONAL MATCH (n)-->(m) "
-                    "RETURN coalesce(n.module_name, n.name) AS module, "
-                    "labels(n)[0] AS node_type, count(m) AS rel_count "
-                    "ORDER BY module SKIP $offset LIMIT $limit",
-                    {"mod_labels": ["MCALModule", "Module"], "offset": offset, "limit": limit},
-                )
-                modules = []
-                for r in result:
-                    entry = {"name": r["module"], "source": "module_node", "node_type": r["node_type"]}
-                    if include_stats:
-                        entry["relationship_count"] = r["rel_count"]
-                    modules.append(entry)
+    def list_modules(self, include_stats: bool = False, profile: str = "illd") -> Dict:
+        """Return all modules for the given profile.
 
-                # Fallback: also collect distinct n.module property values
-                prop_result = s.run(
-                    "MATCH (n) WHERE n.module IS NOT NULL "
-                    "RETURN DISTINCT n.module AS module, count(n) AS count "
-                    "ORDER BY count DESC SKIP $offset LIMIT $limit",
-                    {"offset": offset, "limit": limit},
-                )
-                seen = {m["name"] for m in modules}
-                for r in prop_result:
-                    if r["module"] not in seen:
-                        entry = {"name": r["module"], "source": "property"}
-                        if include_stats:
-                            entry["node_count"] = r["count"]
-                        modules.append(entry)
-                        seen.add(r["module"])
+        No pagination — always returns the complete list.
+        Uses the ontology supported_modules as canonical source;
+        optionally enriches with live Neo4j node counts.
+        """
+        ontology_modules = OntologyLoader().get_supported_modules(profile)
 
-                return {"modules": modules, "total_count": len(modules),
-                        "has_more": len(modules) == limit, "profile": profile}
-        except Exception as e:
-            return {"modules": [], "error": str(e)}
+        # Optional Neo4j enrichment
+        neo4j_counts: Dict[str, int] = {}
+        if self._neo4j and include_stats:
+            try:
+                db = _resolve_db(profile)
+                with self._neo4j.session(database=db) as s:
+                    result = s.run(
+                        "MATCH (n) WHERE n.module IS NOT NULL "
+                        "RETURN toUpper(n.module) AS module, count(n) AS cnt "
+                        "ORDER BY module"
+                    )
+                    for r in result:
+                        neo4j_counts[r["module"].upper()] = r["cnt"]
+            except Exception as e:
+                logger.warning("list_modules: Neo4j stats query failed: %s", e)
+
+        modules = []
+        for name in ontology_modules:
+            entry: Dict[str, Any] = {"name": name}
+            if include_stats:
+                entry["node_count"] = neo4j_counts.get(name.upper(), 0)
+            modules.append(entry)
+
+        return {"modules": modules, "total_count": len(modules), "profile": profile}
 
     def get_distribution(self, dimension: str, profile: str = "illd",
                          label: Optional[str] = None) -> Dict:

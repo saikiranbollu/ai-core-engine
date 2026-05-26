@@ -30,9 +30,22 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path as _Path
 from typing import Any, Dict, List, Optional
 
+import yaml as _yaml
+
 logger = logging.getLogger(__name__)
+
+# Config-driven default alpha (MEG_SW-308)
+try:
+    _cfg_path = _Path(__file__).resolve().parents[2] / "src" / "HybridRAG" / "config" / "storage_config.yaml"
+    with open(_cfg_path, "r", encoding="utf-8") as _fh:
+        _DEFAULT_SEARCH_ALPHA: float = float(
+            _yaml.safe_load(_fh).get("hybrid_search", {}).get("default_alpha", 0.6)
+        )
+except Exception:
+    _DEFAULT_SEARCH_ALPHA = 0.6
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -217,7 +230,7 @@ async def stream_hybrid_search(
     include_relationships: bool = False,
     filter_by_module: Optional[str] = None,
     workspace_id: str = "illd",
-    alpha: float = 0.6,
+    alpha: float = _DEFAULT_SEARCH_ALPHA,
     enhancer=None,
     reranker=None,
 ) -> Dict[str, Any]:
@@ -237,7 +250,7 @@ async def stream_hybrid_search(
             data={"complexity": enhanced.complexity.value,
                   "strategy": enhanced.strategy.value})
         effective_query = enhanced.enhanced_query
-        effective_alpha = enhanced.suggested_alpha if alpha == 0.6 else alpha
+        effective_alpha = enhanced.suggested_alpha if alpha == _DEFAULT_SEARCH_ALPHA else alpha
     else:
         effective_query = query
         effective_alpha = alpha

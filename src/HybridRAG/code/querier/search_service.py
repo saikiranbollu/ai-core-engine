@@ -28,6 +28,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .context_builder import (
     AssembledContext, ContextBuilder, ContextBudget, ContextItem, ContextSlot,
 )
+
+# Config-driven default alpha (MEG_SW-308)
+try:
+    from env_config import get_default_search_alpha as _get_default_alpha
+    _DEFAULT_SEARCH_ALPHA = _get_default_alpha()
+except Exception:
+    _DEFAULT_SEARCH_ALPHA = 0.6
 from .context_compressor import ContextCompressor
 from .context_refiner import ContextRefiner
 from .kg_node_utils import (
@@ -234,7 +241,7 @@ class SearchService:
         filter_by_node_type: Optional[List[str]] = None,
         offset: int = 0,
         workspace_id: str = "illd",
-        alpha: float = 0.6,
+        alpha: float = _DEFAULT_SEARCH_ALPHA,
         skip_judge: bool = False,
     ) -> Dict[str, Any]:
         """
@@ -242,7 +249,7 @@ class SearchService:
 
         alpha controls blend:
           0.0 = pure vector (Qdrant)
-          0.6 = default hybrid
+          config default = balanced hybrid
           1.0 = pure graph (Neo4j)
         """
         _qs_t0 = time.perf_counter()
@@ -557,7 +564,7 @@ class SearchService:
         filter_by_node_type: Optional[List[str]] = None,
         offset: int = 0,
         workspace_id: str = "illd",
-        alpha: float = 0.6,
+        alpha: float = _DEFAULT_SEARCH_ALPHA,
     ) -> Dict[str, Any]:
         """Async hybrid search — runs graph and vector stages concurrently."""
         graph_results: List[Dict[str, Any]] = []

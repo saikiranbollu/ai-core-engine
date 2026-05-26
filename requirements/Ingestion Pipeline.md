@@ -315,7 +315,7 @@
 - PRQ: The system shall support manual ingestion trigger via API.
 - Rationale: On-demand
 - Status: IMPLEMENTED
-- Evidence: ingest_file, ingest_module_from_repo, ingest_batch MCP tools (admin tier)
+- Evidence: `IngestionService.ingest_file()` and `IngestionService.ingest_module()` (library API; MCP admin ingest tools were retired in Plan 2 Phase 2 — ad-hoc per-session ingestion now flows through `sandbox_upload`)
 
 #### AICE-ING-082
 
@@ -355,7 +355,7 @@
 - PRQ: Ingestion status shall be queryable: job_id, status (pending/running/completed/failed), progress_percent, errors.
 - Rationale: Monitoring
 - Status: IMPLEMENTED
-- Evidence: ingestion_status MCP tool + PostgreSQL ingestion_jobs table
+- Evidence: PostgreSQL `ingestion_jobs` table consulted via library-level `IngestionService` (no dedicated MCP `ingestion_status` tool; job status is surfaced through observability tools and sandbox APIs)
 
 #### AICE-ING-087
 

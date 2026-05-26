@@ -68,6 +68,22 @@ def _active_profile() -> str:
     return cfg.get("active_instance", "illd")
 
 
+def _config_default_alpha() -> float:
+    """Return the default RRF blend factor from storage_config.yaml."""
+    try:
+        from env_config import get_default_search_alpha
+        return get_default_search_alpha()
+    except Exception:
+        pass
+    try:
+        from env_config import load_yaml_with_env
+        cfg = load_yaml_with_env(_CONFIG_DIR / "storage_config.yaml")
+    except ImportError:
+        with open(_CONFIG_DIR / "storage_config.yaml", "r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh)
+    return float(cfg.get("hybrid_search", {}).get("default_alpha", 0.6))
+
+
 # ---------------------------------------------------------------------------
 # Result dataclasses
 # ---------------------------------------------------------------------------
@@ -91,7 +107,7 @@ class HybridResult:
     context: str = ""
     graph_traceability: List[dict] = field(default_factory=list)
     elapsed_seconds: float = 0.0
-    alpha: float = 0.5
+    alpha: float = field(default_factory=_config_default_alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +134,12 @@ class HybridRAGOrchestrator:
         self,
         profile: Optional[str] = None,
         module: str = "ADC",
-        alpha: float = 0.5,
+        alpha: Optional[float] = None,
         neo4j_enabled: bool = True,
     ):
         self.profile = profile or _active_profile()
         self.module = module.upper()
-        self.alpha = alpha
+        self.alpha = alpha if alpha is not None else _config_default_alpha()
         self.neo4j_enabled = neo4j_enabled
 
         self._rag_querier = None

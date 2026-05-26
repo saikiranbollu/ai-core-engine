@@ -1,0 +1,271 @@
+# ===========================================================================
+# Datasheet Pin Mux Configuration
+# ===========================================================================
+# Defines available datasheets, their source locations, and extraction
+# parameters for the pin mux pipeline (step 10).
+#
+# Workflow:
+#   1. Pipeline locates PDF (local path or fetches from Bitbucket)
+#   2. table_parser.py extracts pin mux tables from specified page ranges
+#   3. datasheet_kg_builder.py ingests CSVs into Neo4j
+#
+# Adding a new datasheet:
+#   1. Add entry under `datasheets:` with a unique key
+#   2. Specify pdf source (local_path or bitbucket repo + path)
+#   3. Define each device with page_start/page_end
+#   4. Run: python run_pipeline.py --module PORT --only 10 --profile test
+# ===========================================================================
+
+# Path to the table_parser.py tool (used to convert PDF → CSV)
+table_parser_path: "C:/Users/NairSurajRet/Desktop/SampleMCP/table-extractor/table_parser.py"
+
+# Root directory for output CSVs and cached PDFs
+output_dir: "${HYBRIDRAG_ROOT}/../../temp/datasheet"
+
+# ===========================================================================
+# Datasheet definitions
+# ===========================================================================
+datasheets:
+
+  # ── TC4Dx COM datasheet ──────────────────────────────────────────────────
+  tc4dx_com:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC4Dx_COM-DS-v1.2-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC4Dx/Infineon-AURIX-TC4Dx_COM-DS-v1.2-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC4Dx"
+    devices:
+      BGA436_COM:
+        section: "3.2"
+        page_start: 51
+        page_end: 262
+        description: "BGA436_COM pin mux (port 00 through supply)"
+      BGA292_COM:
+        section: "3.3"
+        page_start: 263
+        page_end: 401
+        description: "BGA292_COM pin mux (port 00 through supply)"
+
+  # ── TC49x STD datasheet ──────────────────────────────────────────────────
+  tc49x_std:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC49xN_STD-DS-v0.7-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC49x/Infineon-AURIX-TC49xN_STD-DS-v0.7-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC49x"
+    devices:
+      TC49x_BGA436_STD:
+        section: "3.2"
+        page_start: 51
+        page_end: 275
+        description: "BGA436_STD pin mux (port 00 through supply)"
+      TC49x_BGA292_STD:
+        section: "3.3"
+        page_start: 276
+        page_end: 420
+        description: "BGA292_STD pin mux (port 00 through supply)"
+
+  # ── TC43x RDR datasheet (A-step) ────────────────────────────────────────
+  tc43x_rdr:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/TC43xA-step_RDR_DS_v0.4.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC43x/TC43xA-step_RDR_DS_v0.4.pdf"
+        ref: "master"
+    chip_family: "TC43x"
+    devices:
+      BGA224_RDR:
+        section: "3.2"
+        page_start: 28
+        page_end: 137
+        description: "BGA224_RDR pin mux"
+
+  # ── TC44x COM datasheet ──────────────────────────────────────────────────
+  tc44x_com:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC44x_COM-DS-v0.6-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC44x/Infineon-AURIX-TC44x_COM-DS-v0.6-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC44x"
+    devices:
+      TC44x_BGA292_COM:
+        section: "3.2"
+        page_start: 21
+        page_end: 184
+        description: "BGA292_COM pin mux"
+
+  # ── TC44x STD datasheet ──────────────────────────────────────────────────
+  tc44x_std:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC44x_STD-DS-v0.6-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC44x/Infineon-AURIX-TC44x_STD-DS-v0.6-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC44x"
+    devices:
+      TC44x_BGA292_STD:
+        section: "3.1"
+        page_start: 29
+        page_end: 154
+        description: "BGA292_STD pin mux"
+      TC44x_BGA224_STD:
+        section: "3.2"
+        page_start: 158
+        page_end: 272
+        description: "BGA224_STD pin mux"
+      TC44x_BGA188_STD:
+        section: "3.3"
+        page_start: 274
+        page_end: 397
+        description: "BGA188_STD pin mux"
+
+  # ── TC45x RDR datasheet ──────────────────────────────────────────────────
+  tc45x_rdr:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC45x_RDR-DS-v1.0-PUBLIC-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC45x/Infineon-AURIX-TC45x_RDR-DS-v1.0-EN_US/Infineon-AURIX-TC45x_RDR-DS-v1.0-EN_US/Infineon-AURIX-TC45x_RDR-DS-v1.0-PUBLIC-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC45x"
+    devices:
+      TC45x_BGA292_RDR:
+        section: "3.2"
+        page_start: 21
+        page_end: 123
+        description: "BGA292_RDR pin mux"
+
+  # ── TC46x STD datasheet ──────────────────────────────────────────────────
+  tc46x_std:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC46x_STD-DS-v0.7-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC46x/Infineon-AURIX-TC46x_STD-DS-v0.7-EN_US/Infineon-AURIX-TC46x_STD-DS-v0.7-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC46x"
+    devices:
+      TC46x_BGA436_STD:
+        section: "3.2"
+        page_start: 26
+        page_end: 215
+        description: "BGA436_STD pin mux"
+      TC46x_BGA292_STD:
+        section: "3.3"
+        page_start: 228
+        page_end: 377
+        description: "BGA292_STD pin mux"
+      TC46x_BGA224_STD:
+        section: "3.4"
+        page_start: 386
+        page_end: 545
+        description: "BGA224_STD pin mux"
+
+  # ── TC48x COM datasheet ──────────────────────────────────────────────────
+  tc48x_com:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC48x_COM-DS-v1.0-PUBLIC-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC48x/Infineon-AURIX-TC48x_COM-DS-v1.0-EN_US/Infineon-AURIX-TC48x_COM-DS-v1.0-PUBLIC-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC48x"
+    devices:
+      TC48x_BGA436_COM:
+        section: "3.2"
+        page_start: 46
+        page_end: 246
+        description: "BGA436_COM pin mux"
+      TC48x_BGA292_COM:
+        section: "3.3"
+        page_start: 252
+        page_end: 427
+        description: "BGA292_COM pin mux"
+
+  # ── TC48x STD datasheet ──────────────────────────────────────────────────
+  tc48x_std:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC48x_STD-DS-v1.0-PUBLIC-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC48x/Infineon-AURIX-TC48x_STD-DS-v1.0-EN_US/Infineon-AURIX-TC48x_STD-DS-v1.0-PUBLIC-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC48x"
+    devices:
+      TC48x_BGA292_STD:
+        section: "3.2"
+        page_start: 29
+        page_end: 199
+        description: "BGA292_STD pin mux"
+
+  # ── TC4Ex STD datasheet ──────────────────────────────────────────────────
+  tc4ex_std:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC4Ex_STD-DS-v0.6-EN_US.pdf.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC4Ex/Infineon-AURIX-TC4Ex_STD-DS-v0.6-EN_US.pdf.pdf"
+        ref: "master"
+    chip_family: "TC4Ex"
+    devices:
+      TC4Ex_BGA224_STD:
+        section: "3.2"
+        page_start: 27
+        page_end: 138
+        description: "BGA224_STD pin mux"
+      TC4Ex_BGA292_STD:
+        section: "3.5"
+        page_start: 138
+        page_end: 514
+        description: "BGA292_STD pin mux"
+
+  # ── TC4Zx COM datasheet ──────────────────────────────────────────────────
+  tc4zx_com:
+    pdf:
+      local_path: "${HYBRIDRAG_ROOT}/../../temp/datasheet/Infineon-AURIX-TC4Zx_COM-DS-v0.6-EN_US.pdf"
+      bitbucket:
+        project: "ATVA3GMCAL"
+        repo: "aurix3g_sw_mcal_tc4xx_references"
+        path: "01_Hardware/02_Data_Sheet/TC4Zx/Infineon-AURIX-TC4Zx_COM-DS-v0.6-EN_US/Infineon-AURIX-TC4Zx_COM-DS-v0.6-EN_US.pdf"
+        ref: "master"
+    chip_family: "TC4Zx"
+    devices:
+      TC4Zx_BGA436_COM:
+        section: "3.2"
+        page_start: 16
+        page_end: 230
+        description: "BGA436_COM pin mux"
+      TC4Zx_BGA292_COM:
+        section: "3.3"
+        page_start: 236
+        page_end: 411
+        description: "BGA292_COM pin mux"
+
+# ===========================================================================
+# Extraction settings
+# ===========================================================================
+extraction:
+  # Camelot flavor for table detection
+  flavor: "lattice"
+  # CSV naming pattern: {device}_pin_mux.csv
+  csv_suffix: "_pin_mux.csv"
+  # Skip re-extraction if CSV already exists and is newer than PDF
+  cache_csvs: true

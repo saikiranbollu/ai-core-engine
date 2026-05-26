@@ -41,6 +41,8 @@ Thumbs.db
 # Temporary exploration / intermediary folders
 temp_explore/
 temp_intermediary/
+temp_jama_exports/
+demo_sandbox_live.py
 AICE_INTEGRATION_PLAN.md
 *.swp
 *.swo
@@ -51,8 +53,15 @@ references
 # Temp / generated data
 temp/
 data/
-docs/
-tests/
+docs/*
+!docs/EPHEMERAL_SANDBOX.md
+!docs/NODE_SETS_ARCHITECTURE.md
+tests/*
+!tests/unit/
+!tests/integration/
+!tests/conftest.py
+!tests/run_graphrag_evaluation.py
+!tests/graphrag_evaluation_queries.md
 src/HybridRAG/jama-req/
 src/HybridRAG/swa/
 src/HybridRAG/swud/
@@ -71,6 +80,7 @@ src/HybridRAG/logs/
 .temp_explore/
 .temp_intermediary/
 
+.cache/
 
 archive*/
 tmp*/

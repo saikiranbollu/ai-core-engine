@@ -6,13 +6,16 @@ Transforms parser outputs into Neo4j nodes and edges for the ILLD profile.
 Uses the ontology.yaml v2.0.0 ILLD profile as schema reference.
 
 All 6 data sources are supported:
-    1. HW Spec (hw_spec_parser)    → HardwareRegister, RegisterField, Interrupt, Error
-    2. Requirements (JamaConnector) → Requirement
-    3. SWA Header (illd_swa_parser) → Function, Struct, StructMember, Enum, EnumValue,
-                                       Typedef, Parameter, ReturnType
-    4. Source Code (c_parser)       → Function call graph (CALLS_INTERNALLY)
-    5. SFR (sfr_parser)             → Register, BitField
-    6. PlantUML (puml_parser)       → enriches Function nodes with sequence patterns
+        1. HW Spec (hw_spec_parser)    → HardwareRegister, RegisterField, Interrupt, Error,
+                                           HwConstraint, ProgrammingSequence, SequenceStep,
+                                           HardwareSubModule
+        2. Requirements (JamaConnector) → Requirement
+        3. SWA Header (illd_swa_parser) → Function (origin=arch_only|impl_only|both),
+                                           Struct, StructMember, Enum, EnumValue,
+                                           Typedef, Parameter, ReturnType
+        4. Source Code (c_parser)       → Function call graph (CALLS_INTERNALLY),
+                                           ACCESSES_REGISTER edges
+        5. SFR (sfr_parser)             → HardwareRegister, RegisterField (collapsed v3.0)
 
 Connection is managed via neo4j_manager.py (storage_config.yaml).
 
@@ -252,6 +255,31 @@ class ILLDKGBuilder:
             return json.dumps(value, default=str)
         return str(value)
 
+    # -- ID helpers (v3.0 module-qualified) --------------------------------
+
+    def _hwreg_id(self, name: str) -> str:
+        return f"HWREG_{self.module}_{name}"
+
+    def _regfield_id(self, register: str, name: str) -> str:
+        return f"REGFIELD_{self.module}_{register}_{name}"
+
+    @staticmethod
+    def _signature_hash(name: str, return_type: Optional[str],
+                        parameters: list) -> str:
+        """Stable short hash of a function signature.
+
+        Used to dedup arch vs impl declarations of the same function and to
+        flag silent ABI drifts between Ifx<FB>_swa.h and the inc header.
+        """
+        import hashlib
+        norm_params = []
+        for p in parameters or []:
+            if isinstance(p, dict):
+                ptype = (p.get("type") or "").strip()
+                norm_params.append(ptype)
+        sig = f"{name}|{(return_type or '').strip()}|{','.join(norm_params)}"
+        return hashlib.sha1(sig.encode("utf-8")).hexdigest()[:12]
+
     # =====================================================================
     # 1. SWA Header ingestion (illd_swa_parser output)
     # =====================================================================
@@ -289,15 +317,22 @@ class ILLDKGBuilder:
                 continue
 
             fid = f"FUNC_{fname}"
+            sig_hash = self._signature_hash(
+                fname, func.get("return_type"), func.get("parameters") or []
+            )
+            trace_info = func.get("trace_info") or {}
+            req_ids = trace_info.get("requirements") or []
             node = {
                 "id": fid,
                 "name": fname,
+                "signature_hash": sig_hash,
                 "brief": self._safe_str(func.get("brief")),
                 "purpose": self._safe_str(func.get("purpose") or func.get("detailed_description")),
                 "return_type": self._safe_str(func.get("return_type")),
                 "source": "SWA_Functions",
                 "module": mod,
                 "label": fname,
+                "traces": self._serialize_complex(req_ids) if req_ids else None,
             }
             if source_file:
                 node["source_file"] = source_file
@@ -349,6 +384,24 @@ class ILLDKGBuilder:
                 unique_ret.append(r)
 
         self._merge_nodes("Function", "id", func_nodes)
+        # v3.0: append source_file to Function.source_files list and tag origin.
+        if source_file and func_nodes:
+            origin = "impl_only" if "_inc" in source_file.lower() or source_file.lower().endswith(".c") else "arch_only"
+            for chunk in self._chunked(func_nodes):
+                self._write(
+                    "UNWIND $items AS p "
+                    "MATCH (n:Function {id: p.id}) "
+                    "WITH n, p "
+                    "SET n.source_files = CASE "
+                    "  WHEN n.source_files IS NULL THEN [$src] "
+                    "  WHEN $src IN n.source_files THEN n.source_files "
+                    "  ELSE n.source_files + [$src] END, "
+                    "    n.origin = CASE "
+                    "  WHEN n.origin IS NULL OR n.origin = $origin THEN $origin "
+                    "  ELSE 'both' END",
+                    {"items": [{"id": x["id"]} for x in chunk],
+                     "src": source_file, "origin": origin},
+                )
         self._merge_nodes("Parameter", "id", param_nodes)
         self._merge_nodes("ReturnType", "id", unique_ret)
         self._merge_edges("HAS_PARAMETER", "Function", "id", "Parameter", "id",
@@ -630,7 +683,14 @@ class ILLDKGBuilder:
 
     def ingest_sfr(self, sfr_data: dict):
         """
-        Ingest SFR parser output → Register + BitField nodes + HAS_BITFIELD edges.
+        Ingest SFR parser output → HardwareRegister + RegisterField nodes.
+
+        v3.0 collapse: SFR no longer creates the legacy :Register / :BitField
+        labels.  Instead it produces the same labels as the HW-spec ingestor
+        so that SFR and HWA rows for the same physical register MERGE into a
+        single node (keyed by ``HWREG_{module}_{name}`` / ``REGFIELD_{module}_{reg}_{name}``).
+        ``sfr_source_file`` is set on every node so downstream queries can
+        attribute the row to the originating SFR .py file.
         """
         if not sfr_data:
             logger.warning("No SFR data to ingest.")
@@ -638,20 +698,24 @@ class ILLDKGBuilder:
 
         logger.info("Ingesting SFR data …")
         registers_dict = sfr_data.get("registers", {})
-        mod = self.module  # Always use pipeline module, not parser-derived
+        sfr_source_file = sfr_data.get("file") or sfr_data.get("source_file")
+        mod = self.module
 
-        reg_nodes = []
-        bf_nodes = []
-        reg_bf_edges = []
+        hwreg_nodes: List[dict] = []
+        field_nodes: List[dict] = []
+        has_field_edges: List[dict] = []
 
         for reg_name, bitfields in registers_dict.items():
             if not isinstance(bitfields, list):
                 continue
 
-            reg_id = f"REG_{reg_name}"
-            reg_nodes.append({
-                "register_name": reg_name,
+            rid = self._hwreg_id(reg_name)
+            hwreg_nodes.append({
+                "id": rid,
+                "name": reg_name,
                 "module": mod,
+                "sfr_source_file": self._safe_str(sfr_source_file),
+                "label": reg_name,
             })
 
             for bf in bitfields:
@@ -661,27 +725,37 @@ class ILLDKGBuilder:
                 if not bfname:
                     continue
 
-                bfid = f"BITFIELD_{reg_name}_{bfname}"
-                bf_nodes.append({
-                    "id": bfid,
+                fid = self._regfield_id(reg_name, bfname)
+                field_nodes.append({
+                    "id": fid,
                     "name": bfname,
+                    "register": reg_name,
+                    "module": mod,
                     "bit_range": self._safe_str(bf.get("bit_range")),
+                    "bits": self._safe_str(bf.get("bit_range") or bf.get("bits")),
                     "width": self._safe_str(bf.get("width")),
+                    "reset_value": self._safe_str(bf.get("reset_value")),
                     "description": self._safe_str(bf.get("description")),
-                    "label": self._safe_str(bf.get("label") or f"{bfname} {bf.get('bit_range', '')}"),
+                    "sfr_source_file": self._safe_str(sfr_source_file),
+                    "label": self._safe_str(
+                        bf.get("label") or f"{bfname} {bf.get('bit_range', '')}"
+                    ),
                 })
-                reg_bf_edges.append({
-                    "from_key": reg_name,
-                    "to_key": bfid,
+                has_field_edges.append({
+                    "from_key": rid,
+                    "to_key": fid,
                 })
 
-        self._merge_nodes("Register", "register_name", reg_nodes)
-        self._merge_nodes("BitField", "id", bf_nodes)
-        self._merge_edges("HAS_BITFIELD", "Register", "register_name",
-                          "BitField", "id", reg_bf_edges)
+        self._merge_nodes("HardwareRegister", "id", hwreg_nodes)
+        self._merge_nodes("RegisterField", "id", field_nodes)
+        self._merge_edges("HAS_FIELD", "HardwareRegister", "id",
+                          "RegisterField", "id", has_field_edges)
 
-        logger.info("SFR ingestion complete: %d registers, %d bitfields",
-                     len(reg_nodes), len(bf_nodes))
+        logger.info(
+            "SFR ingestion complete: %d HardwareRegisters, %d RegisterFields"
+            " (sfr_source_file=%s)",
+            len(hwreg_nodes), len(field_nodes), sfr_source_file,
+        )
 
     # =====================================================================
     # 3. HW Spec ingestion (hw_spec_parser output)
@@ -690,13 +764,20 @@ class ILLDKGBuilder:
     def ingest_hw_spec(self, hw_data: dict):
         """
         Ingest HW spec parser output → HardwareRegister, RegisterField,
-        Interrupt, Error nodes + HAS_FIELD edges.
+        Interrupt, Error nodes + HAS_FIELD / HAS_ACCESS_TYPE / LOCATED_AT /
+        INTERRUPT_TRIGGERS / DETECTED_BY / BITFIELD_CONTROLS edges.
+
+        v3.0: HardwareRegister / RegisterField IDs are module-qualified so
+        that SFR and HWA rows merge into the same node; ``hwa_source_doc``
+        is recorded on every node sourced from the HW manual.
         """
         if not hw_data:
             logger.warning("No HW spec data to ingest.")
             return
 
         logger.info("Ingesting HW spec data …")
+
+        hwa_source_doc = (hw_data.get("metadata") or {}).get("source_file")
 
         # --- HardwareRegister nodes ---
         hw_regs = hw_data.get("registers", [])
@@ -708,9 +789,15 @@ class ILLDKGBuilder:
             if not rname:
                 continue
             hwreg_nodes.append({
-                "id": f"HWREG_{rname}",
+                "id": self._hwreg_id(rname),
                 "name": rname,
+                "module": self.module,
                 "description": self._safe_str(reg.get("long_name")),
+                "address": self._safe_str(reg.get("address")),
+                "offset": self._safe_str(reg.get("offset")),
+                "width": self._safe_str(reg.get("width")),
+                "reset_value": self._safe_str(reg.get("reset_value")),
+                "hwa_source_doc": self._safe_str(hwa_source_doc),
                 "label": rname,
             })
 
@@ -728,18 +815,23 @@ class ILLDKGBuilder:
             if not fname or not parent:
                 continue
 
-            fid = f"REGFIELD_{parent}_{fname}"
+            fid = self._regfield_id(parent, fname)
             field_nodes.append({
                 "id": fid,
                 "name": fname,
+                "register": parent,
+                "module": self.module,
                 "bits": self._safe_str(f.get("bits")),
+                "bit_range": self._safe_str(f.get("bits")),
+                "width": self._safe_str(f.get("width")),
+                "reset_value": self._safe_str(f.get("reset_value")),
                 "access": self._safe_str(f.get("type")),
                 "description": self._safe_str(f.get("description")),
-                "register": parent,
+                "hwa_source_doc": self._safe_str(hwa_source_doc),
                 "label": f"{fname} [{f.get('bits', '')}]",
             })
             has_field_edges.append({
-                "from_key": f"HWREG_{parent}",
+                "from_key": self._hwreg_id(parent),
                 "to_key": fid,
             })
 
@@ -826,7 +918,7 @@ class ILLDKGBuilder:
                     "label": access_type,
                 })
 
-            fid = f"REGFIELD_{parent}_{fname_f}"
+            fid = self._regfield_id(parent, fname_f)
             access_edges.append({
                 "from_key": fid,
                 "to_key": aid,
@@ -849,7 +941,7 @@ class ILLDKGBuilder:
             if not rname or not offset:
                 continue
 
-            mlid = f"MEMLOC_{rname}"
+            mlid = f"MEMLOC_{self.module}_{rname}"
             if mlid not in seen_memloc:
                 seen_memloc.add(mlid)
                 memloc_nodes.append({
@@ -862,7 +954,7 @@ class ILLDKGBuilder:
                 })
 
             located_edges.append({
-                "from_key": f"HWREG_{rname}",
+                "from_key": self._hwreg_id(rname),
                 "to_key": mlid,
                 "offset": offset,
             })
@@ -1007,9 +1099,9 @@ class ILLDKGBuilder:
                     "module": self.module,
                 })
 
-            # Link bitfield → operation
+            # Link RegisterField → operation
             if register:
-                bfid = f"BITFIELD_{register}_{field_name}"
+                bfid = self._regfield_id(register, field_name)
                 enable_val = fe.get("enable_value", "")
                 bf_op_edges.append({
                     "from_key": bfid,
@@ -1043,7 +1135,7 @@ class ILLDKGBuilder:
                             "label": fname_f,
                             "module": self.module,
                         })
-                    bfid_key = f"BITFIELD_{parent}_{fname_f}" if parent else None
+                    bfid_key = self._regfield_id(parent, fname_f) if parent else None
                     if bfid_key:
                         bf_op_edges.append({
                             "from_key": bfid_key,
@@ -1053,7 +1145,9 @@ class ILLDKGBuilder:
                     break  # Only match first suffix
 
         self._merge_nodes("Operation", "id", operation_nodes)
-        self._merge_edges("BITFIELD_CONTROLS", "BitField", "id",
+        # v3.0: BitField is collapsed into RegisterField; edge source label
+        # is now :RegisterField (BITFIELD_CONTROLS rel name kept for compatibility).
+        self._merge_edges("BITFIELD_CONTROLS", "RegisterField", "id",
                           "Operation", "id", bf_op_edges, ["control_semantics"])
 
         logger.info("HW spec ingestion complete: %d HW registers, %d fields, "
@@ -1108,6 +1202,74 @@ class ILLDKGBuilder:
         logger.info("Requirements ingestion complete: %d nodes", len(req_nodes))
 
     # =====================================================================
+    # 4b. SRS .dox ingestion (srs_dox_parser output, v3.0)
+    # =====================================================================
+
+    def ingest_srs(self, srs_data: dict):
+        """Ingest iLLD SRS .dox output → :Requirement nodes + IMPLEMENTS /
+        IMPLEMENTED_BY edges (Function ↔ Requirement) from ``@tr{...}`` links.
+        """
+        if not srs_data:
+            logger.warning("No SRS data to ingest.")
+            return
+
+        source_file = (srs_data.get("metadata") or {}).get("source_file")
+        reqs = srs_data.get("requirements") or []
+        traces = srs_data.get("traces") or []
+        logger.info(
+            "Ingesting SRS %s: %d requirements, %d trace links …",
+            source_file, len(reqs), len(traces),
+        )
+
+        req_nodes: List[dict] = []
+        for r in reqs:
+            if not isinstance(r, dict):
+                continue
+            rid = r.get("id")
+            if not rid:
+                continue
+            req_nodes.append({
+                "requirement_id": rid,
+                "name": r.get("name") or rid,
+                "description": r.get("description") or "",
+                "source_file": self._safe_str(r.get("source_file") or source_file),
+                "module": self.module,
+            })
+        self._merge_nodes("Requirement", "requirement_id", req_nodes)
+
+        impl_edges: List[dict] = []
+        for t in traces:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function")
+            rid = t.get("requirement_id")
+            if not fn or not rid:
+                continue
+            impl_edges.append({
+                "from_key": f"FUNC_{fn}",
+                "to_key": rid,
+                "trace_description": self._safe_str(t.get("description")),
+                "trace_source": source_file,
+            })
+        self._merge_edges(
+            "IMPLEMENTS", "Function", "id", "Requirement", "requirement_id",
+            impl_edges, ["trace_description", "trace_source"],
+        )
+        # Reverse direction for symmetric queries.
+        impl_by_edges = [
+            {"from_key": e["to_key"], "to_key": e["from_key"]} for e in impl_edges
+        ]
+        self._merge_edges(
+            "IMPLEMENTED_BY", "Requirement", "requirement_id", "Function", "id",
+            impl_by_edges,
+        )
+
+        logger.info(
+            "SRS ingestion complete: %d requirements, %d IMPLEMENTS edges",
+            len(req_nodes), len(impl_edges),
+        )
+
+    # =====================================================================
     # 5. Source Code ingestion (c_parser output)
     # =====================================================================
 
@@ -1129,6 +1291,13 @@ class ILLDKGBuilder:
         functions = c_data.get("functions", {})
 
         call_edges = []
+        access_edges: List[dict] = []  # v3.0 ACCESSES_REGISTER
+
+        ACCESS_TO_KIND = {
+            "R": "read", "r": "read",
+            "W": "write", "w": "write",
+            "RW": "read_write", "rw": "read_write",
+        }
 
         for func_name, func_info in functions.items():
             if not isinstance(func_info, dict):
@@ -1147,10 +1316,48 @@ class ILLDKGBuilder:
                             "call_site_line": call.get("line"),
                         })
 
+            # v3.0: ACCESSES_REGISTER from c_parser register_accesses
+            for ra in func_info.get("register_accesses") or []:
+                if not isinstance(ra, dict):
+                    continue
+                rname = ra.get("register")
+                if not rname:
+                    continue
+                access_edges.append({
+                    "from_key": fid,
+                    "to_key": self._hwreg_id(rname),
+                    "access_kind": ACCESS_TO_KIND.get(
+                        ra.get("access_type", ""), "unknown"),
+                    "call_site_line": ra.get("line"),
+                    "field": ra.get("field"),
+                })
+
         self._merge_edges("CALLS_INTERNALLY", "Function", "id", "Function", "id",
                           call_edges, ["call_site_line"])
+        self._merge_edges("ACCESSES_REGISTER", "Function", "id",
+                          "HardwareRegister", "id", access_edges,
+                          ["access_kind", "call_site_line", "field"])
 
-        logger.info("Source ingestion complete: %d call edges", len(call_edges))
+        # Tag functions that touched .c sources so 'origin' is computed correctly.
+        if source_file and functions:
+            self._write(
+                "UNWIND $names AS fn "
+                "MATCH (n:Function {id: 'FUNC_' + fn}) "
+                "SET n.source_files = CASE "
+                "  WHEN n.source_files IS NULL THEN [$src] "
+                "  WHEN $src IN n.source_files THEN n.source_files "
+                "  ELSE n.source_files + [$src] END, "
+                "    n.origin = CASE "
+                "  WHEN n.origin IS NULL THEN 'impl_only' "
+                "  WHEN n.origin = 'arch_only' THEN 'both' "
+                "  ELSE n.origin END",
+                {"names": list(functions.keys()), "src": source_file},
+            )
+
+        logger.info(
+            "Source ingestion complete: %d call edges, %d register-access edges",
+            len(call_edges), len(access_edges),
+        )
 
     # =====================================================================
     # 6. PlantUML ingestion (puml_parser output)
@@ -1197,6 +1404,226 @@ class ILLDKGBuilder:
         logger.info("PUML ingestion complete: enriched %d function nodes", enriched)
 
     # =====================================================================
+    # 7. HW Constraints / Programming Sequences / Sub-modules (v3.0)
+    # =====================================================================
+
+    def ingest_hw_constraints(self, hw_data: dict):
+        """Create :HwConstraint nodes + :HAS_CONSTRAINT edges."""
+        constraints = (hw_data or {}).get("hw_constraints") or []
+        if not constraints:
+            return
+
+        logger.info("Ingesting %d HW constraints …", len(constraints))
+        hwa_source_doc = (hw_data.get("metadata") or {}).get("source_file")
+
+        # Build field→parent_register lookup for RegisterField targets
+        field_parent: Dict[str, str] = {}
+        for f in hw_data.get("fields", []) or []:
+            if isinstance(f, dict) and f.get("name"):
+                field_parent.setdefault(f["name"], f.get("parent_register") or "")
+
+        nodes: List[dict] = []
+        edges_reg: List[dict] = []
+        edges_field: List[dict] = []
+        edges_op: List[dict] = []
+
+        for idx, c in enumerate(constraints):
+            if not isinstance(c, dict):
+                continue
+            kind = c.get("kind") or "other"
+            target_label = c.get("target_label") or "HardwareRegister"
+            target_name = c.get("target_name")
+            if not target_name:
+                continue
+            cid = f"HWCON_{self.module}_{target_name}_{kind}_{idx:03d}"
+            nodes.append({
+                "id": cid,
+                "name": c.get("name") or cid,
+                "kind": kind,
+                "value": self._safe_str(c.get("value")),
+                "unit": self._safe_str(c.get("unit")),
+                "condition": self._safe_str(c.get("condition")),
+                "source_section": self._safe_str(c.get("source_section")),
+                "hwa_source_doc": self._safe_str(hwa_source_doc),
+                "module": self.module,
+                "label": f"{kind}:{target_name}",
+            })
+
+            if target_label == "RegisterField":
+                parent = field_parent.get(target_name)
+                if parent:
+                    edges_field.append({
+                        "from_key": self._regfield_id(parent, target_name),
+                        "to_key": cid,
+                    })
+            elif target_label == "Operation":
+                edges_op.append({
+                    "from_key": f"OPERATION_{target_name}",
+                    "to_key": cid,
+                })
+            else:
+                edges_reg.append({
+                    "from_key": self._hwreg_id(target_name),
+                    "to_key": cid,
+                })
+
+        self._merge_nodes("HwConstraint", "id", nodes)
+        self._merge_edges("HAS_CONSTRAINT", "HardwareRegister", "id",
+                          "HwConstraint", "id", edges_reg)
+        self._merge_edges("HAS_CONSTRAINT", "RegisterField", "id",
+                          "HwConstraint", "id", edges_field)
+        self._merge_edges("HAS_CONSTRAINT", "Operation", "id",
+                          "HwConstraint", "id", edges_op)
+        logger.info(
+            "HW constraints complete: %d nodes (%d reg, %d field, %d op edges)",
+            len(nodes), len(edges_reg), len(edges_field), len(edges_op),
+        )
+
+    def ingest_programming_sequences(self, hw_data: dict):
+        """Create :ProgrammingSequence + :SequenceStep nodes with HAS_STEP,
+        NEXT_STEP, STEP_USES_REGISTER edges."""
+        seqs = (hw_data or {}).get("programming_sequences") or []
+        if not seqs:
+            return
+
+        logger.info("Ingesting %d programming sequences …", len(seqs))
+        hwa_source_doc = (hw_data.get("metadata") or {}).get("source_file")
+
+        seq_nodes: List[dict] = []
+        step_nodes: List[dict] = []
+        has_step_edges: List[dict] = []
+        next_step_edges: List[dict] = []
+        step_reg_edges: List[dict] = []
+        step_field_edges: List[dict] = []
+
+        for seq in seqs:
+            if not isinstance(seq, dict):
+                continue
+            use_case = seq.get("use_case") or "Other"
+            seq_name = seq.get("name") or use_case
+            seq_id = f"PSEQ_{self.module}_{use_case}"
+            seq_nodes.append({
+                "id": seq_id,
+                "name": seq_name,
+                "use_case": use_case,
+                "description": self._safe_str(seq.get("description")),
+                "step_count": seq.get("step_count") or len(seq.get("steps") or []),
+                "source_section": self._safe_str(seq.get("source_section")),
+                "hwa_source_doc": self._safe_str(hwa_source_doc),
+                "module": self.module,
+                "label": seq_name,
+            })
+
+            prev_step_id: Optional[str] = None
+            for step in seq.get("steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                order = int(step.get("order") or 0)
+                step_id = f"PSTEP_{self.module}_{use_case}_{order:02d}"
+                step_nodes.append({
+                    "id": step_id,
+                    "name": self._safe_str(step.get("name")) or f"step {order}",
+                    "order": order,
+                    "step_type": self._safe_str(step.get("step_type")) or "Other",
+                    "action": self._safe_str(step.get("action")),
+                    "expected_value": self._safe_str(step.get("expected_value")),
+                    "timeout": self._safe_str(step.get("timeout")),
+                    "module": self.module,
+                    "label": f"{order}:{step.get('step_type', '')}",
+                })
+                has_step_edges.append({
+                    "from_key": seq_id,
+                    "to_key": step_id,
+                    "order": order,
+                })
+                if prev_step_id is not None:
+                    next_step_edges.append({
+                        "from_key": prev_step_id,
+                        "to_key": step_id,
+                    })
+                prev_step_id = step_id
+
+                reg = step.get("touched_register")
+                field = step.get("touched_field")
+                if reg and field:
+                    step_field_edges.append({
+                        "from_key": step_id,
+                        "to_key": self._regfield_id(reg, field),
+                    })
+                elif reg:
+                    step_reg_edges.append({
+                        "from_key": step_id,
+                        "to_key": self._hwreg_id(reg),
+                    })
+
+        self._merge_nodes("ProgrammingSequence", "id", seq_nodes)
+        self._merge_nodes("SequenceStep", "id", step_nodes)
+        self._merge_edges("HAS_STEP", "ProgrammingSequence", "id",
+                          "SequenceStep", "id", has_step_edges, ["order"])
+        self._merge_edges("NEXT_STEP", "SequenceStep", "id",
+                          "SequenceStep", "id", next_step_edges)
+        self._merge_edges("STEP_USES_REGISTER", "SequenceStep", "id",
+                          "HardwareRegister", "id", step_reg_edges)
+        self._merge_edges("STEP_USES_REGISTER", "SequenceStep", "id",
+                          "RegisterField", "id", step_field_edges)
+        logger.info(
+            "Programming sequences complete: %d sequences, %d steps",
+            len(seq_nodes), len(step_nodes),
+        )
+
+    def ingest_submodules(self, hw_data: dict):
+        """Create :HardwareSubModule nodes + :PART_OF_SUBMODULE edges from
+        HardwareRegister back to its sub-module instance."""
+        subs = (hw_data or {}).get("submodules") or []
+        if not subs:
+            return
+
+        logger.info("Ingesting %d hardware sub-modules …", len(subs))
+        hwa_source_doc = (hw_data.get("metadata") or {}).get("source_file")
+
+        sub_nodes: List[dict] = []
+        part_edges: List[dict] = []
+        registers = hw_data.get("registers") or []
+
+        for s in subs:
+            if not isinstance(s, dict):
+                continue
+            sname = s.get("name")
+            if not sname:
+                continue
+            sub_id = f"HWSUB_{self.module}_{sname}"
+            sub_nodes.append({
+                "id": sub_id,
+                "name": sname,
+                "module": self.module,
+                "base_address": self._safe_str(s.get("base_address")),
+                "description": self._safe_str(s.get("description")),
+                "hwa_source_doc": self._safe_str(hwa_source_doc),
+                "label": sname,
+            })
+
+            # Heuristic: any register whose name starts with the sub-module
+            # name is part of that sub-module instance.
+            prefix = sname.upper()
+            for reg in registers:
+                if not isinstance(reg, dict):
+                    continue
+                rname = reg.get("name")
+                if rname and rname.upper().startswith(prefix):
+                    part_edges.append({
+                        "from_key": self._hwreg_id(rname),
+                        "to_key": sub_id,
+                    })
+
+        self._merge_nodes("HardwareSubModule", "id", sub_nodes)
+        self._merge_edges("PART_OF_SUBMODULE", "HardwareRegister", "id",
+                          "HardwareSubModule", "id", part_edges)
+        logger.info(
+            "Sub-modules complete: %d nodes, %d PART_OF_SUBMODULE edges",
+            len(sub_nodes), len(part_edges),
+        )
+
+    # =====================================================================
     # 8. Cross-source relationships
     # =====================================================================
 
@@ -1214,16 +1641,48 @@ class ILLDKGBuilder:
         logger.info("Creating cross-source relationships …")
 
         # --- IMPLEMENTS + IMPLEMENTED_BY ---
-        # Match functions to requirements via \\trace{} references stored on functions
-        # or via Jama requirement IDs that appear in function names/descriptions
-        implements_cypher = (
-            "MATCH (f:Function) WHERE f.module = $module "
+        # v3.0: Prefer explicit \trace{} tags carried on Function.traces.
+        # Heuristic name-matching is retained as a fallback for functions
+        # without trace tags, but is gated behind a logger.info note.
+        trace_cypher = (
+            "MATCH (f:Function) "
+            "WHERE f.module = $module AND f.traces IS NOT NULL "
+            "WITH f, apoc.convert.fromJsonList(f.traces) AS reqs "
+            "UNWIND reqs AS req_id "
             "MATCH (r:Requirement) "
-            "WHERE f.name CONTAINS r.name OR r.description CONTAINS f.name "
+            "  WHERE r.requirement_id = req_id OR r.global_id = req_id "
             "MERGE (f)-[:IMPLEMENTS]->(r) "
             "MERGE (r)-[:IMPLEMENTED_BY]->(f)"
         )
-        self._write(implements_cypher, {"module": self.module})
+        try:
+            self._write(trace_cypher, {"module": self.module})
+        except Exception as exc:
+            # APOC may be unavailable — fall back to a plain JSON parse in Python.
+            logger.warning("APOC fromJsonList unavailable (%s); using fallback.", exc)
+            funcs = self._read(
+                "MATCH (f:Function) WHERE f.module = $module "
+                "AND f.traces IS NOT NULL "
+                "RETURN f.id AS id, f.traces AS traces",
+                {"module": self.module},
+            )
+            edges = []
+            for row in funcs:
+                try:
+                    reqs = json.loads(row["traces"]) if row["traces"] else []
+                except (TypeError, ValueError):
+                    reqs = []
+                for rq in reqs:
+                    edges.append({"from_key": row["id"], "to_key": rq})
+            for chunk in self._chunked(edges):
+                self._write(
+                    "UNWIND $edges AS e "
+                    "MATCH (f:Function {id: e.from_key}) "
+                    "MATCH (r:Requirement) "
+                    "  WHERE r.requirement_id = e.to_key OR r.global_id = e.to_key "
+                    "MERGE (f)-[:IMPLEMENTS]->(r) "
+                    "MERGE (r)-[:IMPLEMENTED_BY]->(f)",
+                    {"edges": chunk},
+                )
 
         # Count IMPLEMENTS
         impl_count = self._read(

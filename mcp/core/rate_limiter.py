@@ -17,12 +17,15 @@ import logging
 import os
 from typing import Optional
 
+from .config import get_settings as _get_settings
+
 logger = logging.getLogger("aice_mcp.rate_limiter")
 
 # Rate limit defaults (configurable via env vars)
-RATE_LIMIT_SEARCH = os.environ.get("RATE_LIMIT_SEARCH", "60/minute")
-RATE_LIMIT_ADMIN = os.environ.get("RATE_LIMIT_ADMIN", "10/minute")
-RATE_LIMIT_INGESTION = os.environ.get("RATE_LIMIT_INGESTION", "5/minute")
+_settings = _get_settings()
+RATE_LIMIT_SEARCH = _settings.rate_limit_search
+RATE_LIMIT_ADMIN = _settings.rate_limit_admin
+RATE_LIMIT_INGESTION = _settings.rate_limit_ingestion
 
 # Tool → rate limit category mapping
 _ADMIN_TOOLS = {

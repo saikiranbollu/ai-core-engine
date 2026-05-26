@@ -79,21 +79,31 @@ logger = logging.getLogger("illd_pipeline")
 
 def _import_parsers():
     """Import ILLD parsers from IngestionPipeline."""
-    from src.IngestionPipeline.parsers import (
+    from src.IngestionPipeline.Parsers import (
         illd_swa_parser,
         c_parser,
-        regdef_parser,
+        sfr_parser,
         puml_parser,
         hw_spec_parser,
-        pdf_parser,
+        srs_dox_parser,
     )
+    # pdf_parser pulls in heavy optional deps (PyMuPDF, langchain_openai).
+    # Import it lazily so steps that don't need it can still run.
+    try:
+        from src.IngestionPipeline.Parsers import pdf_parser
+    except ImportError as exc:  # pragma: no cover - optional dep
+        logging.getLogger(__name__).warning(
+            "pdf_parser unavailable (%s); HW PDF step will be skipped.", exc
+        )
+        pdf_parser = None
     return {
         "swa": illd_swa_parser,
         "c": c_parser,
-        "sfr": regdef_parser,
+        "sfr": sfr_parser,
         "puml": puml_parser,
         "hw_spec": hw_spec_parser,
         "pdf": pdf_parser,
+        "srs": srs_dox_parser,
     }
 
 
@@ -360,6 +370,32 @@ class RemoteSourceFetcher:
         """Fetch the SFR regdef header from GitLab."""
         path = f"infra/sfr/inc/Ifx{self.module_cap}_regdef.h"
         return self.fetch_gitlab_file(path)
+
+    def fetch_all_srs_dox(self) -> List[Path]:
+        """Fetch ALL Ifx<Module>_srs.dox files for this module from GitLab.
+
+        SRS .dox files live alongside the SWA headers in
+        ``lld/<Module>/doc/arch/input``.  Returns a list of local Paths
+        (may be empty).
+        """
+        remote_dir = f"lld/{self.module_cap}/doc/arch/input"
+        entries = self._gl_list_tree(remote_dir)
+        srs_files = [
+            e for e in entries
+            if e.get("name", "").lower().endswith("_srs.dox")
+        ]
+        if not srs_files:
+            self.logger.warning("No SRS .dox found for module %s", self.module)
+            return []
+
+        results: List[Path] = []
+        for sf in srs_files:
+            match_path = f"{remote_dir}/{sf['name']}"
+            self.logger.info("Fetching SRS: %s", match_path)
+            local = self.fetch_gitlab_file(match_path)
+            if local:
+                results.append(local)
+        return results
 
     def fetch_puml_files(self) -> Optional[Path]:
         """Fetch all .puml files for this module from GitLab.
@@ -827,12 +863,22 @@ class ILLDPipeline:
             self.data["hw_spec"] = hw_data
 
             counts = hw_data.get("metadata", {}).get("counts", {})
-            logger.info("Parsed: %d registers, %d fields, %d interrupts, %d errors",
-                         counts.get("registers", 0), counts.get("fields", 0),
-                         counts.get("interrupts", 0), counts.get("errors", 0))
+            logger.info(
+                "Parsed: %d registers, %d fields, %d interrupts, %d errors,"
+                " %d constraints, %d sequences, %d submodules",
+                counts.get("registers", 0), counts.get("fields", 0),
+                counts.get("interrupts", 0), counts.get("errors", 0),
+                counts.get("hw_constraints", 0),
+                counts.get("programming_sequences", 0),
+                counts.get("submodules", 0),
+            )
 
             if self.kg:
                 self.kg.ingest_hw_spec(hw_data)
+                # v3.0 additions: HW constraints, programming sequences, sub-modules
+                self.kg.ingest_hw_constraints(hw_data)
+                self.kg.ingest_programming_sequences(hw_data)
+                self.kg.ingest_submodules(hw_data)
             if self.rag:
                 self.rag.ingest_hw_spec_markdown(md_path)
         else:
@@ -929,6 +975,57 @@ class ILLDPipeline:
                 self.rag.ingest_requirements(items)
         finally:
             connector.close()
+
+    # -- Step 7: Cross-source relationships ---------------------------------
+
+    def step_srs(self):
+        """Parse iLLD SRS .dox file(s) and ingest forward-trace links.
+
+        Looks for ``Ifx<Module>_srs.dox`` next to the SWA header in
+        ``doc/arch/input``.  Produces :Requirement nodes (from ``@uid{...}``)
+        and :IMPLEMENTS / :IMPLEMENTED_BY edges (from ``@tr{...}``).
+        """
+        logger.info("=" * 60)
+        logger.info("STEP 6b: SRS Doxygen (%s)", self.module)
+        logger.info("=" * 60)
+
+        srs_paths: list[Path] = []
+        if self._fetcher:
+            srs_paths = self._fetcher.fetch_all_srs_dox()
+        elif self.gitlab_repo:
+            input_dir = (self.gitlab_repo / "lld" / self.module_cap /
+                         "doc" / "arch" / "input")
+            if input_dir.exists():
+                srs_paths = sorted(input_dir.glob("*_srs.dox"))
+
+        if not srs_paths:
+            logger.warning("No SRS .dox file found — skipping.")
+            return
+
+        parsers = _import_parsers()
+        merged_reqs: list = []
+        merged_traces: list = []
+
+        for srs_path in srs_paths:
+            logger.info("Parsing SRS: %s", srs_path)
+            srs_data = parsers["srs"].parse(str(srs_path))
+            counts = srs_data.get("metadata", {}).get("counts", {})
+            logger.info("Parsed %s: %d requirements, %d trace links",
+                        srs_path.name,
+                        counts.get("requirements", 0),
+                        counts.get("traces", 0))
+
+            if self.kg:
+                self.kg.ingest_srs(srs_data)
+
+            merged_reqs.extend(srs_data.get("requirements", []))
+            merged_traces.extend(srs_data.get("traces", []))
+
+        self.data["srs"] = {
+            "requirements": merged_reqs,
+            "traces": merged_traces,
+        }
+        logger.info("SRS complete: %d file(s) processed", len(srs_paths))
 
     # -- Step 7: Cross-source relationships ---------------------------------
 
@@ -1038,6 +1135,7 @@ class ILLDPipeline:
         skip_puml: bool = False,
         skip_hw: bool = False,
         skip_jama: bool = False,
+        skip_srs: bool = False,
         hw_md_path: Optional[Path] = None,
         save_intermediary: bool = False,
     ):
@@ -1077,6 +1175,8 @@ class ILLDPipeline:
             self._run_step("HW Spec", self.step_hw_spec, hw_md_path)
         if not skip_jama:
             self._run_step("Jama Requirements", self.step_requirements)
+        if not skip_srs:
+            self._run_step("SRS Doxygen", self.step_srs)
 
         t_cross = time.time()
         self.step_cross_relationships()
@@ -1156,6 +1256,8 @@ def main():
                         help="Skip HW spec PDF/markdown")
     parser.add_argument("--skip-jama", action="store_true",
                         help="Skip Jama requirements fetch")
+    parser.add_argument("--skip-srs", action="store_true",
+                        help="Skip iLLD SRS Doxygen (.dox) ingestion")
     parser.add_argument("--keep-temp", action="store_true",
                         help="Keep temp files after pipeline completes (default: auto-delete)")
     parser.add_argument("--save-intermediary", action="store_true",
@@ -1182,6 +1284,7 @@ def main():
         skip_puml=args.skip_puml,
         skip_hw=args.skip_hw,
         skip_jama=args.skip_jama,
+        skip_srs=args.skip_srs,
         hw_md_path=args.hw_md,
         save_intermediary=args.save_intermediary,
     )

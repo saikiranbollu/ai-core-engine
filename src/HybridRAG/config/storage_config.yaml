@@ -18,6 +18,22 @@ ontology:
 # Neo4j Configuration
 # ---------------------------------------------------------------------------
 neo4j:
+  illd:
+    description: "ILLD - Reference Software (Cloud)"
+    uri: "bolt+ssc://bolt-passthrough-neo4j-ai-core-engine-legato.icp.infineon.com:443"
+    username: "${NEO4J_USERNAME}"
+    password: "${NEO4J_PASSWORD}"
+    database: "neo4j"
+    encrypted: false
+    max_connection_lifetime: 3600
+    max_connection_pool_size: 50
+    connection_acquisition_timeout: 60
+    in_cluster_uri: "bolt://neo4j-legato:7687"
+    graph_settings:
+      node_label_prefix: "ILLD_"
+      embedding_dimension: 1536
+      similarity_threshold: 0.85
+
   mcal:
     description: "MCAL - Production (ai-core-engine-mcal)"
     uri: "bolt+ssc://bolt-passthrough-neo4j-ai-core-engine-mcal.icp.infineon.com:443"
@@ -28,6 +44,7 @@ neo4j:
     max_connection_lifetime: 3600
     max_connection_pool_size: 50
     connection_acquisition_timeout: 60
+    in_cluster_uri: "bolt://neo4j-mcal:7687"
     graph_settings:
       node_label_prefix: "MCAL_"
       embedding_dimension: 1536
@@ -127,3 +144,9 @@ pdf_pipeline:
   max_retries: 3
   batch_size: 2              # pages per LLM batch (2–3 recommended)
   dpi: 300                   # render DPI for page images
+
+# ---------------------------------------------------------------------------
+# Hybrid Search / RRF Configuration
+# ---------------------------------------------------------------------------
+hybrid_search:
+  default_alpha: 0.6         # RRF blend factor: 0.0=pure vector, 1.0=pure graph

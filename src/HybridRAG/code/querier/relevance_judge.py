@@ -147,6 +147,9 @@ class _DeepEvalBackend:
         except ImportError:
             self._available = False
             logger.info("deepeval not installed — using custom LLM judge fallback")
+        except OSError as exc:
+            self._available = False
+            logger.warning("deepeval unavailable (filesystem error: %s) — using fallback", exc)
         return self._available
 
     def judge_chunks(self, query: str, chunks: List[str],

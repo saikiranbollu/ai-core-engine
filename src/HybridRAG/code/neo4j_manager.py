@@ -75,6 +75,7 @@ class Neo4jInstanceConfig:
     max_connection_lifetime: int = 3600
     max_connection_pool_size: int = 50
     connection_acquisition_timeout: int = 60
+    in_cluster_uri: Optional[str] = None
     graph_settings: GraphSettings = field(default_factory=GraphSettings)
 
     @classmethod

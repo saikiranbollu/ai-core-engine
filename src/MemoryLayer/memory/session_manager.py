@@ -145,9 +145,10 @@ class SessionManager:
         mgr = SessionManager(backend=RedisSessionBackend(redis_client))
         mgr = SessionManager(postgres_client=pg_client)  # With PostgreSQL persistence
     """
-    def __init__(self, backend=None, postgres_client=None):
+    def __init__(self, backend=None, postgres_client=None, on_expire_callback=None):
         self._backend = backend or DictBackend()
         self._pg = postgres_client  # Optional PostgresClient for session metadata
+        self._on_expire_callback = on_expire_callback  # Called with session_id when TTL expires
 
     def create(self, session_id: str, assistant_name: str = "",
                module_context: str = "", ttl_seconds: int = 3600,
@@ -175,6 +176,9 @@ class SessionManager:
         s = self._backend.load(session_id)
         if s and s.is_expired:
             self._backend.delete(session_id)
+            logger.info("[SessionMgr] Session %s expired (TTL %ds exceeded)", session_id, s.ttl_seconds)
+            if self._on_expire_callback:
+                self._on_expire_callback(session_id)
             return None
         return s
 

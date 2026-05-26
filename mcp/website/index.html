@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Core Engine — Intelligent Knowledge Graph Platform</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <a href="#main-content" class="skip-to-content">Skip to main content</a>
+
+    <!-- Navigation Bar -->
+    <nav class="navbar" role="navigation" aria-label="Main navigation">
+        <div class="nav-container">
+            <div class="nav-logo">
+                <h2><i class="fas fa-brain"></i> AI Core Engine</h2>
+            </div>
+            <ul class="nav-menu" id="nav-menu" role="menubar">
+                <li class="nav-item">
+                    <a href="#home" class="nav-link active" onclick="showSection('home')">Home</a>
+                </li>
+                <li class="nav-item">
+                    <a href="#docs" class="nav-link" onclick="showSection('docs')">Docs</a>
+                </li>
+                <li class="nav-item">
+                    <a href="#getting-started" class="nav-link" onclick="showSection('getting-started')">Getting Started</a>
+                </li>
+                <li class="nav-item">
+                    <a href="#about" class="nav-link" onclick="showSection('about')">About Us</a>
+                </li>
+                <li class="nav-item">
+                    <a href="/docs" class="nav-link nav-link-external"><i class="fas fa-book"></i> Swagger</a>
+                </li>
+            </ul>
+            <button class="hamburger" aria-label="Toggle navigation menu" aria-expanded="false" aria-controls="nav-menu">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+            </button>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main id="main-content">
+
+    <!-- Home Scroll Container -->
+    <div id="home-scroll" class="home-scroll-container">
+
+    <!-- Hero Section (Home) -->
+    <section id="home" class="hero scroll-panel">
+        <div class="hero-container">
+            <div class="hero-content reveal">
+                <h1>AI Core Engine</h1>
+                <p class="hero-subtitle">An intelligent knowledge graph platform powering automotive software traceability, dependency analysis, and AI-assisted development workflows.</p>
+                <div class="hero-buttons">
+                    <button class="btn-primary" onclick="showSection('docs')">
+                        <i class="fas fa-rocket"></i> Explore Docs
+                    </button>
+                    <button class="btn-secondary" onclick="showSection('about')">
+                        <i class="fas fa-info-circle"></i> About Us
+                    </button>
+                </div>
+            </div>
+            <div class="hero-animation">
+                <div class="floating-icons" aria-hidden="true">
+                    <i class="fas fa-project-diagram floating-icon" style="animation-delay: 0s;"></i>
+                    <i class="fas fa-cogs floating-icon" style="animation-delay: 0.5s;"></i>
+                    <i class="fas fa-brain floating-icon" style="animation-delay: 1s;"></i>
+                    <i class="fas fa-shield-alt floating-icon" style="animation-delay: 1.5s;"></i>
+                </div>
+            </div>
+        </div>
+        <div class="scroll-indicator" aria-hidden="true">
+            <i class="fas fa-chevron-down"></i>
+        </div>
+    </section>
+
+    <!-- Mission & Vision -->
+    <section id="mission-vision" class="mission-vision scroll-panel">
+        <div class="container">
+            <h2 class="section-title reveal"><i class="fas fa-bullseye"></i> Mission &amp; Vision</h2>
+            <div class="mv-grid">
+                <div class="mv-card reveal reveal-left">
+                    <div class="mv-icon"><i class="fas fa-crosshairs"></i></div>
+                    <h3>Our Mission</h3>
+                    <p>To empower automotive software teams with an intelligent, graph-powered platform that automates traceability, accelerates dependency analysis, and provides AI-driven insights — reducing manual effort and increasing software quality across the development lifecycle.</p>
+                </div>
+                <div class="mv-card reveal reveal-right">
+                    <div class="mv-icon"><i class="fas fa-eye"></i></div>
+                    <h3>Our Vision</h3>
+                    <p>To become the central knowledge backbone for automotive software engineering — a platform where every requirement, code artifact, test case, and hardware interface is seamlessly connected, queryable, and continuously learning from developer feedback to deliver ever-smarter recommendations.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Overview -->
+    <section id="features" class="features-section scroll-panel">
+        <div class="container">
+            <h2 class="section-title reveal">Platform Capabilities</h2>
+            <p class="section-subtitle reveal">56 MCP tools across 13 categories</p>
+            <div class="features-grid">
+                <div class="feature-card reveal" style="transition-delay: 0.1s;">
+                    <i class="fas fa-search"></i>
+                    <h3>Search &amp; Query</h3>
+                    <p>Full-text and semantic search across Neo4j knowledge graph and Qdrant vector store.</p>
+                </div>
+                <div class="feature-card reveal" style="transition-delay: 0.2s;">
+                    <i class="fas fa-code"></i>
+                    <h3>API Intelligence</h3>
+                    <p>Query API functions, type definitions, and auto-generate initialization code.</p>
+                </div>
+                <div class="feature-card reveal" style="transition-delay: 0.3s;">
+                    <i class="fas fa-sitemap"></i>
+                    <h3>Dependency Analysis</h3>
+                    <p>Trace dependencies, validate API usage, and detect polling requirements.</p>
+                </div>
+                <div class="feature-card reveal" style="transition-delay: 0.4s;">
+                    <i class="fas fa-link"></i>
+                    <h3>Traceability</h3>
+                    <p>Build traceability matrices linking requirements to code, tests, and HW interfaces.</p>
+                </div>
+                <div class="feature-card reveal" style="transition-delay: 0.5s;">
+                    <i class="fas fa-memory"></i>
+                    <h3>Memory &amp; Context</h3>
+                    <p>Session management with ephemeral sandbox for temporary file ingestion.</p>
+                </div>
+                <div class="feature-card reveal" style="transition-delay: 0.6s;">
+                    <i class="fas fa-shield-alt"></i>
+                    <h3>Review Gate</h3>
+                    <p>Confidence evaluation and human-in-the-loop review workflows.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    </div><!-- end home-scroll-container -->
+
+    <!-- Docs Section -->
+    <section id="docs" class="docs-section section-hidden">
+        <div class="container">
+            <h2 class="section-title"><i class="fas fa-book-open"></i> Documentation</h2>
+            <p class="section-subtitle">Architecture overview and API endpoint reference</p>
+
+            <!-- Architecture Diagram -->
+            <div class="architecture-block">
+                <h3><i class="fas fa-drafting-compass"></i> System Architecture</h3>
+                <div class="architecture-image-wrap">
+                    <img src="/static/media/architecture.PNG" alt="AI Core Engine Architecture Diagram" class="architecture-img" onclick="openImageModal(this.src)">
+                    <p class="img-caption">Click to enlarge — AI Core Engine system architecture</p>
+                </div>
+            </div>
+
+            <!-- Endpoints Grid -->
+            <div class="endpoints-block">
+                <h3><i class="fas fa-plug"></i> MCP Tool Endpoints</h3>
+                <p class="endpoints-subtitle">Click any endpoint card to see full details from the OpenAPI spec.</p>
+
+                <!-- Filter -->
+                <div class="endpoint-filter">
+                    <div class="search-box">
+                        <i class="fas fa-search" aria-hidden="true"></i>
+                        <input type="text" id="endpoint-search" placeholder="Search endpoints..." oninput="filterEndpoints()">
+                    </div>
+                    <div class="tier-filters">
+                        <button class="filter-btn active" data-tier="all" onclick="setTierFilter('all')">All</button>
+                        <button class="filter-btn" data-tier="public" onclick="setTierFilter('public')">Public</button>
+                        <button class="filter-btn" data-tier="developer" onclick="setTierFilter('developer')">Developer</button>
+                        <button class="filter-btn" data-tier="admin" onclick="setTierFilter('admin')">Admin</button>
+                    </div>
+                </div>
+
+                <div id="endpoints-grid" class="endpoints-grid">
+                    <div style="text-align:center;padding:3rem;opacity:.5;">
+                        <i class="fas fa-spinner fa-spin" style="font-size:2rem;"></i>
+                        <p style="margin-top:1rem;">Loading endpoints from OpenAPI spec…</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Getting Started Section -->
+    <section id="getting-started" class="getting-started-section section-hidden">
+        <div class="container">
+            <h2 class="section-title"><i class="fas fa-play-circle"></i> Getting Started</h2>
+            <p class="section-subtitle">Connect to the AI Core Engine MCP server and start using tools</p>
+
+            <div class="gs-steps">
+                <div class="gs-step">
+                    <div class="gs-step-number">1</div>
+                    <div class="gs-step-content">
+                        <h3>Configure your MCP Client</h3>
+                        <p>Add the AI Core Engine server to your MCP client configuration (e.g. VS Code Copilot):</p>
+                        <div class="code-block">
+                            <div class="code-header"><span>VS Code — .vscode/mcp.json</span></div>
+                            <pre><code>{
+  "servers": {
+    "aice": {
+      "type": "http",
+      "url": "https://aice-mcswai.eu-de-7.icp.infineon.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:aice-api-key}"
+      }
+    }
+  }
+}</code></pre>
+                        </div>
+                        <p class="gs-note"><i class="fas fa-info-circle"></i> Request your API key from the team — never hardcode keys in shared files. Use input variables or environment variables as shown above.</p>
+                    </div>
+                </div>
+
+                <div class="gs-step">
+                    <div class="gs-step-number">2</div>
+                    <div class="gs-step-content">
+                        <h3>Verify Connection</h3>
+                        <p>Once configured, ask your AI assistant to run the health check tool:</p>
+                        <div class="code-block">
+                            <div class="code-header"><span>Prompt</span></div>
+                            <pre><code>Use the health_check tool to verify the AICE server is reachable.</code></pre>
+                        </div>
+                        <p>Expected response: a JSON object with backend service statuses (neo4j, qdrant, redis).</p>
+                    </div>
+                </div>
+
+                <div class="gs-step">
+                    <div class="gs-step-number">3</div>
+                    <div class="gs-step-content">
+                        <h3>Try Basic Queries</h3>
+                        <p>Here are some example prompts to get started:</p>
+                        <div class="gs-examples">
+                            <div class="gs-example">
+                                <div class="gs-example-label">Search the knowledge graph</div>
+                                <div class="code-block"><pre><code>Use search_database to find all nodes related to "CAN driver initialization"</code></pre></div>
+                            </div>
+                            <div class="gs-example">
+                                <div class="gs-example-label">Query an API function</div>
+                                <div class="code-block"><pre><code>Use query_api_function to get documentation for "IfxCan_Can_initModule"</code></pre></div>
+                            </div>
+                            <div class="gs-example">
+                                <div class="gs-example-label">Trace requirements</div>
+                                <div class="code-block"><pre><code>Use find_requirement_traces to trace requirement REQ-1234 to implementation</code></pre></div>
+                            </div>
+                            <div class="gs-example">
+                                <div class="gs-example-label">Upload a file for analysis</div>
+                                <div class="code-block"><pre><code>Use sandbox_upload to ingest my current file, then search_database with
+the returned session_id to query its contents.</code></pre></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="gs-step">
+                    <div class="gs-step-number">4</div>
+                    <div class="gs-step-content">
+                        <h3>Explore All Tools</h3>
+                        <p>Visit the <a href="#docs" onclick="showSection('docs')">Docs</a> page to browse all 56 available tools, or open the <a href="/docs">Swagger UI</a> for the full OpenAPI specification.</p>
+                        <p>Tools are organized into access tiers:</p>
+                        <ul class="gs-tier-list">
+                            <li><span class="endpoint-tier tier-public">public</span> Available to all authenticated users</li>
+                            <li><span class="endpoint-tier tier-developer">developer</span> Requires developer role</li>
+                            <li><span class="endpoint-tier tier-admin">admin</span> Admin-only operations</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- About Section -->
+    <section id="about" class="about-section section-hidden">
+        <div class="container">
+            <h2 class="section-title"><i class="fas fa-users"></i> About Us</h2>
+            <div class="about-content">
+                <div class="about-text">
+                    <h3>AI Core Engine Team</h3>
+                    <p>We are the AI Core Engine team at Infineon Technologies, building the next-generation knowledge graph platform for automotive software engineering. Our platform connects requirements, source code, test artifacts, and hardware interfaces into a unified, queryable graph — enabling intelligent traceability and AI-powered insights.</p>
+
+                    <h3>What We Do</h3>
+                    <ul>
+                        <li><strong>Knowledge Graph:</strong> Neo4j-powered graph connecting all software artifacts</li>
+                        <li><strong>Hybrid RAG:</strong> Combining graph traversal with vector search for intelligent retrieval</li>
+                        <li><strong>MCP Server:</strong> 56 tools exposed via the Model Context Protocol for AI assistant integration</li>
+                        <li><strong>Review Gate:</strong> Human-in-the-loop confidence evaluation for critical decisions</li>
+                        <li><strong>Observability:</strong> Full Prometheus + Grafana monitoring stack</li>
+                    </ul>
+
+
+                </div>
+                <div class="about-contact">
+                    <div class="contact-card">
+                        <div class="contact-icon"><i class="fas fa-envelope"></i></div>
+                        <h3>Contact Us</h3>
+                        <p>For questions, feature requests, or collaboration:</p>
+                        <a href="mailto:BLRAICoreEngine@infineon.com" class="contact-email">
+                            BLRAICoreEngine@infineon.com
+                        </a>
+                        <div class="contact-details">
+                            <p><i class="fas fa-building"></i> Infineon Technologies</p>
+                            <p><i class="fas fa-code-branch"></i> ATV MC D SW</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Meet the Team -->
+            <div class="meet-team">
+                <h3 class="meet-team-title"><i class="fas fa-people-group"></i> Meet the Team</h3>
+                <div class="team-grid">
+                    <div class="team-card">
+                        <div class="team-avatar"><i class="fas fa-user-tie"></i></div>
+                        <h4>Bollu Sai Kiran</h4>
+                        <span class="team-role role-lead">Team Lead</span>
+                        <a href="mailto:SaiKiran.Bollu@infineon.com" class="team-email">SaiKiran.Bollu@infineon.com</a>
+                    </div>
+                    <div class="team-card">
+                        <div class="team-avatar"><i class="fas fa-user"></i></div>
+                        <h4>Chahat Gupta</h4>
+                        <span class="team-role role-dev">Developer</span>
+                        <a href="mailto:Chahat.Gupta@infineon.com" class="team-email">Chahat.Gupta@infineon.com</a>
+                    </div>
+                    <div class="team-card">
+                        <div class="team-avatar"><i class="fas fa-user"></i></div>
+                        <h4>Suraj Retheesh Nair</h4>
+                        <span class="team-role role-dev">Developer</span>
+                        <a href="mailto:SurajRetheesh.Nair@infineon.com" class="team-email">SurajRetheesh.Nair@infineon.com</a>
+                    </div>
+                    <div class="team-card">
+                        <div class="team-avatar"><i class="fas fa-user"></i></div>
+                        <h4>Ayub Khan Mohammed Owais Khan</h4>
+                        <span class="team-role role-dev">Developer</span>
+                        <a href="mailto:MohammedOwaisKhan.AyubKhan@infineon.com" class="team-email">MohammedOwaisKhan.AyubKhan@infineon.com</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer" role="contentinfo">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h3><i class="fas fa-brain"></i> AI Core Engine</h3>
+                    <p>Intelligent knowledge graph platform for automotive software engineering.</p>
+                </div>
+                <div class="footer-section">
+                    <h4>Quick Links</h4>
+                    <ul>
+                        <li><a href="#home" onclick="showSection('home')">Home</a></li>
+                        <li><a href="#docs" onclick="showSection('docs')">Documentation</a></li>
+                        <li><a href="#getting-started" onclick="showSection('getting-started')">Getting Started</a></li>
+                        <li><a href="/docs">Swagger UI</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4>Resources</h4>
+                    <ul>
+                        <li><a href="/openapi.json" target="_blank">OpenAPI Spec</a></li>
+                        <li><a href="/metrics" target="_blank">Metrics</a></li>
+                        <li><a href="/mcp" target="_blank">MCP Endpoint</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4>Contact</h4>
+                    <p><a href="mailto:BLRAICoreEngine@infineon.com" style="color: #63b3ed;">BLRAICoreEngine@infineon.com</a></p>
+                    <p>Infineon Technologies<br>ATV MC D SW</p>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; 2025 AI Core Engine — Infineon Technologies. Empowering intelligent automotive software development.</p>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Endpoint Detail Modal -->
+    <div id="endpoint-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="endpoint-modal-title">
+        <div class="modal-content endpoint-modal-content">
+            <div class="modal-title-bar">
+                <h2 id="endpoint-modal-title">Endpoint Details</h2>
+                <button class="modal-close-btn" onclick="closeEndpointModal()" title="Close" aria-label="Close dialog">&times;</button>
+            </div>
+            <div class="modal-body" id="endpoint-modal-body">
+            </div>
+        </div>
+    </div>
+
+    <!-- Image Modal -->
+    <div id="image-modal" class="modal" role="dialog" aria-modal="true">
+        <div class="modal-content image-modal-content">
+            <button class="modal-close-btn" onclick="closeImageModal()" title="Close" aria-label="Close dialog">&times;</button>
+            <img id="image-modal-img" src="" alt="Architecture Diagram Enlarged">
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

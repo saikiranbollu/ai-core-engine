@@ -515,21 +515,26 @@ class EAGraphBuilder:
                         safe_key = f"op_{_safe_prop_name(prop)}"
                         elements[obj_id][safe_key] = actual_val
 
-    # ── HSI: pull out-of-scope register targets into scope ───────────────
+    # ── HSI: pull out-of-scope register targets & remap function_design sw_access ──
     def _pull_hsi_registers(
         self,
         elements: dict[int, dict],
         pkg_ids: set[int],
     ) -> list[dict]:
-        """Find registers targeted by sw_access connectors from function_design
-        elements in-scope, but living outside the module package tree
-        (e.g. in the shared 'AURIX 3G Family' register model).
+        """Remap sw_access connectors from function_design elements to their
+        parent EA_Function, handling both in-scope and out-of-scope targets.
 
         function_design elements are NOT in STEREOTYPE_MAP so they're absent
-        from *elements*.  We query them from the DB, find their sw_access
-        connectors to out-of-scope targets, pull those register targets into
-        *elements*, and return remapped connectors where the source is the
-        parent EA_Function (not the function_design)."""
+        from *elements*.  We query them from the DB, find ALL their sw_access
+        connectors, pull out-of-scope targets into *elements*, and return
+        remapped connectors where the source is the parent EA_Function
+        (not the function_design).
+
+        This handles:
+        - Out-of-scope targets (registers in shared 'AURIX 3G Family' model)
+        - In-scope targets (global_variable, register, config_struct already
+          in elements) that would otherwise be dropped because the source
+          function_design isn't in elements."""
 
         # Step 1: Find function_design elements in module scope
         pkg_list = ",".join(str(p) for p in pkg_ids)
@@ -557,58 +562,68 @@ class EAGraphBuilder:
         if not fd_to_parent:
             return []
 
-        # Step 2: Find sw_access connectors from function_design → out-of-scope targets
+        # Step 2: Find ALL sw_access connectors from function_design
+        #         (both in-scope and out-of-scope targets)
         fd_list = ",".join(str(i) for i in fd_to_parent)
-        elem_list = ",".join(str(e) for e in elements)
         rows = self._db.sql_query(
             "SELECT c.Connector_ID, c.Start_Object_ID, c.End_Object_ID, "
             "c.Name, c.Stereotype "
             "FROM t_connector c "
             f"WHERE c.Start_Object_ID IN ({fd_list}) "
-            "AND c.Stereotype = 'sw_access' "
-            f"AND c.End_Object_ID NOT IN ({elem_list})"
+            "AND c.Stereotype = 'sw_access'"
         )
         if not rows:
-            logger.info("No out-of-scope sw_access targets found")
+            logger.info("No sw_access connectors from function_design elements")
             return []
-        logger.info("Found %d sw_access connectors to out-of-scope targets", len(rows))
 
-        # Step 3: Pull register targets into elements
-        out_ids = list({r[2] for r in rows})
-        oid_list = ",".join(str(i) for i in out_ids)
-        elem_rows = self._db.sql_query(
-            "SELECT Object_ID, Name, Object_Type, Stereotype, Note, "
-            "Package_ID, ParentID, Classifier, ea_guid "
-            f"FROM t_object WHERE Object_ID IN ({oid_list})"
-        )
-        pulled = 0
-        for r in elem_rows:
-            obj_id, name, obj_type, stereo, note, pkg_id, parent_id, classifier, ea_guid = r
-            if stereo not in STEREOTYPE_MAP:
-                continue
-            mapping = STEREOTYPE_MAP[stereo]
-            props = {
-                "ea_id": f"{self.model_prefix}:{obj_id}",
-                "name": name or "",
-                "object_type": obj_type,
-                "stereotype": stereo,
-                "note": _strip_html(note) if note else "",
-                "package_id": pkg_id,
-                "module": self.module,
-                "label": mapping["label"],
-                "source_model": self.model_prefix,
-            }
-            if ea_guid:
-                props["feature_id"] = ea_guid.strip("{}")
-            if "kind" in mapping:
-                props["kind"] = mapping["kind"]
-            if parent_id:
-                props["parent_element_id"] = parent_id
-            elements[obj_id] = props
-            pulled += 1
-        logger.info("Pulled %d out-of-scope HSI register targets into scope", pulled)
+        # Partition into in-scope and out-of-scope targets
+        in_scope_rows = []
+        out_scope_rows = []
+        for r in rows:
+            if r[2] in elements:
+                in_scope_rows.append(r)
+            else:
+                out_scope_rows.append(r)
+        logger.info("Found %d sw_access connectors (%d in-scope, %d out-of-scope)",
+                     len(rows), len(in_scope_rows), len(out_scope_rows))
 
-        # Step 4: Build remapped connectors (parent function → register)
+        # Step 3: Pull out-of-scope targets into elements
+        if out_scope_rows:
+            out_ids = list({r[2] for r in out_scope_rows})
+            oid_list = ",".join(str(i) for i in out_ids)
+            elem_rows = self._db.sql_query(
+                "SELECT Object_ID, Name, Object_Type, Stereotype, Note, "
+                "Package_ID, ParentID, Classifier, ea_guid "
+                f"FROM t_object WHERE Object_ID IN ({oid_list})"
+            )
+            pulled = 0
+            for r in elem_rows:
+                obj_id, name, obj_type, stereo, note, pkg_id, parent_id, classifier, ea_guid = r
+                if stereo not in STEREOTYPE_MAP:
+                    continue
+                mapping = STEREOTYPE_MAP[stereo]
+                props = {
+                    "ea_id": f"{self.model_prefix}:{obj_id}",
+                    "name": name or "",
+                    "object_type": obj_type,
+                    "stereotype": stereo,
+                    "note": _strip_html(note) if note else "",
+                    "package_id": pkg_id,
+                    "module": self.module,
+                    "label": mapping["label"],
+                    "source_model": self.model_prefix,
+                }
+                if ea_guid:
+                    props["feature_id"] = ea_guid.strip("{}")
+                if "kind" in mapping:
+                    props["kind"] = mapping["kind"]
+                if parent_id:
+                    props["parent_element_id"] = parent_id
+                elements[obj_id] = props
+                pulled += 1
+            logger.info("Pulled %d out-of-scope HSI targets into scope", pulled)
+
+        # Step 4: Build remapped connectors (parent function → target)
         hsi_connectors = []
         for conn_id, start_id, end_id, name, stereo in rows:
             if end_id not in elements:
@@ -624,7 +639,7 @@ class EAGraphBuilder:
                 "name": name or "",
                 "stereotype": stereo or "",
             })
-        logger.info("Created %d HSI connector edges (remapped to parent functions)",
+        logger.info("Created %d remapped sw_access edges (function_design → parent EA_Function)",
                      len(hsi_connectors))
         return hsi_connectors
 

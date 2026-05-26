@@ -1,6 +1,6 @@
 # AI Core Engine (AICE) — Complete Documentation
 
-**Version 2.1.0 | Sprint 9**
+**Version 2.2.0 | Sprint 25**
 **MCP Interface for Automotive Embedded Software Development**
 
 > **Getting started?** See [MCP_QUICKSTART.md](MCP_QUICKSTART.md) for a practical setup and configuration guide with examples.
@@ -35,9 +35,9 @@
 
 The **AI Core Engine (AICE)** is a knowledge-graph-backed MCP (Model Context Protocol) server purpose-built for **Infineon AURIX TC3xx** automotive embedded software development. It provides a unified AI-powered platform that serves multiple Domain Assistants (DAs) — specialized LLM-based agents — with structured knowledge about AUTOSAR MCAL drivers, iLLD reference software, hardware registers, requirements traceability, and compliance rules.
 
-AICE exposes **56 tools across 13 categories** (including Ephemeral Sandbox and RLM extensions in Category 6), backed by a **Hybrid RAG** engine that combines Neo4j Knowledge Graph traversal with Qdrant vector similarity search, delivering precise and contextually rich responses for automotive software engineering tasks.
+AICE exposes **55 tools across 14 categories** (including Ephemeral Sandbox, RLM, HSI, and GAP v2 extensions), backed by a **Hybrid RAG** engine that combines Neo4j Knowledge Graph traversal with Qdrant vector similarity search, delivering precise and contextually rich responses for automotive software engineering tasks.
 
-> **Note:** Run `python -c "from mcp.core.mcp_server import mcp; print(len(mcp._tools), 'tools registered')"` to verify the exact tool count in your deployment. The count includes 2 RLM tools and 4 Sandbox tools added in Sprint 5.
+> **Note:** Run `python -c "from mcp.core.tool_tiers import TOOL_TIERS; print(len(TOOL_TIERS), 'tools registered')"` to verify the exact tool count in your deployment. Plan 2 Phase 2 removed the 4 admin Cat 5 Ingestion tools from MCP registration — file ingestion now flows through `sandbox_upload`. Added since Sprint 9: `sandbox_diff`, `get_function_hsi`, `cache_refresh_config`, `query_enhance`.
 
 ### 1.2 Target Domain
 
@@ -245,7 +245,7 @@ AICE serves 21+ Domain Assistants, each specialized for a phase of the V-Model l
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────────┐│
 │  │                  MCP Server (FastMCP)                        ││
-│  │           56 Tools across 13 Categories                      ││
+│  │           55 Tools across 14 Categories                      ││
 │  │                                                              ││
 │  │  ┌─────────────────────────────────────────────────────┐     ││
 │  │  │  Cat 1: Search & Query (6)                          │     ││
@@ -425,203 +425,213 @@ Both workspaces share the same MCP server instance and tool set but use separate
 
 ## 4. MCP Tool Reference
 
+> **Source of truth:** `mcp/core/tool_tiers.py` (the `TOOL_TIERS` dict) lists every tool registered against the MCP server, together with its access tier. The descriptions below match the `@mcp.tool()` docstrings in `mcp/core/mcp_server.py`.
+>
+> **Plan 2 Phase 2 change:** Production ingestion tools (`ingest_file`, `ingest_module_from_repo`, `batch_ingest_modules`, `ingest_repository`) are **no longer exposed via MCP**. All file ingestion now flows through `sandbox_upload`. The underlying `IngestionService` remains available as library code for internal pipelines.
+>
+> **Sandbox routing:** Any Cat 1–4 tool that accepts a `session_id` parameter will, when paired with an active sandbox session, route the call through the per-session ephemeral overlay (NetworkX graph + per-session vector store) instead of (or in addition to) production Neo4j/Qdrant. The legacy `sandbox_query` tool is deprecated — use `search_database(session_id=...)` instead.
+
 ### 4.1 Category 1: Search & Query (6 tools)
+
+All tools in this category accept an optional `session_id` parameter that activates sandbox-overlay routing when an ephemeral session is open.
 
 #### `search_database` — Hybrid Search
 - **Tier**: public
-- **Purpose**: Primary search entry point combining semantic vector search with knowledge graph traversal
+- **Purpose**: Primary hybrid search entry point. Combines Qdrant vector similarity with Neo4j graph traversal. Results pass through the LRU → Semantic → RAG cache tiers.
 - **Parameters**:
   - `query` (str, required): Natural language search query
-  - `workspace` (str): "illd" or "mcal" (default: active instance)
-  - `module_filter` (str): Restrict results to a specific module
-  - `node_types` (list[str]): Filter by node labels
-  - `alpha` (float, 0.0–1.0): Vector vs. graph blend (0.0 = all graph, 1.0 = all vector)
-  - `include_relationships` (bool): Include neighboring relationships
-  - `top_k` (int): Maximum results (default: 10)
-- **Returns**: Ranked list of nodes with relevance scores, provenance indicators, and optional relationship context
+  - `max_results` (int): Maximum results (default: 10)
+  - `include_relationships` (bool): Include relationship data (default: false)
+  - `filter_by_module` (str | None): Module name filter (e.g., "Adc", "Can")
+  - `filter_by_node_type` (list[str] | None): Filter by node labels
+  - `offset` (int): Pagination offset (default: 0)
+  - `workspace_id` (str): "illd" (default) or "mcal"
+  - `alpha` (float, 0.0–1.0): Vector-vs-graph blend (0.6 default; 0.0 = pure vector, 1.0 = pure graph)
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: Ranked nodes with `node_id`, `label`, `score`, `properties`, optional `relationships`, plus `total_count` and original `query`
 
 #### `search_nodes` — Structured Node Search
 - **Tier**: public
-- **Purpose**: Deterministic structured query by label, keyword, and property filters
+- **Purpose**: Deterministic structured query by label, keyword, and property filters. Use this when you know the exact node type and want precise, non-semantic filtering.
 - **Parameters**:
-  - `label` (str): Node type (e.g., "APIFunction", "Register")
-  - `keyword` (str): Search keyword
-  - `filters` (dict): Property-based filters
-  - `workspace` (str): Target workspace
-  - `limit` (int): Max results
-- **Returns**: Matching nodes with all properties
+  - `label` (str, required): Node type (e.g., "APIFunction", "Register", "StakeholderRequirement"). Run `get_ontology_schema` for the full list.
+  - `keyword` (str | None): Full-text keyword filter
+  - `filters` (dict | None): Property filters, e.g. `{"module": "Adc"}`
+  - `return_properties` (list[str] | None): Specific properties to include
+  - `limit` (int): Max results (default: 10)
+  - `offset` (int): Pagination offset (default: 0)
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: `{"nodes": [...], "total_count": int}`
 
 #### `get_node_by_id` — Exact Lookup
 - **Tier**: public
-- **Purpose**: Retrieve a single node by document ID or Jama item ID
+- **Purpose**: Retrieve a single node by document ID or Jama item ID. Provide at least one identifier.
 - **Parameters**:
-  - `node_id` (str, required): Unique identifier
-  - `workspace` (str): Target workspace
-- **Returns**: Complete node with all properties and relationships
+  - `document_id` (str | None): Unique `document_id` property
+  - `jama_id` (int | None): Jama item ID (primarily mcal)
+  - `label` (str | None): Optional label hint to narrow the lookup
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: Complete node with `node_id`, `label`, `properties`, `relationships`
 
 #### `get_neighbors` — Graph Traversal
 - **Tier**: developer
-- **Purpose**: Find directly connected nodes for a given node
+- **Purpose**: Direct graph traversal — get all nodes connected to a known node. When `depth > 1` and a sandbox session is active, uses hybrid traversal that continues into production Neo4j at boundary leaves.
 - **Parameters**:
-  - `node_id` (str, required): Starting node ID
-  - `relationship_types` (list[str]): Filter by relationship type
-  - `direction` (str): "in", "out", or "both"
-  - `limit` (int): Max results
-- **Returns**: Neighbor nodes with relationship metadata
+  - `document_id` (str | None) **or** `jama_id` (int | None): Source node (at least one required)
+  - `direction` (str): "in", "out", or "both" (default: "both")
+  - `relationship_types` (list[str] | None): Filter by relationship type
+  - `depth` (int): Number of hops (default: 1)
+  - `limit` (int): Max neighbors (default: 20)
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate hybrid traversal
+- **Returns**: `{"source": {...}, "neighbors": [...], "total_count": int}`
 
 #### `shortest_path` — Path Analysis
 - **Tier**: developer
-- **Purpose**: Find shortest path between two nodes in the knowledge graph
+- **Purpose**: Find the shortest path between two nodes. Provide at least one identifier each for source and target. Supports hybrid sandbox/prod traversal when `session_id` is provided.
 - **Parameters**:
-  - `source_id` (str, required): Starting node
-  - `target_id` (str, required): Destination node
-  - `max_depth` (int): Maximum traversal depth
-- **Returns**: Path as ordered list of nodes and relationships
+  - `from_document_id` (str | None) **or** `from_jama_id` (int | None): Source
+  - `to_document_id` (str | None) **or** `to_jama_id` (int | None): Target
+  - `max_depth` (int): Max path length (default: 8)
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate hybrid traversal
+- **Returns**: `{"path": [...], "relationships": [...], "length": int, "found": bool}`
 
 #### `execute_cypher` — Raw Cypher Query
 - **Tier**: developer
-- **Purpose**: Execute read-only Cypher queries directly against Neo4j
+- **Purpose**: Execute read-only Cypher against Neo4j.
 - **Parameters**:
-  - `query` (str, required): Cypher query (write clauses are rejected)
-  - `params` (dict): Query parameters
-  - `workspace` (str): Target workspace
-- **Returns**: Query results as list of records
-- **Security**: Write operations (CREATE, DELETE, SET, MERGE, DROP, REMOVE) are blocked
+  - `query` (str, required): Read-only Cypher query
+  - `parameters` (dict | None): Query parameters (always prefer over string interpolation)
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: `{"records": [...], "count": int}`
+- **Security**: Write clauses (CREATE, MERGE, DELETE, SET, REMOVE, DETACH, DROP, `CALL { ... }`) are rejected via word-boundary regex.
 
 ### 4.2 Category 2: API Intelligence (3 tools)
 
 #### `query_api_function` — Function Intelligence
 - **Tier**: public
-- **Purpose**: Retrieve comprehensive information about an API function with 25+ fields
+- **Purpose**: Retrieve 25+ enriched fields for an API function: signature, parameters, return type, dependencies, callers, usage patterns, traceability links, and related requirements.
 - **Parameters**:
-  - `function_name` (str, required): API function name
-  - `workspace` (str): Target workspace
-- **Returns**: Enriched function data including:
-  - Signature, parameters, return type
-  - Module, file location
-  - Dependencies (calls, called-by)
-  - Traceability (linked requirements, test cases)
-  - MISRA compliance notes
-  - Initialization sequence position
-  - Register accesses
-  - Safety criticality (ASIL level)
+  - `function_name` (str, required): Exact API function name (e.g. "Adc_Init", "Can_Write")
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: Function metadata including signature, return type, parameters, module, dependencies, callers, requirements, test cases, description.
 
 #### `get_type_definition` — Type Resolution
 - **Tier**: public
-- **Purpose**: Retrieve struct, enum, or typedef definitions with fields and defaults
+- **Purpose**: Retrieve struct/enum/typedef definition with fields, defaults, and related functions.
 - **Parameters**:
-  - `type_name` (str, required): Type name
-  - `workspace` (str): Target workspace
-- **Returns**: Full type definition with fields, C declaration, default values
+  - `struct_name` (str, required): Type name (e.g. "Adc_ConfigType")
+  - `module` (str | None): Module narrowing hint
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: `{"name", "kind", "c_definition", "module", "fields": [...], "related_functions": [...]}`
 
 #### `generate_initialization_code` — Code Generation
 - **Tier**: public
-- **Purpose**: Generate C initialization code by merging KG-stored defaults with user overrides
+- **Purpose**: Generate C initialization code by merging KG-stored defaults with user-supplied overrides.
 - **Parameters**:
-  - `type_name` (str, required): Type/struct to initialize
-  - `overrides` (dict): Custom field values
-  - `workspace` (str): Target workspace
-- **Returns**: Generated C code block
+  - `struct_name` (str, required): Struct to initialize
+  - `user_overrides` (dict | None): Custom field values
+  - `variable_name` (str | None): Identifier to use for the generated variable
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: Generated C code block + merged config payload
 
 ### 4.3 Category 3: Dependency Analysis (3 tools)
 
 #### `query_dependencies` — Dependency Graph
 - **Tier**: public
-- **Purpose**: Resolve direct and transitive dependencies with topological initialization ordering
+- **Purpose**: Resolve direct and transitive dependencies with topological initialization ordering.
 - **Parameters**:
   - `function_name` (str, required): Starting function
-  - `depth` (int): Max traversal depth (default: 3)
-  - `workspace` (str): Target workspace
-- **Returns**: Dependency tree, topological init_sequence, direct/transitive counts
+  - `module_name` (str | None): Module hint to narrow resolution
+  - `max_depth` (int): Max traversal depth (default from `MAX_DEPENDENCIES_DEPTH` setting)
+  - `include_hardware` (bool): Include hardware register/bitfield dependencies (default: false)
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: Dependency tree, topological init sequence, direct/transitive counts
 
 #### `validate_api_usage` — Usage Validation
 - **Tier**: public
-- **Purpose**: Check whether a sequence of API calls follows the correct dependency ordering
+- **Purpose**: Check whether a sequence of API calls follows the correct dependency ordering.
 - **Parameters**:
-  - `call_sequence` (list[str], required): Ordered list of function calls
-  - `workspace` (str): Target workspace
+  - `function_sequence` (list[str], required): Ordered list of function calls
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
 - **Returns**: Validation result with violations marked
 
 #### `detect_polling_requirements` — Polling Detection
 - **Tier**: public
-- **Purpose**: Identify APIs that require status polling after invocation
+- **Purpose**: Identify APIs that require status polling after invocation, with recommended patterns.
 - **Parameters**:
-  - `function_name` (str, required): Function to analyze
-  - `workspace` (str): Target workspace
-- **Returns**: Polling requirements with recommended patterns
+  - `function_names` (list[str], required): Functions to analyze
+  - `module` (str | None): Module hint
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
+- **Returns**: Polling requirements per function with recommended patterns
 
 ### 4.4 Category 4: Traceability (4 tools)
 
 #### `find_requirement_traces` — V-Model Traces
 - **Tier**: public
-- **Purpose**: Trace complete V-Model chains from requirements through architecture, code, tests, to results
+- **Purpose**: Trace complete V-Model chains from requirements through architecture, code, tests, to results.
 - **Parameters**:
   - `requirement_id` (str, required): Requirement identifier
-  - `workspace` (str): Target workspace
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
 - **Returns**: Full trace chain with link quality metadata
 
 #### `build_traceability_matrix` — Matrix Generation
 - **Tier**: public
-- **Purpose**: Generate module-wide traceability matrix
+- **Purpose**: Generate module-wide traceability matrix.
 - **Parameters**:
-  - `module` (str, required): Module name
-  - `format` (str): Output format — "json", "csv", or "html"
-  - `workspace` (str): Target workspace
+  - `module_name` (str, required): Module name
+  - `output_format` (str): "json", "csv", or "html" (default: "json")
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
 - **Returns**: Complete traceability matrix in requested format
 
 #### `find_coverage_gaps` — Gap Detection
 - **Tier**: public
-- **Purpose**: Identify missing links in requirement-code-test chains
+- **Purpose**: Identify missing links in requirement-code-test chains.
 - **Parameters**:
-  - `module` (str, required): Module name
-  - `workspace` (str): Target workspace
+  - `module_name` (str, required): Module name
+  - `gap_type` (str): Gap class to surface ("all" default)
+  - `severity` (str): Severity filter ("all" default)
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
 - **Returns**: List of gaps with severity and suggested actions
 
 #### `analyze_hw_sw_links` — HW-SW Analysis
 - **Tier**: public
-- **Purpose**: Map hardware register usage to software functions and detect undocumented accesses
+- **Purpose**: Map hardware register usage to software functions and detect undocumented accesses.
 - **Parameters**:
-  - `module` (str, required): Module name
-  - `workspace` (str): Target workspace
+  - `module_name` (str, required): Module name
+  - `workspace_id` (str): "illd" or "mcal" (default: "illd")
+  - `session_id` (str | None): Activate sandbox overlay routing
 - **Returns**: Register-to-function mapping, undocumented access warnings
 
-### 4.5 Category 5: Ingestion Pipeline (4 tools)
+### 4.5 Category 5: Ingestion Pipeline — Removed from MCP (Plan 2 Phase 2)
 
-#### `ingest_file` — Single File Ingestion
-- **Tier**: admin
-- **Purpose**: Parse a single file and ingest extracted knowledge into the graph
-- **Parameters**:
-  - `file_path` (str, required): Path to file
-  - `workspace` (str, required): Target workspace
-  - `module` (str, required): Owner module
-  - `overwrite` (bool): Force replacement (default: false)
-- **Returns**: Job ID, parsed node/relationship counts
+The four legacy admin ingestion tools (`ingest_file`, `ingest_module_from_repo`, `batch_ingest_modules`, `ingest_repository`) are **no longer registered with the MCP server**. They remain in `mcp/core/mcp_server.py` as private async helpers (`_ingest_file`, etc.) and the underlying `IngestionService` is still available as library code for internal pipelines (CI ingestion jobs, replays, etc.).
 
-#### `ingest_module_from_repo` — Module Ingestion
-- **Tier**: admin
-- **Purpose**: Discover and ingest all artifacts for a given module
-- **Parameters**:
-  - `repo_path` (str, required): Root repository path
-  - `module` (str, required): Module name
-  - `workspace` (str, required): Target workspace
-- **Returns**: Aggregated job summary
+**Migration path for callers:** Use `sandbox_upload` for all per-session file ingestion via MCP. For repository-scale ingestion, invoke `IngestionService` directly from a backend job or CLI script.
 
-#### `batch_ingest_modules` — Batch Ingestion
-- **Tier**: admin
-- **Purpose**: Ingest multiple modules in parallel
-- **Parameters**:
-  - `repo_path` (str, required): Root repository path
-  - `modules` (list[str], required): Module names
-  - `workspace` (str, required): Target workspace
-- **Returns**: Per-module job summaries
+### 4.5b Category 5b: HSI — Hardware-Software Interface (1 tool)
 
-#### `ingest_repository` — Full Repository Ingestion
-- **Tier**: admin
-- **Purpose**: Discover and ingest all modules across the entire repository
+#### `get_function_hsi` — Function HSI Extraction
+- **Tier**: public
+- **Purpose**: Extract the HSI section for a function in SWUD format: SFR registers accessed (access type, trust zone, line numbers), global/shared variables (with `via_chain`), and events. Dedicated tool for HSI constituents.
 - **Parameters**:
-  - `repo_path` (str, required): Root repository path
-  - `workspace` (str, required): Target workspace
-- **Returns**: Repository-wide ingestion summary
+  - `function_name` (str, required): Exact function name
+  - `module` (str): Module name (default: "Adc")
+  - `profile` (str): "mcal" (default) or "illd"
+- **Returns**: `{"function_name", "registers": [...], "global_variables": [...], "events": [...], "summary_text": str}` (markdown-formatted SWUD HSI section)
 
 ### 4.6 Category 6: Memory & Context (5 + 4 Sandbox + 2 RLM = 11 tools)
 
@@ -673,84 +683,92 @@ Both workspaces share the same MCP server instance and tool set but use separate
 
 #### Ephemeral Sandbox (4 tools)
 
+> The legacy `sandbox_query` tool was removed from MCP registration. To search a sandbox, call `search_database(session_id=...)` (or any Cat 1 tool with `session_id`) — when an active sandbox is bound to the session, queries route through the per-session NetworkX graph + vector store via `HybridGraphService`.
+
 #### `sandbox_upload` — Upload Documents
 - **Tier**: public
-- **Purpose**: Parse user-provided documents into per-session ephemeral KG and vector stores
+- **Purpose**: Parse a user-provided document into the per-session ephemeral KG and vector store.
 - **Parameters**:
   - `session_id` (str, required): Active session
   - `file_path` (str, required): Document to upload
 - **Returns**: Upload summary with extracted node/relationship counts
-- **Limits**: Max 20 files, 50MB total per session
-
-#### `sandbox_query` — Query Sandbox
-- **Tier**: public
-- **Purpose**: Search within the session's ephemeral stores
-- **Parameters**:
-  - `session_id` (str, required): Active session
-  - `query` (str, required): Search query
-- **Returns**: Results from ephemeral graph + vector stores
+- **Limits**: Sandbox manager enforces a per-instance chunk ceiling (default 5000); upload sizes are bounded by Working Memory session limits.
 
 #### `sandbox_status` — Sandbox Status
 - **Tier**: public
-- **Purpose**: Inspect loaded files, node counts, and storage stats
+- **Purpose**: Inspect loaded files, node counts, and storage stats.
 - **Parameters**:
   - `session_id` (str, required): Active session
-- **Returns**: Status report
+- **Returns**: Status report (files, chunk count, graph node/edge counts, TTL info)
 
 #### `sandbox_clear` — Clear Sandbox
 - **Tier**: public
-- **Purpose**: Explicitly release ephemeral storage before session TTL expires
+- **Purpose**: Explicitly release ephemeral storage before session TTL expires.
 - **Parameters**:
   - `session_id` (str, required): Active session
 - **Returns**: Confirmation
 
+#### `sandbox_diff` — Sandbox vs Production Diff
+- **Tier**: public
+- **Purpose**: Report nodes/edges added or modified in the sandbox compared to production counterparts. Useful for understanding which overlays will be applied during hybrid queries.
+- **Parameters**:
+  - `session_id` (str, required): Active session
+- **Returns**: `{"nodes_added": [...], "nodes_modified": [{"node_id", "original", "current"}], "nodes_unchanged": int, "edges_added": int, "edges_total": int}`
+
 #### RLM (2 tools)
 
 #### `rlm_orchestrate` — Multi-Step Context
-- **Tier**: public
-- **Purpose**: Decompose complex queries into targeted sub-queries for richer context assembly
+- **Tier**: developer
+- **Purpose**: Decompose complex queries into targeted sub-queries for richer context assembly.
 - **Parameters**:
   - `query` (str, required): Complex query
-  - `task_type` (str): One of 23 task types (auto-detected if not specified)
-  - `session_id` (str): Active session for context reuse
-  - `workspace` (str): Target workspace
+  - `task_type` (str): One of 23 task types (auto-detected if not specified; default "generic")
+  - `module` (str): Module context (default "CAN")
+  - `profile` (str): Workspace profile (default "mcal")
+  - `session_id` (str | None): Active session for context reuse
 - **Returns**: Synthesized context from up to 6 sub-queries
 
 #### `rlm_plan_preview` — Preview Plan
 - **Tier**: public
-- **Purpose**: Show planned sub-queries without executing them
+- **Purpose**: Show planned sub-queries without executing them.
 - **Parameters**:
   - `query` (str, required): Query to plan
   - `task_type` (str): Task type hint
 - **Returns**: Planned sub-queries with alpha values and expected targets
 
-### 4.7 Category 7: Cache Management (4 tools)
+### 4.7 Category 7: Cache Management (5 tools)
 
 #### `cache_get` — Inspect Cache
 - **Tier**: developer
-- **Purpose**: Check if a cache entry exists for a given query
+- **Purpose**: Check whether a cache entry exists for a given query.
 - **Parameters**:
   - `query` (str, required): Query to check
 - **Returns**: Cache hit/miss status with entry metadata if hit
 
 #### `cache_stats` — Cache Metrics
 - **Tier**: developer
-- **Purpose**: Retrieve cache performance metrics
-- **Returns**: LRU, FAISS L1 semantic, and RediSearch L2 cache stats (hit rate, size, FAISS enabled status, RediSearch availability)
+- **Purpose**: Retrieve cache performance metrics across all tiers.
+- **Returns**: LRU, FAISS L1 semantic, and RediSearch L2 cache stats (hit rate, size, FAISS enabled flag, RediSearch availability)
 
 #### `cache_invalidate_module` — Module Invalidation
 - **Tier**: admin
-- **Purpose**: Invalidate all cache entries related to a specific module
+- **Purpose**: Invalidate all cache entries related to a specific module.
 - **Parameters**:
-  - `module` (str, required): Module to invalidate
+  - `module_name` (str, required): Module to invalidate
 - **Returns**: Number of invalidated entries
 
 #### `cache_clear` — Clear Cache
 - **Tier**: admin
-- **Purpose**: Clear entire cache or selected tiers
+- **Purpose**: Clear entire cache or selected tiers.
 - **Parameters**:
-  - `tier` (str): "lru", "semantic", or "all" (default: "all")
+  - `tiers` (list[str] | None): Subset of `["lru", "semantic", "rag"]`; None clears all
 - **Returns**: Confirmation with cleared entry count
+
+#### `cache_refresh_config` — Reload Cache Configuration
+- **Tier**: admin
+- **Purpose**: Reload cache configuration from environment variables without restarting. Re-reads `LRU_CACHE_SIZE`, `LRU_CACHE_TTL_HOURS`, `SEMANTIC_CACHE_MAX_SIZE`, `SEMANTIC_CACHE_THRESHOLD`, `SEMANTIC_CACHE_TTL_DAYS`. Cached data is preserved (evicted only if size shrinks).
+- **Parameters**: None
+- **Returns**: Diff of old/new values plus `evicted` count
 
 ### 4.8 Category 8: Feedback & Learning (4 tools)
 
@@ -770,10 +788,9 @@ Both workspaces share the same MCP server instance and tool set but use separate
 
 #### `get_learning_metrics` — Learning Stats
 - **Tier**: developer
-- **Purpose**: Retrieve approval/rejection rates, pattern counts, and learning trends
+- **Purpose**: Retrieve approval/rejection rates, pattern counts, and learning trends.
 - **Parameters**:
-  - `module` (str): Filter by module
-  - `time_range` (str): Time window
+  - `include_pattern_details` (bool): Include per-pattern detail rows (default: false)
 - **Returns**: Metrics summary
 
 #### `get_failure_patterns` — Pattern Query
@@ -848,28 +865,30 @@ Both workspaces share the same MCP server instance and tool set but use separate
 
 #### `validate_entity` — Entity Validation
 - **Tier**: developer
-- **Purpose**: Validate an entity against ontology rules
+- **Purpose**: Validate an entity against ontology rules.
 - **Parameters**:
-  - `entity` (dict, required): Entity data to validate
-  - `profile` (str, required): Target ontology profile
+  - `entity_type` (str, required): Entity type/label to validate against
+  - `data` (dict, required): Entity data
+  - `context` (str): Ontology profile context (default: "illd")
 - **Returns**: Validation result with violations
 
 #### `get_ontology_compliance` — Compliance Scoring
 - **Tier**: developer
-- **Purpose**: Compute ontology compliance score for a module
+- **Purpose**: Compute ontology compliance score for a module.
 - **Parameters**:
-  - `module` (str, required): Module to evaluate
-  - `profile` (str, required): Ontology profile
+  - `module_name` (str, required): Module to evaluate
+  - `ontology_profile` (str): Ontology profile (default: "illd")
 - **Returns**: Compliance percentage with violation details
 
 ### 4.11 Category 11: Observability & Health (6 tools)
 
 #### `health_check` — System Health
 - **Tier**: public
-- **Purpose**: Check connectivity to Neo4j, Qdrant, Redis, GPT4IFX, and PostgreSQL
+- **Purpose**: Check connectivity to Neo4j, Qdrant, Redis, and GPT4IFX. Updates the `BACKEND_UP` Prometheus gauges.
 - **Parameters**:
-  - `verbose` (bool): Include detailed diagnostics
-- **Returns**: Service-by-service health status
+  - `verbose` (bool): Include detailed diagnostics (URIs, memory usage, collection names)
+  - `include_test_query` (bool): Run a `MATCH (n) RETURN count(n)` test query against Neo4j
+- **Returns**: `{"status": healthy|degraded, "timestamp", "components": {neo4j, qdrant, redis, gpt4ifx}}`
 
 #### `get_graph_statistics` — Graph Stats
 - **Tier**: public
@@ -924,13 +943,27 @@ Both workspaces share the same MCP server instance and tool set but use separate
 
 #### `get_token_info` — Token Inspection
 - **Tier**: developer
-- **Purpose**: Inspect JWT token timing (issued-at, expires-at, expired status)
+- **Purpose**: Inspect a JWT token's timing fields (issued-at, expires-at, expired status).
+- **Parameters**:
+  - `token` (str, required): JWT to inspect
 - **Returns**: Token metadata
 
 #### `ensure_valid_token` — Token Refresh
 - **Tier**: admin
-- **Purpose**: Force-refresh the GPT4IFX JWT using configured credentials
+- **Purpose**: Ensure a valid GPT4IFX JWT is cached; refresh from credentials if expired.
+- **Parameters**:
+  - `force_refresh` (bool): Force a refresh even if the cached token appears valid (default: false)
 - **Returns**: New token status
+
+### 4.14 Category 14: GAP v2 (1 tool)
+
+#### `query_enhance` — Query Complexity Classifier
+- **Tier**: developer
+- **Purpose**: Classify query complexity and predict optimal search strategy. Exposes the `QueryEnhancer` preprocessing stage. Rule-based, zero LLM dependency, sub-millisecond latency.
+- **Parameters**:
+  - `query` (str, required): Natural language query to analyse
+  - `include_synonyms` (bool): Include expanded domain synonyms (default: false)
+- **Returns**: `{"original_query", "enhanced_query", "complexity": SIMPLE|MEDIUM|COMPLEX, "strategy": GRAPH_HEAVY|VECTOR_HEAVY|HYBRID|EXACT, "suggested_alpha", "suggested_max_results", "detected_entities", "detected_modules", "is_aggregation", "token_budget_hint"}`
 
 ---
 
@@ -977,8 +1010,8 @@ HTTP Request
 | Tier | Tool Count | Access Level |
 |------|-----------|-------------|
 | **public** | 34 | Any authenticated caller |
-| **developer** | 14 | Developer + Admin API keys |
-| **admin** | 8 | Admin API keys only |
+| **developer** | 16 | Developer + Admin API keys |
+| **admin** | 5 | Admin API keys only |
 
 Hierarchy: `admin` can invoke all tools, `developer` can invoke developer + public tools, `public` can invoke only public tools.
 
@@ -987,7 +1020,7 @@ Hierarchy: `admin` can invoke all tools, `developer` can invoke developer + publ
 Policy files in `mcp/auth/policies/`:
 
 - **derived_roles.yaml**: Defines role inheritance (admin includes developer permissions, developer includes public)
-- **resource_mcp_tool.yaml**: Per-tool access control for all 56 tools across the 3 tiers
+- **resource_mcp_tool.yaml**: Per-tool access control for all 55 tools across the 3 tiers
 
 ### 5.4 Transport Mode
 
@@ -1122,7 +1155,7 @@ The Ingestion Pipeline transforms raw artifacts (source code, requirements docum
 ### 7.4 Ingestion Flow
 
 ```
-1. Tool invocation (ingest_file / ingest_module / batch_ingest / ingest_repository)
+1. Tool invocation (`sandbox_upload` via MCP, or `IngestionService.ingest_*` from library code)
       │
       ▼
 2. Job creation → IngestionJobTracker assigns ID, status = "queued"
@@ -1676,19 +1709,21 @@ session_end(session_id="GEST_20260322_001")
 
 #### Ingesting New Knowledge
 
+Production file ingestion is **no longer exposed as MCP tools** (Plan 2 Phase 2). For per-session ingestion via MCP, use `sandbox_upload`; for repository-scale jobs invoke `IngestionService` directly.
+
 ```python
-# Ingest a single file
-ingest_file(file_path="/repo/Adc/src/Adc.c", workspace="illd", module="Adc")
+# Per-session ingestion via MCP (recommended for ad-hoc files)
+session_start(session_id="GEST_20260322_001", assistant_name="GEST")
+sandbox_upload(session_id="GEST_20260322_001",
+               file_path="/repo/Adc/src/Adc.c")
 
-# Ingest an entire module
-ingest_module_from_repo(repo_path="/repo", module="Adc", workspace="illd")
-
-# Batch ingest multiple modules
-batch_ingest_modules(repo_path="/repo", modules=["Adc", "Spi", "Can"],
-                     workspace="illd")
-
-# Full repository ingestion
-ingest_repository(repo_path="/repo", workspace="illd")
+# Library-level ingestion (CI jobs, batch backfills) — Python, not MCP
+from src.IngestionPipeline.ingestion_service import IngestionService
+svc = IngestionService(neo4j_driver=driver)
+svc.ingest_file("/repo/Adc/src/Adc.c", "Adc", workspace_id="illd")
+svc.ingest_module("/repo", "Adc", workspace_id="illd")
+svc.batch_ingest("/repo", modules=["Adc", "Spi", "Can"], workspace_id="illd")
+svc.ingest_repository("/repo", workspace_id="illd")
 ```
 
 #### Managing Cache
@@ -1698,10 +1733,13 @@ ingest_repository(repo_path="/repo", workspace="illd")
 stats = cache_stats()
 
 # Invalidate cache after re-ingestion
-cache_invalidate_module(module="Adc")
+cache_invalidate_module(module_name="Adc")
 
-# Clear all caches
-cache_clear(tier="all")
+# Clear specific tiers (default: all tiers)
+cache_clear(tiers=["lru", "semantic"])
+
+# Reload tunables from environment without restart
+cache_refresh_config()
 ```
 
 #### Monitoring System Health
@@ -1877,7 +1915,7 @@ AICE implements the [Model Context Protocol (MCP)](https://modelcontextprotocol.
 
 ### 15.2 Response Envelope
 
-All 56 tools return data wrapped in a consistent envelope:
+All 55 tools return data wrapped in a consistent envelope:
 
 ```typescript
 // Success

@@ -16,7 +16,7 @@
 
 | Req ID | Requirement | Priority | Rationale | Status |
 |--------|-------------|----------|-----------|--------|
-| AICE-SRV-001 | The MCP server shall expose exactly 56 tools across 13 categories via JSON-RPC 2.0 | Must | Tool inventory per PPTX v3 Developer Guide | IMPLEMENTED |
+| AICE-SRV-001 | The MCP server shall expose 55 tools across 14 categories via JSON-RPC 2.0 | Must | Tool inventory per `mcp.core.tool_tiers.TOOL_TIERS` (Sprint 25) | IMPLEMENTED |
 | AICE-SRV-002 | The MCP server shall support streamable-http transport for production/Kubernetes deployments | Must | Standard HTTP transport for load balancers and service mesh | IMPLEMENTED |
 | AICE-SRV-003 | The MCP server shall support stdio transport for local development and testing | Should | Zero-network-config local development | IMPLEMENTED |
 | AICE-SRV-004 | Transport mode shall be configurable via MCP_TRANSPORT environment variable | Must | Deployment flexibility | IMPLEMENTED |
@@ -121,7 +121,7 @@
 | Req ID | Requirement | Priority | Rationale | Status |
 |--------|-------------|----------|-----------|--------|
 | AICE-MEM-SANDBOX-001 | The `sandbox_upload` tool shall ingest files into a per-session in-memory knowledge graph for experimental content | Must | Ad-hoc document analysis | IMPLEMENTED |
-| AICE-MEM-SANDBOX-002 | The `sandbox_query` tool shall search within the ephemeral sandbox graph | Must | Session-scoped retrieval | IMPLEMENTED |
+| AICE-MEM-SANDBOX-002 | Sandbox-scoped retrieval shall be served by `search_database` when invoked with `session_id` (the legacy `sandbox_query` tool was removed; routing is automatic via the `@with_session_routing` decorator) | Must | Session-scoped retrieval | IMPLEMENTED |
 | AICE-MEM-SANDBOX-003 | The `sandbox_status` tool shall return sandbox statistics (nodes, relationships, files) | Should | Sandbox monitoring | IMPLEMENTED |
 | AICE-MEM-SANDBOX-004 | The `sandbox_clear` tool shall delete all sandbox content for a session | Should | Resource cleanup | IMPLEMENTED |
 | AICE-MEM-SANDBOX-005 | Sandbox content shall be automatically destroyed when the parent session ends | Must | No data leakage between sessions | IMPLEMENTED |
@@ -216,7 +216,7 @@
 | Req ID | Requirement | Priority | Rationale | Status |
 |--------|-------------|----------|-----------|--------|
 | AICE-PROM-001 | The MCP server shall expose a `/metrics` endpoint for Prometheus scraping via `prometheus_client` ASGI app | Must | Real-time time-series metrics | IMPLEMENTED |
-| AICE-PROM-002 | All 56 tools shall be automatically instrumented via `_ok()`/`_err()` helpers (no per-tool code changes) | Must | Zero-effort metric collection | IMPLEMENTED |
+| AICE-PROM-002 | All 55 tools shall be automatically instrumented via `_ok()`/`_err()` helpers (no per-tool code changes) | Must | Zero-effort metric collection | IMPLEMENTED |
 | AICE-PROM-003 | The system shall expose 11 Prometheus metric types: tool_requests_total, tool_request_duration, search_requests_total, search_duration, cache_requests_total, active_sessions, rlm_requests_total, rlm_subqueries, ingestion_files_total, backend_up, review_routing_total | Must | Comprehensive operational metrics | IMPLEMENTED |
 | AICE-PROM-004 | If `prometheus_client` is not installed, all metrics shall degrade to `_NoOp` stubs that silently ignore all method calls | Must | Graceful degradation without metrics dependency | IMPLEMENTED |
 | AICE-PROM-005 | Metrics shall be opt-in via `ENABLE_METRICS` environment variable | Should | Resource savings in development | IMPLEMENTED |

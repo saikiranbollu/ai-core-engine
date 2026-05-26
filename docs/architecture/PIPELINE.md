@@ -72,7 +72,7 @@ Traverses the knowledge graph for structurally related nodes:
 MISRA rules, iLLD API relationships, register hierarchies, and
 requirement traceability edges.
 
-- **Module**: `src/HybridRAG/code/querier/graph_search.py`
+- **Module**: `src/HybridRAG/code/querier/search_service.py` (the graph-search stage is implemented as `SearchService._graph_search()` and its consolidated UNWIND helper; there is **no** separate `graph_search.py` file)
 - **Read mode**: `READ_ACCESS` (H14 fix)
 - **Injection protection**: Label allowlist (H17 fix)
 - **ID format**: `elementId()` (M07 migration)
@@ -83,7 +83,7 @@ requirement traceability edges.
 Dense retrieval using 384-dimensional embeddings (all-MiniLM-L6-v2 via
 FlashRank, replacing PyTorch/sentence-transformers per ADR-038).
 
-- **Module**: `src/HybridRAG/code/querier/vector_search.py`
+- **Module**: `src/HybridRAG/code/querier/search_service.py` (implemented as `SearchService._vector_search()`; there is **no** separate `vector_search.py` file)
 - **Fallback**: 384-dim zero-padded embeddings (H18 fix)
 - **Alpha = 0.0** selects pure vector search.
 
@@ -93,7 +93,7 @@ Reciprocal Rank Fusion combines graph and vector result lists into a
 single ranked set. Batch enrichment resolves cross-references and
 attaches metadata (module, file path, confidence scores).
 
-- **Module**: `src/HybridRAG/code/querier/rrf_merge.py`
+- **Module**: `src/HybridRAG/code/querier/search_service.py` (implemented as `SearchService._merge_results_rrf()`; there is **no** separate `rrf_merge.py` file). Batch enrichment is in `src/HybridRAG/code/querier/batch_graph_resolver.py`.
 - **Token estimation**: `len(text) // 4` (M09 standardization)
 
 ### Stage 5 — Cross-Encoder Reranking (GAP-A01, FlashRank)

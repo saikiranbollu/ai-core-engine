@@ -137,6 +137,71 @@ DEFAULT_RELATIONSHIPS_PATH = None
 DEFAULT_FOLDERS_CACHE_PATH = None
 
 
+class ClearAbortedError(Exception):
+    """Raised when the user aborts a --clear-all confirmation prompt."""
+    pass
+
+
+class DeprecatedClearError(Exception):
+    """Raised when --clear is used without module scope and without --clear-all.
+
+    F-CD-B01: The historical behavior of wiping the entire database via
+    --clear (without --clear-all) is deprecated. Callers must either
+    provide a --module or use --clear-all explicitly.
+    """
+    pass
+
+
+def _do_clear_module(run_fn, write_tx_fn, module: str, db: str) -> int:
+    """Module-scoped DETACH DELETE — shared between builder classes.
+
+    Returns the count of deleted nodes.
+    """
+    rows = run_fn(
+        "MATCH (n) WHERE toUpper(n.module) = toUpper($mod) "
+        "RETURN count(n) AS c",
+        {"mod": module},
+    ) or []
+    count_before = rows[0]["c"] if rows else 0
+    logger.warning(
+        "Clearing %d nodes for module '%s' in database '%s'…",
+        count_before, module, db,
+    )
+    write_tx_fn(
+        "MATCH (n) WHERE toUpper(n.module) = toUpper($mod) DETACH DELETE n",
+        {"mod": module},
+    )
+    logger.info("Module '%s' cleared (%d nodes deleted).", module, count_before)
+    return count_before
+
+
+def _do_clear_all_confirmed(run_fn, write_tx_fn, db: str) -> int:
+    """Full database wipe with interactive confirmation.
+
+    Raises ClearAbortedError if user does not confirm.
+    Returns the count of deleted nodes.
+    """
+    rows = run_fn("MATCH (n) RETURN count(n) AS c") or []
+    count = rows[0]["c"] if rows else 0
+    print(
+        f"\n  WARNING: This will DELETE ALL {count:,} nodes in "
+        f"database '{db}'.\n  This action cannot be undone.\n"
+    )
+    try:
+        confirm = input(
+            f"  Type the database name '{db}' to confirm: "
+        ).strip()
+    except EOFError:
+        confirm = ""
+    if confirm != db:
+        raise ClearAbortedError(
+            f"Clear-all aborted: expected '{db}', got '{confirm}'."
+        )
+    write_tx_fn("MATCH (n) DETACH DELETE n")
+    logger.warning("FULL DATABASE CLEAR executed by user. %d nodes deleted.", count)
+    return count
+
+
 def get_module_paths(module: str) -> dict:
     """Return module-specific file paths for MCAL Jama data.
 
@@ -272,7 +337,12 @@ def get_neo4j_settings(profile: str, storage_cfg: dict) -> dict:
 
 
 def _stamp_project_on_module(neo4j_cfg: dict, module: str, project: str) -> None:
-    """Set ``project`` on every node whose ``module`` matches *module*."""
+    """Set ``project`` on every node whose ``module`` matches *module*.
+
+    Only stamps nodes that do NOT already have a project set.
+    This prevents cross-project contamination when multiple projects
+    share the same module name (e.g. A3G GPT and RC1 GPT).
+    """
     from neo4j import GraphDatabase as _GD
     driver = _GD.driver(
         neo4j_cfg["uri"],
@@ -280,7 +350,7 @@ def _stamp_project_on_module(neo4j_cfg: dict, module: str, project: str) -> None
     )
     cypher = (
         "MATCH (n) "
-        "WHERE n.module = $module AND (n.project IS NULL OR n.project <> $project) "
+        "WHERE n.module = $module AND n.project IS NULL "
         "SET n.project = $project "
         "RETURN count(n) AS cnt"
     )
@@ -462,6 +532,7 @@ class KnowledgeGraphBuilder:
         jama_cfg: Optional[dict] = None,
         module: Optional[str] = None,
         force_incremental: bool = False,
+        clear_all: bool = False,
     ):
         self.profile = profile
         self.profile_cfg = get_profile_config(ontology, profile)
@@ -469,6 +540,7 @@ class KnowledgeGraphBuilder:
         self.data_path = data_path
         self.dry_run = dry_run
         self.clear_db = clear_db
+        self.clear_all = clear_all
         self.force_incremental = force_incremental
         # Derive module-aware cache paths from data_path if not explicitly given
         if not relationships_path or not folders_path:
@@ -762,10 +834,23 @@ class KnowledgeGraphBuilder:
     # -- Clear database -----------------------------------------------------
 
     def _clear_database(self):
-        """Delete all nodes and relationships in the target database."""
-        logger.warning("Clearing ALL data in database '%s'…", self.neo4j_cfg["database"])
-        self._write_tx("MATCH (n) DETACH DELETE n")
-        logger.info("Database cleared.")
+        """Delete data prior to ingestion.
+
+        F-CD-B01: ``--clear`` is module-scoped when ``self.module`` is set
+        (only nodes with matching ``module`` property are removed). A full
+        wipe now requires the separate ``--clear-all`` flag (``self.clear_all``)
+        and an interactive confirmation. This prevents the historical
+        footgun where ``--clear`` silently obliterated 20 modules of data.
+        """
+        if self.clear_all:
+            _do_clear_all_confirmed(self._run, self._write_tx, self.neo4j_cfg["database"])
+        elif self.module:
+            _do_clear_module(self._run, self._write_tx, self.module, self.neo4j_cfg["database"])
+        else:
+            raise DeprecatedClearError(
+                "F-CD-B01: --clear used without --module scope. "
+                "Use --clear-all for a full wipe, or specify --module."
+            )
 
     # -- Constraints & Indexes -----------------------------------------------
 
@@ -1866,12 +1951,14 @@ class ILLDKnowledgeGraphBuilder:
         data_path: Path,
         dry_run: bool = False,
         clear_db: bool = False,
+        clear_all: bool = False,
     ):
         self.neo4j_cfg = neo4j_cfg
         self.module = module.upper()
         self.data_path = data_path
         self.dry_run = dry_run
         self.clear_db = clear_db
+        self.clear_all = clear_all
         self.stats: dict = Counter()
         self._driver = None
 
@@ -1990,9 +2077,12 @@ class ILLDKnowledgeGraphBuilder:
 
         try:
             if self.clear_db:
-                logger.warning("Clearing ALL data in database '%s'…", self.neo4j_cfg["database"])
-                self._write_tx("MATCH (n) DETACH DELETE n")
-                logger.info("Database cleared.")
+                # F-CD-B01: module-scoped by default; --clear-all → full wipe
+                # with confirmation.
+                if self.clear_all:
+                    _do_clear_all_confirmed(self._run, self._write_tx, self.neo4j_cfg["database"])
+                else:
+                    _do_clear_module(self._run, self._write_tx, self.module, self.neo4j_cfg["database"])
 
             # Step 3: Create nodes
             logger.info("Step 2/4: Creating %d nodes…", len(nodes))
@@ -3186,7 +3276,18 @@ def main():
     parser.add_argument(
         "--clear",
         action="store_true",
-        help="Delete all existing data in the target database before building.",
+        help=(
+            "F-CD-B01: Delete data for THIS MODULE only before ingestion. "
+            "Other modules are left untouched. Use --clear-all for a full wipe."
+        ),
+    )
+    parser.add_argument(
+        "--clear-all",
+        action="store_true",
+        help=(
+            "DANGEROUS: Delete the ENTIRE database (all modules). "
+            "Requires interactive confirmation. Use with extreme caution."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -3205,6 +3306,10 @@ def main():
         help="Enable DEBUG logging.",
     )
     args = parser.parse_args()
+
+    # F-CD-B01: --clear and --clear-all are mutually exclusive.
+    if args.clear and args.clear_all:
+        parser.error("--clear and --clear-all are mutually exclusive")
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -3243,6 +3348,7 @@ def main():
             data_path=data_path,
             dry_run=args.dry_run,
             clear_db=args.clear,
+            clear_all=args.clear_all,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()
@@ -3321,6 +3427,7 @@ def main():
         data_path=data_path,
         dry_run=args.dry_run,
         clear_db=args.clear,
+        clear_all=args.clear_all,
         relationships_path=relationships_path,
         folders_path=folders_path,
         jama_cfg=jama_cfg,
@@ -3548,6 +3655,16 @@ class SourceCodeKnowledgeGraphBuilder:
         self._call_edges: list[dict] = []
         self._register_accesses: list[dict] = []
         self._global_ref_edges: list[dict] = []
+        self._clang_parsed_func_ids: set[str] = set()
+
+    @property
+    def _uid_prefix(self) -> str:
+        """Project-scoped UID prefix for multi-project node isolation.
+
+        When a project is set (e.g. 'A3G', 'RC1'), UIDs are prefixed
+        so that nodes from different projects don't MERGE together.
+        """
+        return f"{self.project}::" if self.project else ""
 
     # -- Connection ---------------------------------------------------------
 
@@ -3722,13 +3839,13 @@ class SourceCodeKnowledgeGraphBuilder:
             logger.info("Step 4/5: Creating nodesΓÇª")
             self._create_nodes()
 
+            # ── Stamp project property on SRC_* nodes (before relationships) ──
+            if self.project:
+                self._stamp_project()
+
             # Step 5: Create relationships
             logger.info("Step 5/5: Creating relationshipsΓÇª")
             self._create_relationships()
-
-            # ── Stamp project property on SRC_* nodes ──
-            if self.project:
-                self._stamp_project()
 
             # ── Stamp hashes ──
             if self._src_all_hashes:
@@ -3750,11 +3867,15 @@ class SourceCodeKnowledgeGraphBuilder:
     )
 
     def _stamp_project(self):
-        """Set ``project`` property on all SRC_* nodes for this module."""
+        """Set ``project`` property on all SRC_* nodes for this module.
+
+        Only stamps nodes with project IS NULL to avoid overwriting
+        nodes belonging to a different project (e.g. A3G vs RC1).
+        """
         for label in self._SRC_NODE_LABELS:
             cypher = (
                 f"MATCH (n:{label} {{module: $module}}) "
-                f"WHERE n.project IS NULL OR n.project <> $project "
+                f"WHERE n.project IS NULL "
                 f"SET n.project = $project"
             )
             self._write_tx(cypher, {"module": self.module, "project": self.project})
@@ -3790,8 +3911,11 @@ class SourceCodeKnowledgeGraphBuilder:
             # Build a set of filenames from CfgMcal (e.g. Adc_Data.c)
             cfg_names = {f.name for f in cfg_files}
             # Filter: only CfgMcal files whose name matches this module
-            mod_prefix = self.module.capitalize()  # e.g. "Adc"
-            cfg_files = [f for f in cfg_files if f.name.startswith(mod_prefix)]
+            # Use case-insensitive comparison because capitalize() fails for
+            # multi-part module names (e.g. "ETH_17_GETH".capitalize() gives
+            # "Eth_17_geth" but filename is "Eth_17_Geth_Data.c")
+            mod_prefix_lower = self.module.lower()  # e.g. "eth_17_geth"
+            cfg_files = [f for f in cfg_files if f.name.lower().startswith(mod_prefix_lower)]
             cfg_names = {f.name for f in cfg_files}
             if cfg_names:
                 # Remove template files that have a generated replacement
@@ -4004,8 +4128,9 @@ class SourceCodeKnowledgeGraphBuilder:
             cfg_files = (
                 list(cfg_src.glob("**/*.c")) + list(cfg_src.glob("**/*.h"))
             )
-            mod_prefix = self.module.capitalize()  # e.g. "Adc"
-            cfg_files = [f for f in cfg_files if f.name.startswith(mod_prefix)]
+            # Use case-insensitive comparison (see _discover_c_files comment)
+            mod_prefix_lower = self.module.lower()  # e.g. "eth_17_geth"
+            cfg_files = [f for f in cfg_files if f.name.lower().startswith(mod_prefix_lower)]
             cfg_names = {f.name for f in cfg_files}
             if cfg_names:
                 before = len(files)
@@ -4176,7 +4301,7 @@ class SourceCodeKnowledgeGraphBuilder:
                     break
 
         return {
-            "file_id": rel_path,
+            "file_id": f"{self._uid_prefix}{rel_path}",
             "_abs_path": str(fpath.resolve()),
             "file_name": fpath.name,
             "relative_path": rel_path,
@@ -4190,6 +4315,7 @@ class SourceCodeKnowledgeGraphBuilder:
             "includes": json.dumps(includes) if includes else None,
             "traceability_ids": json.dumps(guids) if guids else None,
             "module": self.module,
+            "project": self.project,
         }
 
     # ΓöÇΓöÇ Function extraction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -4283,7 +4409,7 @@ class SourceCodeKnowledgeGraphBuilder:
             # Get doc block info
             doc = doc_blocks.get(func_name, {})
 
-            func_id = f"{rel_path}::{func_name}"
+            func_id = f"{self._uid_prefix}{rel_path}::{func_name}"
 
             func_node = {
                 "function_id": func_id,
@@ -4302,6 +4428,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "compile_condition": compile_cond,
                 "traceability_ids": json.dumps(doc["guids"]) if doc.get("guids") else None,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": rel_path,
             }
             self._functions.append(func_node)
@@ -4315,6 +4442,7 @@ class SourceCodeKnowledgeGraphBuilder:
 
             # ΓöÇΓöÇ Call graph from C parser result ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
             if parser_result and func_name in parser_result.get("functions", {}):
+                self._clang_parsed_func_ids.add(func_id)
                 func_data = parser_result["functions"][func_name]
                 calls = func_data.get("internal_calls", [])
                 if isinstance(calls, list):
@@ -4371,6 +4499,9 @@ class SourceCodeKnowledgeGraphBuilder:
                         "callee": gr.get("callee", ""),
                         "alias_local": gr.get("alias_local", ""),
                         "via_chain": gr.get("via_chain", ""),
+                        "accessed_member": gr.get("accessed_member", ""),
+                        "in_critical_section": gr.get("in_critical_section", False),
+                        "critical_section_name": gr.get("critical_section_name", ""),
                     })
             else:
                 # ━━━━ Regex fallback for functions NOT covered by clang ━━━━
@@ -4499,7 +4630,7 @@ class SourceCodeKnowledgeGraphBuilder:
             desc = self._find_preceding_comment(raw_content, name)
             start_line = clean_content[:m.start()].count("\n") + 1
             self._data_types.append({
-                "type_id": f"{rel_path}::{name}",
+                "type_id": f"{self._uid_prefix}{rel_path}::{name}",
                 "name": name,
                 "kind": "struct",
                 "members": json.dumps(members) if members else None,
@@ -4508,6 +4639,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "traceability_ids": json.dumps(guids) if guids else None,
                 "start_line": start_line,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": rel_path,
             })
 
@@ -4523,7 +4655,7 @@ class SourceCodeKnowledgeGraphBuilder:
             desc = self._find_preceding_comment(raw_content, name)
             start_line = clean_content[:m.start()].count("\n") + 1
             self._data_types.append({
-                "type_id": f"{rel_path}::{name}",
+                "type_id": f"{self._uid_prefix}{rel_path}::{name}",
                 "name": name,
                 "kind": "union",
                 "members": json.dumps(members) if members else None,
@@ -4532,6 +4664,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "traceability_ids": json.dumps(guids) if guids else None,
                 "start_line": start_line,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": rel_path,
             })
 
@@ -4544,7 +4677,7 @@ class SourceCodeKnowledgeGraphBuilder:
             desc = self._find_preceding_comment(raw_content, name)
             start_line = clean_content[:m.start()].count("\n") + 1
             self._data_types.append({
-                "type_id": f"{rel_path}::{name}",
+                "type_id": f"{self._uid_prefix}{rel_path}::{name}",
                 "name": name,
                 "kind": "enum",
                 "members": json.dumps(members) if members else None,
@@ -4553,6 +4686,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "traceability_ids": json.dumps(guids) if guids else None,
                 "start_line": start_line,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": rel_path,
             })
 
@@ -4567,7 +4701,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 continue
             start_line = clean_content[:m.start()].count("\n") + 1
             self._data_types.append({
-                "type_id": f"{rel_path}::{name}",
+                "type_id": f"{self._uid_prefix}{rel_path}::{name}",
                 "name": name,
                 "kind": "typedef",
                 "members": None,
@@ -4576,6 +4710,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "traceability_ids": None,
                 "start_line": start_line,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": rel_path,
             })
 
@@ -4608,7 +4743,7 @@ class SourceCodeKnowledgeGraphBuilder:
             guids = self._find_preceding_guids(raw_content, name)
 
             self._macros.append({
-                "macro_id": f"{rel_path}::{name}",
+                "macro_id": f"{self._uid_prefix}{rel_path}::{name}",
                 "name": name,
                 "value": value[:500] if value else None,  # truncate very long values
                 "macro_category": category,
@@ -4616,6 +4751,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "traceability_ids": json.dumps(guids) if guids else None,
                 "start_line": start_line,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": rel_path,
             })
 
@@ -4735,7 +4871,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 full_type += array_bounds
 
             self._global_variables.append({
-                "variable_id": f"{rel_path}::{var_name}",
+                "variable_id": f"{self._uid_prefix}{rel_path}::{var_name}",
                 "name": var_name,
                 "data_type": full_type,
                 "is_static": is_static,
@@ -4749,6 +4885,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "description": desc,
                 "traceability_ids": json.dumps(guids) if guids else None,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": rel_path,
             })
 
@@ -4796,7 +4933,8 @@ class SourceCodeKnowledgeGraphBuilder:
         seen_grefs: dict[tuple, dict] = {}
         for e in self._global_ref_edges:
             k = (e["function_id"], e["global_name"], e.get("line", 0),
-                 e.get("access_context", ""))
+                 e.get("access_context", ""),
+                 e.get("accessed_member", ""))
             seen_grefs[k] = e
         self._global_ref_edges = list(seen_grefs.values())
 
@@ -4830,7 +4968,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 continue
             known.add(gname)
             self._global_variables.append({
-                "variable_id": f"CfgMcal::{gname}",
+                "variable_id": f"{self._uid_prefix}CfgMcal::{gname}",
                 "name": gname,
                 "data_type": "",
                 "is_static": True,
@@ -4844,6 +4982,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "description": "Auto-injected from struct chain resolver",
                 "traceability_ids": None,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": "CfgMcal",
             })
             added += 1
@@ -4861,7 +5000,7 @@ class SourceCodeKnowledgeGraphBuilder:
     ):
         """Extract local variable declarations from a function body."""
         lines = func_body.split("\n")
-        func_id = f"{rel_path}::{func_name}"
+        func_id = f"{self._uid_prefix}{rel_path}::{func_name}"
 
         # Build condition map relative to function body
         cond_stack: list[str] = []
@@ -4929,6 +5068,7 @@ class SourceCodeKnowledgeGraphBuilder:
                 "compile_condition": compile_cond,
                 "start_line": abs_line,
                 "module": self.module,
+                "project": self.project,
                 "_file_id": rel_path,
                 "_function_id": func_id,
             })
@@ -4963,9 +5103,13 @@ class SourceCodeKnowledgeGraphBuilder:
         return self._RE_COVER_GUID.findall(preceding)
 
     @staticmethod
+    @staticmethod
     def _strip_comments(code: str) -> str:
-        """Remove C comments (block + line)."""
-        code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+        """Remove C comments (block + line), preserving line numbers."""
+        # Replace block comments with equivalent newlines to keep line counts
+        def _block_repl(m):
+            return '\n' * m.group(0).count('\n')
+        code = re.sub(r'/\*.*?\*/', _block_repl, code, flags=re.DOTALL)
         code = re.sub(r'//.*?$', '', code, flags=re.MULTILINE)
         return code
 
@@ -5045,13 +5189,19 @@ class SourceCodeKnowledgeGraphBuilder:
     def _create_nodes(self):
         """Create all SRC_ nodes using UNWIND + MERGE."""
 
-        # Clean up stale SRC_GlobalVariable nodes for this module
+        # Clean up stale SRC_GlobalVariable nodes for this module+project
         # (struct field false positives may remain from earlier runs)
         if self._global_variables is not None:
-            self._write_tx(
-                "MATCH (g:SRC_GlobalVariable {module: $module}) DETACH DELETE g",
-                {"module": self.module},
-            )
+            if self.project:
+                self._write_tx(
+                    "MATCH (g:SRC_GlobalVariable {module: $module, project: $project}) DETACH DELETE g",
+                    {"module": self.module, "project": self.project},
+                )
+            else:
+                self._write_tx(
+                    "MATCH (g:SRC_GlobalVariable {module: $module}) DETACH DELETE g",
+                    {"module": self.module},
+                )
 
         node_groups = {
             "SRC_SourceFile":    self._files,
@@ -5109,6 +5259,7 @@ class SourceCodeKnowledgeGraphBuilder:
         self._create_implements_ea_rels()
         self._create_traceability_rels()
         self._create_register_access_rels()
+        self._propagate_callee_accesses()
 
     def _create_defined_in_rels(self):
         """SRC_Function / SRC_DataType / SRC_Macro / SRC_*Variable ΓåÆ SRC_SourceFile."""
@@ -5120,7 +5271,7 @@ class SourceCodeKnowledgeGraphBuilder:
             ("SRC_LocalVariable", self._local_variables, "variable_id"),
         ]:
             edges = [
-                {"uid": item[uid_prop], "file_id": item["_file_id"]}
+                {"uid": item[uid_prop], "file_id": f"{self._uid_prefix}{item['_file_id']}"}
                 for item in items
             ]
             if not edges:
@@ -5138,45 +5289,78 @@ class SourceCodeKnowledgeGraphBuilder:
             self.stats[f"rel:SRC_DEFINED_IN({node_type})"] = len(edges)
 
     def _create_call_graph_rels(self):
-        """SRC_Function -[SRC_CALLS]ΓåÆ SRC_Function (by function name)."""
+        """SRC_Function -[SRC_CALLS]→ SRC_Function (by function name)."""
         if not self._call_edges:
             return
 
-        logger.info("  Creating SRC_CALLS (%d edges)ΓÇª", len(self._call_edges))
+        logger.info("  Creating SRC_CALLS (%d edges)…", len(self._call_edges))
 
-        # Build lookup: function name ΓåÆ list of function_ids
+        # Build lookup: function name → list of function_ids
         # (a function name can appear in multiple files, prefer same-module match)
         func_name_set = {f["name"] for f in self._functions}
 
-        # Filter edges where we know both caller and callee
-        valid_edges = []
+        # Split edges into intra-module and cross-module
+        intra_edges = []
+        cross_edges = []
         for edge in self._call_edges:
+            clean = {
+                "caller_id": edge["caller_id"],
+                "callee_name": edge["callee_name"],
+                "call_order": edge.get("call_order", 0),
+            }
+            if edge.get("case_label"):
+                clean["case_label"] = edge["case_label"]
             if edge["callee_name"] in func_name_set:
-                clean = {
-                    "caller_id": edge["caller_id"],
-                    "callee_name": edge["callee_name"],
-                    "call_order": edge.get("call_order", 0),
-                }
-                if edge.get("case_label"):
-                    clean["case_label"] = edge["case_label"]
-                valid_edges.append(clean)
+                intra_edges.append(clean)
+            else:
+                cross_edges.append(clean)
 
-        if not valid_edges:
+        if not intra_edges and not cross_edges:
             logger.info("    No resolvable call edges (callees outside module)")
             return
 
-        logger.info("    %d edges resolve to known functions", len(valid_edges))
-        for chunk in self._chunked(valid_edges, self.BATCH_SIZE):
-            cypher = (
-                "UNWIND $edges AS e "
-                "MATCH (caller:SRC_Function {function_id: e.caller_id}) "
-                "MATCH (callee:SRC_Function {name: e.callee_name, module: $module}) "
-                "MERGE (caller)-[r:SRC_CALLS]->(callee) "
-                "SET r.call_order = e.call_order "
-                "SET r.case_label = e.case_label"
-            )
-            self._write_tx(cypher, {"edges": chunk, "module": self.module})
-        self.stats["rel:SRC_CALLS"] = len(valid_edges)
+        # Intra-module edges: match callee within same module+project
+        if intra_edges:
+            logger.info("    %d intra-module edges", len(intra_edges))
+            for chunk in self._chunked(intra_edges, self.BATCH_SIZE):
+                if self.project:
+                    cypher = (
+                        "UNWIND $edges AS e "
+                        "MATCH (caller:SRC_Function {function_id: e.caller_id}) "
+                        "MATCH (callee:SRC_Function {name: e.callee_name, module: $module, project: $project}) "
+                        "MERGE (caller)-[r:SRC_CALLS]->(callee) "
+                        "SET r.call_order = e.call_order "
+                        "SET r.case_label = e.case_label"
+                    )
+                    self._write_tx(cypher, {"edges": chunk, "module": self.module, "project": self.project})
+                else:
+                    cypher = (
+                        "UNWIND $edges AS e "
+                        "MATCH (caller:SRC_Function {function_id: e.caller_id}) "
+                        "MATCH (callee:SRC_Function {name: e.callee_name, module: $module}) "
+                        "MERGE (caller)-[r:SRC_CALLS]->(callee) "
+                        "SET r.call_order = e.call_order "
+                        "SET r.case_label = e.case_label"
+                    )
+                    self._write_tx(cypher, {"edges": chunk, "module": self.module})
+
+        # Cross-module edges: match callee in ANY module
+        if cross_edges:
+            logger.info("    %d potential cross-module edges", len(cross_edges))
+            for chunk in self._chunked(cross_edges, self.BATCH_SIZE):
+                cypher = (
+                    "UNWIND $edges AS e "
+                    "MATCH (caller:SRC_Function {function_id: e.caller_id}) "
+                    "MATCH (callee:SRC_Function {name: e.callee_name}) "
+                    "WHERE callee.module <> $module "
+                    "MERGE (caller)-[r:SRC_CALLS]->(callee) "
+                    "SET r.call_order = e.call_order, "
+                    "    r.case_label = e.case_label, "
+                    "    r.cross_module = true"
+                )
+                self._write_tx(cypher, {"edges": chunk, "module": self.module})
+
+        self.stats["rel:SRC_CALLS"] = len(intra_edges) + len(cross_edges)
 
     def _create_belongs_to_module_rels(self):
         """SRC_* → MCALModule."""
@@ -5211,7 +5395,7 @@ class SourceCodeKnowledgeGraphBuilder:
             return
 
         edges = [
-            {"file_id": gv["_file_id"], "var_id": gv["variable_id"]}
+            {"file_id": f"{self._uid_prefix}{gv['_file_id']}", "var_id": gv["variable_id"]}
             for gv in self._global_variables
         ]
         logger.info("  Creating SRC_HAS_GLOBAL_VAR (%d edges)ΓÇª", len(edges))
@@ -5265,7 +5449,6 @@ class SourceCodeKnowledgeGraphBuilder:
                 gv_name_to_id[gv["name"]] = gv["variable_id"]
 
         # --- Phase 1: Use clang-extracted global_ref_edges ---
-        clang_covered_funcs: set = set()
         if self._global_ref_edges:
             for gre in self._global_ref_edges:
                 func_id = gre["function_id"]
@@ -5279,14 +5462,19 @@ class SourceCodeKnowledgeGraphBuilder:
                         "callee": gre.get("callee", ""),
                         "alias_local": gre.get("alias_local", ""),
                         "via_chain": gre.get("via_chain", ""),
+                        "accessed_members": gre.get("accessed_member", ""),
+                        "in_critical_section": gre.get("in_critical_section", False),
+                        "critical_section_name": gre.get("critical_section_name", ""),
                     })
-                    clang_covered_funcs.add(func_id)
 
-        # --- Phase 2: Regex fallback for functions NOT covered by clang ---
+        # --- Phase 2: Regex fallback for functions NOT parsed by clang ---
+        # Only runs for functions that clang never saw (e.g. disabled
+        # #ifdef blocks in non-sum-mode).  Functions that clang parsed
+        # but have zero global_refs are legitimately clean — no fallback.
         for func in self._functions:
             func_id = func["function_id"]
-            if func_id in clang_covered_funcs:
-                continue  # already handled by clang
+            if func_id in self._clang_parsed_func_ids:
+                continue  # clang already handled this function
 
             start = func.get("start_line", 0)
             end = func.get("end_line", 0)
@@ -5318,23 +5506,25 @@ class SourceCodeKnowledgeGraphBuilder:
                     if gv_name in gv_name_to_id:
                         edges.append({"func_id": func_id, "var_id": gv_name_to_id[gv_name],
                                       "access_type": "READ", "access_context": "REGEX",
-                                      "callee": "", "alias_local": ""})
+                                      "callee": "", "alias_local": "", "accessed_members": ""})
                     else:
                         for gv in self._global_variables:
                             if gv["name"] == gv_name:
                                 edges.append({"func_id": func_id, "var_id": gv["variable_id"],
                                               "access_type": "READ", "access_context": "REGEX",
-                                              "callee": "", "alias_local": ""})
+                                              "callee": "", "alias_local": "", "accessed_members": ""})
                                 break
 
         if not edges:
             logger.info("  Skipping SRC_USES_GLOBAL (no usage edges detected)")
             return
 
-        # Deduplicate — merge contexts when same (func, global) pair
+        # Deduplicate — keep one edge per (func, global, member) so that
+        # per-member access types are preserved for DaFA analysis.
+        # Edges with the same member but different contexts are merged.
         seen: dict[tuple, dict] = {}
         for e in edges:
-            key = (e["func_id"], e["var_id"])
+            key = (e["func_id"], e["var_id"], e.get("accessed_members", ""))
             if key not in seen:
                 seen[key] = e
             else:
@@ -5347,6 +5537,9 @@ class SourceCodeKnowledgeGraphBuilder:
                     existing["alias_local"] = e["alias_local"]
                 if e.get("via_chain") and not existing.get("via_chain"):
                     existing["via_chain"] = e["via_chain"]
+                elif (e.get("via_chain") and existing.get("via_chain")
+                      and len(e["via_chain"]) > len(existing["via_chain"])):
+                    existing["via_chain"] = e["via_chain"]
                 if e.get("callee") and not existing.get("callee"):
                     existing["callee"] = e["callee"]
                 # Merge access types: different types → READ_WRITE
@@ -5356,26 +5549,37 @@ class SourceCodeKnowledgeGraphBuilder:
                     existing["access_type"] = "READ_WRITE"
         edges = list(seen.values())
 
-        logger.info("  Creating SRC_USES_GLOBAL (%d edges, %d from clang, rest from regex)…",
-                     len(edges), len(clang_covered_funcs))
+        clang_edge_count = sum(1 for e in edges if e.get("access_context", "") != "REGEX")
+        logger.info("  Creating SRC_USES_GLOBAL (%d edges, %d from clang, %d with accessed_members)…",
+                     len(edges), clang_edge_count,
+                     sum(1 for e in edges if e.get("accessed_members")))
 
-        # Clean up existing SRC_USES_GLOBAL edges for this module
-        self._write_tx(
-            "MATCH (f:SRC_Function {module: $module})-[r:SRC_USES_GLOBAL]->() DELETE r",
-            {"module": self.module},
-        )
+        # Clean up existing SRC_USES_GLOBAL edges for this module+project
+        if self.project:
+            self._write_tx(
+                "MATCH (f:SRC_Function {module: $module, project: $project})-[r:SRC_USES_GLOBAL]->() DELETE r",
+                {"module": self.module, "project": self.project},
+            )
+        else:
+            self._write_tx(
+                "MATCH (f:SRC_Function {module: $module})-[r:SRC_USES_GLOBAL]->() DELETE r",
+                {"module": self.module},
+            )
 
         for chunk in self._chunked(edges, self.BATCH_SIZE):
             cypher = (
                 "UNWIND $edges AS e "
                 "MATCH (f:SRC_Function {function_id: e.func_id}) "
                 "MATCH (g:SRC_GlobalVariable {variable_id: e.var_id}) "
-                "MERGE (f)-[r:SRC_USES_GLOBAL]->(g) "
+                "CREATE (f)-[r:SRC_USES_GLOBAL]->(g) "
                 "SET r.access_type = e.access_type, "
                 "    r.access_context = e.access_context, "
                 "    r.callee = CASE WHEN e.callee <> '' THEN e.callee ELSE null END, "
                 "    r.alias_local = CASE WHEN e.alias_local <> '' THEN e.alias_local ELSE null END, "
-                "    r.via_chain = CASE WHEN e.via_chain <> '' THEN e.via_chain ELSE null END"
+                "    r.via_chain = CASE WHEN e.via_chain <> '' THEN e.via_chain ELSE null END, "
+                "    r.accessed_members = CASE WHEN e.accessed_members <> '' THEN e.accessed_members ELSE null END, "
+                "    r.in_critical_section = e.in_critical_section, "
+                "    r.critical_section_name = CASE WHEN e.critical_section_name <> '' THEN e.critical_section_name ELSE null END"
             )
             self._write_tx(cypher, {"edges": chunk})
         self.stats["rel:SRC_USES_GLOBAL"] = len(edges)
@@ -5435,12 +5639,20 @@ class SourceCodeKnowledgeGraphBuilder:
             return
 
         logger.info("  Creating SRC_IMPLEMENTS_EA (matching against %d EA functions)…", ea_count)
-        cypher = (
-            "MATCH (src:SRC_Function {module: $module}) "
-            "MATCH (ea:EA_Function {name: src.name, module: $module}) "
-            "MERGE (src)-[:SRC_IMPLEMENTS_EA]->(ea)"
-        )
-        self._write_tx(cypher, {"module": self.module})
+        if self.project:
+            cypher = (
+                "MATCH (src:SRC_Function {module: $module, project: $project}) "
+                "MATCH (ea:EA_Function {name: src.name, module: $module, project: $project}) "
+                "MERGE (src)-[:SRC_IMPLEMENTS_EA]->(ea)"
+            )
+            self._write_tx(cypher, {"module": self.module, "project": self.project})
+        else:
+            cypher = (
+                "MATCH (src:SRC_Function {module: $module}) "
+                "MATCH (ea:EA_Function {name: src.name, module: $module}) "
+                "MERGE (src)-[:SRC_IMPLEMENTS_EA]->(ea)"
+            )
+            self._write_tx(cypher, {"module": self.module})
 
         count_res = self._run(
             "MATCH (:SRC_Function {module: $module})-[r:SRC_IMPLEMENTS_EA]->(:EA_Function) "
@@ -5562,12 +5774,18 @@ class SourceCodeKnowledgeGraphBuilder:
             logger.info("  Skipping register access (no register accesses extracted)")
             return
 
-        # Clean up existing SRC_ACCESSES_SFR edges for this module
+        # Clean up existing SRC_ACCESSES_SFR edges for this module+project
         logger.info("  Removing existing SRC_ACCESSES_SFR edges for module %s…", self.module)
-        self._write_tx(
-            "MATCH (f:SRC_Function {module: $module})-[r:SRC_ACCESSES_SFR]->() DELETE r",
-            {"module": self.module},
-        )
+        if self.project:
+            self._write_tx(
+                "MATCH (f:SRC_Function {module: $module, project: $project})-[r:SRC_ACCESSES_SFR]->() DELETE r",
+                {"module": self.module, "project": self.project},
+            )
+        else:
+            self._write_tx(
+                "MATCH (f:SRC_Function {module: $module})-[r:SRC_ACCESSES_SFR]->() DELETE r",
+                {"module": self.module},
+            )
 
         # Group by function_id
         from collections import defaultdict
@@ -5693,6 +5911,227 @@ class SourceCodeKnowledgeGraphBuilder:
         self.stats["rel:SRC_ACCESSES_SFR"] = sfr_edges_created
         logger.info("    → %d functions, %d accesses, %d SFR edges",
                      len(by_func), len(self._register_accesses), sfr_edges_created)
+
+    def _propagate_callee_accesses(self):
+        """Propagate callee accessed_members and registers to API-level callers.
+
+        For each non-static (public API) function, traverses the SRC_CALLS
+        graph up to 4 levels deep and:
+        1. Copies callee SRC_USES_GLOBAL edges (with accessed_members) to the
+           caller, tagged with access_context='CALLEE_PROPAGATED'.
+        2. Unions callee registers_read/registers_written into the caller's
+           properties.
+
+        This enables the DaFA analysis to see all struct member accesses and
+        register accesses at the API level without manual graph traversal.
+        """
+        if not self._call_edges or not self._functions:
+            return
+
+        # Build caller→callee map (caller_id → set of callee function_ids)
+        func_name_to_id: dict[str, str] = {}
+        func_id_to_name: dict[str, str] = {}
+        func_id_is_static: dict[str, bool] = {}
+        for func in self._functions:
+            fid = func["function_id"]
+            fname = func["name"]
+            func_name_to_id[fname] = fid
+            func_id_to_name[fid] = fname
+            # Detect static (local) functions — they start with module prefix + 'l'
+            # e.g. Adc_lInit, Dma_lChannelReset
+            func_id_is_static[fid] = func.get("is_static", False)
+
+        caller_to_callees: dict[str, set] = {}
+        for edge in self._call_edges:
+            caller_id = edge["caller_id"]
+            callee_name = edge["callee_name"]
+            callee_id = func_name_to_id.get(callee_name)
+            if callee_id:
+                caller_to_callees.setdefault(caller_id, set()).add(callee_id)
+
+        # Identify API functions (non-static, public)
+        api_func_ids = [
+            fid for fid, is_static in func_id_is_static.items()
+            if not is_static
+        ]
+
+        if not api_func_ids:
+            return
+
+        # BFS: for each API function, collect all transitive callees (max depth 4)
+        MAX_DEPTH = 4
+
+        def _get_all_callees(start_id: str) -> set:
+            visited = set()
+            queue = [(start_id, 0)]
+            while queue:
+                current, depth = queue.pop(0)
+                if depth >= MAX_DEPTH:
+                    continue
+                for callee_id in caller_to_callees.get(current, set()):
+                    if callee_id not in visited and callee_id != start_id:
+                        visited.add(callee_id)
+                        queue.append((callee_id, depth + 1))
+            return visited
+
+        # Build lookup: function_id → list of global_ref_edges
+        func_to_global_refs: dict[str, list] = {}
+        for gre in self._global_ref_edges:
+            func_to_global_refs.setdefault(gre["function_id"], []).append(gre)
+
+        # Build lookup: function_id → register accesses
+        func_to_registers: dict[str, list] = {}
+        for ra in self._register_accesses:
+            func_to_registers.setdefault(ra["function_id"], []).append(ra)
+
+        # Propagate: collect callee edges for each API function
+        propagated_edges: list[dict] = []
+        register_propagation: dict[str, dict] = {}  # func_id → {reads: set, writes: set}
+
+        for api_id in api_func_ids:
+            all_callees = _get_all_callees(api_id)
+            if not all_callees:
+                continue
+
+            # Existing accessed_members for this API (to avoid duplicates)
+            existing_members: set = set()
+            for gre in func_to_global_refs.get(api_id, []):
+                member = gre.get("accessed_member", "")
+                if member:
+                    existing_members.add((gre["global_name"], member))
+
+            # Propagate global_ref edges from callees
+            for callee_id in all_callees:
+                for gre in func_to_global_refs.get(callee_id, []):
+                    member = gre.get("accessed_member", "")
+                    if not member:
+                        continue
+                    key = (gre["global_name"], member)
+                    if key in existing_members:
+                        continue
+                    existing_members.add(key)
+                    propagated_edges.append({
+                        "function_id": api_id,
+                        "global_name": gre["global_name"],
+                        "access_type": gre.get("access_type", "READ"),
+                        "access_context": "CALLEE_PROPAGATED",
+                        "via_chain": gre.get("via_chain", ""),
+                        "accessed_member": member,
+                        "callee": func_id_to_name.get(callee_id, ""),
+                    })
+
+            # Propagate registers
+            api_reads: set = set()
+            api_writes: set = set()
+            for callee_id in all_callees:
+                for ra in func_to_registers.get(callee_id, []):
+                    reg = ra["register_name"]
+                    if ra["access_type"] == "READ":
+                        api_reads.add(reg)
+                    elif ra["access_type"] == "WRITE":
+                        api_writes.add(reg)
+            if api_reads or api_writes:
+                register_propagation[api_id] = {
+                    "reads": api_reads,
+                    "writes": api_writes,
+                }
+
+        # Write propagated SRC_USES_GLOBAL edges
+        if propagated_edges:
+            logger.info("  Propagating %d callee accessed_members to %d API functions…",
+                         len(propagated_edges),
+                         len({e["function_id"] for e in propagated_edges}))
+
+            # Build lookup for global variable IDs
+            gv_name_to_id: dict[str, str] = {}
+            for gv in self._global_variables:
+                if gv["name"] not in gv_name_to_id:
+                    gv_name_to_id[gv["name"]] = gv["variable_id"]
+
+            batch = []
+            for pe in propagated_edges:
+                var_id = gv_name_to_id.get(pe["global_name"])
+                if not var_id:
+                    continue
+                batch.append({
+                    "func_id": pe["function_id"],
+                    "var_id": var_id,
+                    "access_type": pe["access_type"],
+                    "access_context": pe["access_context"],
+                    "via_chain": pe.get("via_chain", ""),
+                    "accessed_members": pe["accessed_member"],
+                    "callee": pe.get("callee", ""),
+                })
+
+            for chunk in self._chunked(batch, self.BATCH_SIZE):
+                cypher = (
+                    "UNWIND $edges AS e "
+                    "MATCH (f:SRC_Function {function_id: e.func_id}) "
+                    "MATCH (g:SRC_GlobalVariable {variable_id: e.var_id}) "
+                    "CREATE (f)-[r:SRC_USES_GLOBAL]->(g) "
+                    "SET r.access_type = e.access_type, "
+                    "    r.access_context = e.access_context, "
+                    "    r.callee = e.callee, "
+                    "    r.via_chain = CASE WHEN e.via_chain <> '' THEN e.via_chain ELSE null END, "
+                    "    r.accessed_members = e.accessed_members"
+                )
+                self._write_tx(cypher, {"edges": chunk})
+
+        # Update register properties on API functions
+        if register_propagation:
+            logger.info("  Propagating registers to %d API functions…",
+                         len(register_propagation))
+
+            prop_batch = []
+            for func_id, regs in register_propagation.items():
+                # Get existing registers for this function
+                existing_reads: set = set()
+                existing_writes: set = set()
+                for ra in func_to_registers.get(func_id, []):
+                    if ra["access_type"] == "READ":
+                        existing_reads.add(ra["register_name"])
+                    elif ra["access_type"] == "WRITE":
+                        existing_writes.add(ra["register_name"])
+
+                all_reads = sorted(existing_reads | regs["reads"])
+                all_writes = sorted(existing_writes | regs["writes"])
+                prop_batch.append({
+                    "func_id": func_id,
+                    "registers_read": json.dumps(all_reads),
+                    "registers_written": json.dumps(all_writes),
+                })
+
+            for chunk in self._chunked(prop_batch, self.BATCH_SIZE):
+                cypher = (
+                    "UNWIND $items AS item "
+                    "MATCH (f:SRC_Function {function_id: item.func_id}) "
+                    "SET f.registers_read = item.registers_read, "
+                    "    f.registers_written = item.registers_written"
+                )
+                self._write_tx(cypher, {"items": chunk})
+
+        # Propagate SRC_ACCESSES_SFR edges from callees to API functions
+        # This uses Cypher to traverse SRC_CALLS edges (already written)
+        # and MERGE SFR edges from callees onto their callers.
+        # Only send API functions that have at least one callee in call graph.
+        api_with_callees = [fid for fid in api_func_ids if fid in caller_to_callees]
+        if api_with_callees:
+            logger.info("  Propagating SRC_ACCESSES_SFR edges via call graph…")
+            cypher = (
+                "UNWIND $func_ids AS fid "
+                "MATCH (api:SRC_Function {function_id: fid}) "
+                "MATCH (api)-[:SRC_CALLS*1..4]->(callee:SRC_Function) "
+                "MATCH (callee)-[cr:SRC_ACCESSES_SFR]->(reg:SFR_Register) "
+                "WHERE NOT (api)-[:SRC_ACCESSES_SFR {access_type: cr.access_type}]->(reg) "
+                "MERGE (api)-[pr:SRC_ACCESSES_SFR {access_type: cr.access_type}]->(reg) "
+                "SET pr.propagated = true, "
+                "    pr.field = CASE WHEN pr.field IS NULL THEN cr.field ELSE pr.field END"
+            )
+            for chunk in self._chunked(api_with_callees, self.BATCH_SIZE):
+                self._write_tx(cypher, {"func_ids": chunk})
+
+        self.stats["propagated_member_edges"] = len(propagated_edges)
+        self.stats["propagated_register_funcs"] = len(register_propagation)
 
     # -- Preview (dry-run) --------------------------------------------------
 
@@ -5990,6 +6429,11 @@ class SFRKnowledgeGraphBuilder:
             )
         )
 
+        # Inject project property into all SFR node dicts
+        if self.project:
+            for item in self._files + self._registers + self._bitfields:
+                item["project"] = self.project
+
         if self.dry_run:
             self._preview()
             return
@@ -6064,11 +6508,15 @@ class SFRKnowledgeGraphBuilder:
     )
 
     def _stamp_project(self):
-        """Set ``project`` property on all SFR_* nodes for this module."""
+        """Set ``project`` property on all SFR_* nodes for this module.
+
+        Only stamps nodes with project IS NULL to avoid overwriting
+        nodes belonging to a different project (e.g. A3G vs RC1).
+        """
         for label in self._SFR_NODE_LABELS:
             cypher = (
                 f"MATCH (n:{label} {{module: $module}}) "
-                f"WHERE n.project IS NULL OR n.project <> $project "
+                f"WHERE n.project IS NULL "
                 f"SET n.project = $project"
             )
             self._write_tx(cypher, {"module": self.module, "project": self.project})
@@ -6825,7 +7273,18 @@ def main():
     parser.add_argument(
         "--clear",
         action="store_true",
-        help="Delete all existing data in the target database before building.",
+        help=(
+            "F-CD-B01: Delete data for THIS MODULE only before ingestion. "
+            "Other modules are left untouched. Use --clear-all for a full wipe."
+        ),
+    )
+    parser.add_argument(
+        "--clear-all",
+        action="store_true",
+        help=(
+            "DANGEROUS: Delete the ENTIRE database (all modules). "
+            "Requires interactive confirmation. Use with extreme caution."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -6853,6 +7312,10 @@ def main():
         help="Enable DEBUG logging.",
     )
     args = parser.parse_args()
+
+    # F-CD-B01: --clear and --clear-all are mutually exclusive.
+    if args.clear and args.clear_all:
+        parser.error("--clear and --clear-all are mutually exclusive")
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -6891,6 +7354,7 @@ def main():
             data_path=data_path,
             dry_run=args.dry_run,
             clear_db=args.clear,
+            clear_all=args.clear_all,
         )
         builder.BATCH_SIZE = args.batch_size
         builder.build()
@@ -7034,6 +7498,7 @@ def main():
         data_path=data_path,
         dry_run=args.dry_run,
         clear_db=args.clear,
+        clear_all=args.clear_all,
         relationships_path=relationships_path,
         folders_path=folders_path,
         jama_cfg=jama_cfg,
@@ -7048,4 +7513,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ClearAbortedError as exc:
+        print(f"\nAborted: {exc}")
+        sys.exit(1)
+    except DeprecatedClearError as exc:
+        print(f"\nError: {exc}")
+        sys.exit(2)

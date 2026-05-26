@@ -1,8 +1,6 @@
 # AI Core Engine — System Architecture Overview
 
-**Version 2.1.0 | Sprint 10**
-
-> This document describes the implemented architecture of the AI Core Engine (AICE). For tool-level API details see [DOCUMENTATION.md](../DOCUMENTATION.md). For setup instructions see [MCP_QUICKSTART.md](../MCP_QUICKSTART.md).
+> This document describes the implemented architecture of the AI Core Engine (AICE). For tool-level API details see [DETAILED_DOCUMENTATION.md](../DETAILED_DOCUMENTATION.md). For setup instructions see [MCP_QUICKSTART.md](../MCP_QUICKSTART.md).
 
 ---
 
@@ -28,7 +26,7 @@
 
 ## 1. System Purpose
 
-AICE is a **knowledge-graph-backed MCP (Model Context Protocol) server** purpose-built for Infineon AURIX TC3xx automotive embedded software development. It serves as the shared knowledge backbone for **21+ Domain Assistants** (DAs) — specialized LLM-based agents covering the full V-Model lifecycle from requirements through testing and safety analysis.
+AICE is a **knowledge-graph-backed MCP (Model Context Protocol) server** purpose-built for Infineon AURIX automotive embedded software development. It serves as the shared knowledge backbone for **21+ Domain Assistants** (DAs) — specialized LLM-based agents covering the full V-Model lifecycle from requirements through testing and safety analysis.
 
 **Core capability**: Expose structured engineering knowledge (API functions, register maps, requirements, traceability chains, compliance rules) through a unified set of MCP tools, backed by a Hybrid RAG engine that combines graph traversal with vector similarity search.
 
@@ -61,15 +59,19 @@ AICE is a **knowledge-graph-backed MCP (Model Context Protocol) server** purpose
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │              FastMCP Tool Layer — 56 Tools                   │   │
+│  │              FastMCP Tool Layer — 55 Active Tools             │   │
 │  │                                                              │   │
-│  │  Cat 1: Search & Query (6)      Cat 8: Feedback (4)         │   │
+│  │  Cat 1: Search & Query (6)      Cat 8: Feedback & Learn (4) │   │
 │  │  Cat 2: API Intelligence (3)    Cat 9: Review Gate (4)      │   │
-│  │  Cat 3: Dependencies (3)        Cat 10: Ontology (4)        │   │
+│  │  Cat 3: Dependencies (3)        Cat 10: Ontology (2)        │   │
 │  │  Cat 4: Traceability (4)        Cat 11: Observability (6)   │   │
-│  │  Cat 5: Ingestion (4)           Cat 12: Visualization (1)   │   │
-│  │  Cat 6: Memory (5+4+2=11)       Cat 13: Authentication (2)  │   │
-│  │  Cat 7: Cache (4)                                           │   │
+│  │  Cat 5: Ingestion (0 — library) Cat 12: Visualization (1)   │   │
+│  │  Cat 6: Memory (5+4+2+1=12)     Cat 13: Authentication (2)  │   │
+│  │  Cat 7: Cache (5)               Cat 14: Validation (2)      │   │
+│  │                                 Cat 16: Knowledge Mgmt (1)  │   │
+│  │                                                              │   │
+│  │  Total = 55 (Cat 5 ingestion is library-only; process_results│   │
+│  │  is categorized under Cat 8 alongside the feedback tools.)   │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐   │
@@ -101,7 +103,7 @@ AICE is a **knowledge-graph-backed MCP (Model Context Protocol) server** purpose
 
 | Component | Source Path | Responsibility | Backing Store |
 |-----------|------------|----------------|---------------|
-| **MCP Server** | `mcp/core/mcp_server.py` | 62 tool handlers, ASGI middleware, singleton service factories | — |
+| **MCP Server** | `mcp/core/mcp_server.py` | 55 tool handlers, ASGI middleware, singleton service factories | — |
 | **Auth & RBAC** | `mcp/core/auth_middleware.py`, `mcp/auth/` | Cerbos PDP, API key → principal resolution, 3-tier RBAC | Cerbos PDP (subprocess) |
 | **Hybrid RAG / Search** | `src/HybridRAG/code/querier/search_service.py` | Hybrid search pipeline: graph + vector → RRF merge | Neo4j + Qdrant |
 | **Knowledge Intelligence** | `src/HybridRAG/code/querier/knowledge_intelligence.py` | API function lookup, dependency analysis, traceability | Neo4j |
@@ -136,7 +138,7 @@ async def tool_name(params...) → dict:
 |---------------|-------------------|-------------|
 | `SearchService` | Cat 1 (Search) | `search()`, `search_nodes()`, `get_node_by_id()`, `get_neighbors()`, `shortest_path()`, `execute_cypher()` |
 | `KnowledgeIntelligenceService` | Cat 2–4 (Intelligence, Dependencies, Traceability) | `query_api_function()`, `get_type_definition()`, `query_dependencies()`, `validate_api_usage()`, `find_requirement_traces()`, `build_traceability_matrix()` |
-| `IngestionService` | Cat 5 (Ingestion) | `ingest_file()`, `ingest_module()`, `batch_ingest()`, `ingest_repository()` |
+| `IngestionService` | Cat 5 (Ingestion) | `ingest_file()`, `ingest_module()`, `batch_ingest()`, `ingest_repository()` — invoked from library code; MCP exposes only `process_results` (admin) and `sandbox_upload` (public, per-session) |
 | `WorkingMemorySessionAdapter` | Cat 6 (Sessions) | `start()`, `store()`, `retrieve()`, `end()` |
 | `SandboxManager` | Cat 6 (Sandbox) | `upload()`, `query()`, `status()`, `clear()` |
 | `RLMOrchestrator` | Cat 6 (RLM) | `orchestrate()`, `preview_plan()` |
@@ -313,7 +315,7 @@ ai-core-engine/
 ├── mcp/                              # MCP server (entrypoint + tools)
 │   ├── app.py                        #   K8s entrypoint, Cerbos lifecycle
 │   ├── core/
-│   │   ├── mcp_server.py             #   62 tool handlers, ASGI middleware (1800 lines)
+│   │   ├── mcp_server.py             #   55 tool handlers, ASGI middleware
 │   │   ├── tool_tiers.py             #   Tool → tier mapping (public/developer/admin)
 │   │   └── auth_middleware.py         #   Cerbos integration, API key resolution
 │   ├── auth/
@@ -380,13 +382,14 @@ ai-core-engine/
 ├── Dockerfile                        # Multi-stage build (Cerbos + Python 3.12)
 ├── requirements.txt                  # Python dependencies
 └── docs/                             # Documentation
-    ├── DOCUMENTATION.md              # Complete reference (tools, config, API)
+    ├── DETAILED_DOCUMENTATION.md     # Complete reference (tools, config, API)
+    ├── DOCUMENTATION.md              # Legacy full documentation (retained for reference)
     ├── MCP_QUICKSTART.md             # Setup and connection guide
     ├── NODE_SETS_ARCHITECTURE.md     # NodeSet design
     └── architecture/                 # ← You are here
 ```
 
-**Scale**: ~25,000+ lines of Python, 6,166-line ontology YAML, 62 MCP tools, 14 parsers, 3 external connectors, 7 PostgreSQL tables.
+**Scale**: ~25,000+ lines of Python, 6,166-line ontology YAML, **55 active MCP tools** across 14 categories, 14 parsers, 3 external connectors, 7 PostgreSQL tables.
 
 ---
 
@@ -403,6 +406,7 @@ ai-core-engine/
 | [Auth & Security](auth-and-security.md) | Cerbos RBAC, API keys, tier model |
 | [Observability](observability.md) | PostgreSQL audit, Prometheus metrics, Grafana dashboards, health checks |
 | [Deployment](deployment.md) | Docker Compose, Kubernetes, Dockerfile |
-| [DOCUMENTATION.md](../DOCUMENTATION.md) | Full MCP tool reference |
+| [DETAILED_DOCUMENTATION.md](../DETAILED_DOCUMENTATION.md) | Full MCP tool reference (canonical) |
+| [DOCUMENTATION.md](../DOCUMENTATION.md) | Legacy full documentation, retained for reference |
 | [MCP_QUICKSTART.md](../MCP_QUICKSTART.md) | Client setup and usage guide |
 | [NODE_SETS_ARCHITECTURE.md](../NODE_SETS_ARCHITECTURE.md) | NodeSet module isolation design |

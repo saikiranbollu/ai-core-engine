@@ -99,6 +99,10 @@ class _RegisterAccessExtractor:
         mcal_read_pattern = re.compile(
             r'MCALUTIL_SFRREAD\s*\(\s*\w+\s*,\s*([\w>\-\[\]\.]+?)\.(B|U)\s*\)'
         )
+        # Pattern 2b: MCALUTIL_SWPMSK (swap-with-mask, read-modify-write)
+        mcal_swpmsk_pattern = re.compile(
+            r'MCALUTIL_SWPMSK\s*\(\s*(?:\([^)]*\)\s*)?&?\s*([\w>\-\[\]\.]+?)\.(B|U)\s*,'
+        )
         # Pattern 3: Module SFR macros  (e.g. ADC_SFR_RUNTIME_WRITE32(REG.U, val))
         sfr_macro_write = re.compile(
             r'\w+_SFR_(?:RUNTIME|INIT_DEINIT)_WRITE(?:32)?\s*\(\s*([\w>\-\[\]\.]+?)\.(B|U)\s*,'
@@ -141,14 +145,26 @@ class _RegisterAccessExtractor:
                     accesses.append({"register": register, "field": field, "access_type": "READ", "line": line_idx})
 
             # Pattern 2: MCALUTIL_SFRWRITE / MCALUTIL_SFRREAD macros
+            # Check if MCALUTIL_SWPMSK appears on this line (read-modify-write)
+            line_has_swpmsk = 'MCALUTIL_SWPMSK' in line
             for match in mcal_write_pattern.finditer(line):
                 reg_path = match.group(1)
                 register = reg_path.rsplit('->', 1)[-1] if '->' in reg_path else reg_path
                 accesses.append({"register": register, "field": "U", "access_type": "WRITE", "line": line_idx})
+                # If SWPMSK is on the same line, the write target is also read
+                # (SWPMSK = read-modify-write: read current value, mask, write back)
+                if line_has_swpmsk:
+                    accesses.append({"register": register, "field": "U", "access_type": "READ", "line": line_idx})
             for match in mcal_read_pattern.finditer(line):
                 reg_path = match.group(1)
                 register = reg_path.rsplit('->', 1)[-1] if '->' in reg_path else reg_path
                 accesses.append({"register": register, "field": "U", "access_type": "READ", "line": line_idx})
+            # Pattern 2b: MCALUTIL_SWPMSK (read-modify-write)
+            for match in mcal_swpmsk_pattern.finditer(line):
+                reg_path = match.group(1)
+                register = reg_path.rsplit('->', 1)[-1] if '->' in reg_path else reg_path
+                accesses.append({"register": register, "field": "U", "access_type": "READ", "line": line_idx})
+                accesses.append({"register": register, "field": "U", "access_type": "WRITE", "line": line_idx})
 
             # Pattern 3: Module-specific SFR macros
             for match in sfr_macro_write.finditer(line):
@@ -404,6 +420,9 @@ class _ClangAnalyzer:
 
         diagnostics = self._collect_diagnostics(tu)
 
+        # Pre-scan headers for write-wrapper macros (used by _is_write_context)
+        self._build_write_macro_cache(src_path)
+
         # Build the recursive AST dict (backward-compatible)
         ast = self._cursor_to_dict(tu.cursor, src_path)
 
@@ -477,6 +496,61 @@ class _ClangAnalyzer:
     # ------------------------------------------------------------------
     # Semantic extraction from raw AST cursors
     # ------------------------------------------------------------------
+
+    def _build_write_macro_cache(self, src_path: str) -> None:
+        """Scan header files in include paths for macros wrapping SFRWRITE/SWPMSK.
+
+        Populates ``self._write_macros`` (set of macro names whose body contains
+        MCALUTIL_SFRWRITE or SFR_*_WRITE patterns) and ``self._swpmsk_macros``
+        (set of macro names whose body contains MCALUTIL_SWPMSK).
+        These are used by ``_is_write_context`` to correctly classify register
+        accesses that go through wrapper macros.
+        """
+        write_macros: set = set()
+        swpmsk_macros: set = set()
+
+        # Scan all .h files in include paths
+        dirs_to_scan = list(self._include_paths)
+        # Also scan the directory of the source file itself
+        src_dir = os.path.dirname(src_path)
+        if src_dir and src_dir not in dirs_to_scan:
+            dirs_to_scan.append(src_dir)
+
+        for inc_dir in dirs_to_scan:
+            if not os.path.isdir(inc_dir):
+                continue
+            for fname in os.listdir(inc_dir):
+                if not fname.endswith(".h"):
+                    continue
+                hpath = os.path.join(inc_dir, fname)
+                try:
+                    with open(hpath, "r", encoding="utf-8", errors="replace") as f:
+                        lines = f.readlines()
+                except Exception:
+                    continue
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    m = re.match(r"#define\s+(\w+)", line)
+                    if m:
+                        macro_name = m.group(1)
+                        # Collect full macro body (continuation lines)
+                        full_def = line
+                        while line.rstrip().endswith("\\") and i + 1 < len(lines):
+                            i += 1
+                            line = lines[i]
+                            full_def += " " + line
+                        if re.search(
+                            r"MCALUTIL_SFRWRITE|SFR_(?:RUNTIME|INIT_DEINIT)_WRITE",
+                            full_def,
+                        ):
+                            write_macros.add(macro_name)
+                        if re.search(r"MCALUTIL_SWPMSK", full_def):
+                            swpmsk_macros.add(macro_name)
+                    i += 1
+
+        self._write_macros = write_macros
+        self._swpmsk_macros = swpmsk_macros
 
     @staticmethod
     def _collect_function_cursors(root_cursor: Any, src_path: str) -> List[Any]:
@@ -555,28 +629,53 @@ class _ClangAnalyzer:
         except Exception:
             _src_lines = []
 
-        def _is_write_context(cursor: Any) -> bool:
-            """Check if a cursor is on the LHS of an assignment or inside a WRITE macro."""
-            # Strategy 1: Check if the source line contains a known WRITE macro
+        # Local refs to instance macro caches for closure access
+        _write_macros = getattr(self, '_write_macros', set())
+        _swpmsk_macros = getattr(self, '_swpmsk_macros', set())
+
+        def _get_access_type(cursor: Any) -> str:
+            """Determine register access type: 'READ', 'WRITE', or 'READ_WRITE'.
+
+            Strategies:
+            1. Check source line for direct SFRWRITE/SFRREAD/SWPMSK patterns
+            2. Check source line for known write-wrapper macros (from header scan)
+            3. Check source line for known swap-mask macros (read-modify-write)
+            4. Token-based heuristic for direct assignment operators
+            """
             line_no = cursor.location.line
             if 0 < line_no <= len(_src_lines):
                 src_line = _src_lines[line_no - 1]
+                # Strategy 1a: Direct SFRWRITE on source line
                 if re.search(r'SFRWRITE|SFR_(?:RUNTIME|INIT_DEINIT)_WRITE', src_line):
-                    return True
+                    return "WRITE"
+                # Strategy 1b: Direct SFRREAD on source line
                 if re.search(r'SFRREAD|SFR_(?:RUNTIME|INIT_DEINIT)_READ', src_line):
-                    return False
+                    return "READ"
+                # Strategy 1c: Direct SWPMSK on source line (read-modify-write)
+                if re.search(r'MCALUTIL_SWPMSK', src_line):
+                    return "READ_WRITE"
+                # Strategy 2: Source line uses a wrapper macro known to call SFRWRITE
+                if _write_macros:
+                    for macro in _write_macros:
+                        if macro in src_line:
+                            return "WRITE"
+                # Strategy 3: Source line uses a wrapper macro known to call SWPMSK
+                if _swpmsk_macros:
+                    for macro in _swpmsk_macros:
+                        if macro in src_line:
+                            return "READ_WRITE"
 
-            # Strategy 2: Token-based heuristic for non-macro assignments
+            # Strategy 4: Token-based heuristic for non-macro assignments
             try:
                 extent = cursor.extent
                 tu = cursor.translation_unit
                 all_tokens = list(tu.get_tokens(extent=extent))
                 for tok in all_tokens:
                     if tok.spelling in ('=', '|=', '&=', '^=', '<<=', '>>=', '+=', '-='):
-                        return True
+                        return "WRITE"
             except Exception:
                 pass
-            return False
+            return "READ"
 
         def _walk(cursor: Any):
             if (cursor.location.file
@@ -626,17 +725,21 @@ class _ClangAnalyzer:
                             parent_type_name, instance_member)
                         field = cursor.spelling
                         line = cursor.location.line
-                        access_type = "WRITE" if _is_write_context(cursor) else "READ"
-                        key = (line, register_name, field, access_type)
-                        if key not in seen:
-                            seen.add(key)
-                            accesses.append({
-                                "register": register_name,
-                                "field": field,
-                                "access_type": access_type,
-                                "line": line,
-                                "struct_type": parent_type_name,
-                            })
+                        raw_access = _get_access_type(cursor)
+                        # READ_WRITE produces both entries
+                        access_types = (["READ", "WRITE"] if raw_access == "READ_WRITE"
+                                        else [raw_access])
+                        for access_type in access_types:
+                            key = (line, register_name, field, access_type)
+                            if key not in seen:
+                                seen.add(key)
+                                accesses.append({
+                                    "register": register_name,
+                                    "field": field,
+                                    "access_type": access_type,
+                                    "line": line,
+                                    "struct_type": parent_type_name,
+                                })
                     elif (cursor.spelling in ("U", "B")
                           and _is_sfr_register_union(parent_type_name)):
                         # Raw register access: reg.U or reg.B
@@ -679,17 +782,20 @@ class _ClangAnalyzer:
                             parent_type_name, instance_member)
                         field = cursor.spelling
                         line = cursor.location.line
-                        access_type = "WRITE" if _is_write_context(cursor) else "READ"
-                        key = (line, register_name, field, access_type)
-                        if key not in seen:
-                            seen.add(key)
-                            accesses.append({
-                                "register": register_name,
-                                "field": field,
-                                "access_type": access_type,
-                                "line": line,
-                                "struct_type": parent_type_name,
-                            })
+                        raw_access = _get_access_type(cursor)
+                        access_types = (["READ", "WRITE"] if raw_access == "READ_WRITE"
+                                        else [raw_access])
+                        for access_type in access_types:
+                            key = (line, register_name, field, access_type)
+                            if key not in seen:
+                                seen.add(key)
+                                accesses.append({
+                                    "register": register_name,
+                                    "field": field,
+                                    "access_type": access_type,
+                                    "line": line,
+                                    "struct_type": parent_type_name,
+                                })
                 except Exception:
                     pass  # Skip nodes we can't resolve
 
@@ -796,21 +902,29 @@ class _ClangAnalyzer:
                 if name and col > 0:
                     # Text after the identifier on this line
                     after_name = src_line[col - 1 + len(name):].lstrip()
+                    # If variable is preceded by * (dereference), any
+                    # assignment goes to pointed-to memory. The variable
+                    # itself is READ (provides the address).
+                    before_name = src_line[:col - 1].rstrip()
+                    if before_name.endswith('*'):
+                        return False
+                    # Strip array subscripts: GlobalArray[i] = val IS a write
+                    # to the global (its contents change).
+                    import re as _re_wc
+                    after_name = _re_wc.sub(r'^(\s*\[[^\]]*\])+', '', after_name).lstrip()
                     if after_name and after_name[0] == '=' and (len(after_name) < 2 or after_name[1] != '='):
                         return True
-                    if len(after_name) >= 2 and after_name[:2] in ('|=', '&=', '^=', '+=', '-='):
+                    if len(after_name) >= 2 and after_name[:2] in ('|=', '&=', '^=', '+=', '-=', '++', '--'):
                         return True
                     if len(after_name) >= 3 and after_name[:3] in ('<<=', '>>='):
                         return True
-                    # Check for pattern:  *GlobalVar... = (dereference write)
-                    before_name = src_line[:col - 1].rstrip()
-                    if before_name.endswith('*'):
-                        rest = src_line[col - 1 + len(name):].lstrip()
-                        # skip array/member access then look for =
-                        import re as _re_local
-                        stripped = _re_local.sub(r'^[\[\]\w\.\->]+', '', rest).lstrip()
-                        if stripped and stripped[0] == '=' and (len(stripped) < 2 or stripped[1] != '='):
-                            return True
+                    # Check for prefix ++/-- (e.g. ++GlobalCounter)
+                    if before_name.endswith('++') or before_name.endswith('--'):
+                        return True
+                    # Pattern: *GlobalVar[...]->field = val
+                    # The * dereferences the result of the expression, so
+                    # GlobalVar itself is READ (provides the address).
+                    # Do NOT treat this as a write to GlobalVar.
 
             # Strategy 2: Token-based heuristic (original)
             try:
@@ -818,7 +932,7 @@ class _ClangAnalyzer:
                 tu = cursor.translation_unit
                 all_tokens = list(tu.get_tokens(extent=extent))
                 for tok in all_tokens:
-                    if tok.spelling in ('=', '|=', '&=', '^=', '<<=', '>>=', '+=', '-='):
+                    if tok.spelling in ('=', '|=', '&=', '^=', '<<=', '>>=', '+=', '-=', '++', '--'):
                         return True
             except Exception:
                 pass
@@ -1019,7 +1133,31 @@ class _ClangAnalyzer:
                         key = (global_name, line, "ALIAS:" + local_name)
                         if key not in seen:
                             seen.add(key)
-                            access_type = "WRITE" if _is_write_context(cursor) else "READ"
+                            if _is_write_context(cursor):
+                                # For pointer aliases, distinguish real writes
+                                # to the global from operations that only use
+                                # the global's pointer value (READ):
+                                # 1. alias = ... → local reassignment, global READ
+                                # 2. *alias... = val → deref write, global READ
+                                # 3. alias->field = val → member write via ptr, global READ
+                                access_type = "WRITE"
+                                col = cursor.location.column
+                                if 0 < line <= len(_global_src_lines):
+                                    src_line = _global_src_lines[line - 1]
+                                    after = src_line[col - 1 + len(local_name):].lstrip()
+                                    before = src_line[:col - 1].rstrip()
+                                    # Case 1: alias = ... (assignment TO alias)
+                                    if (after and after[0] == '='
+                                            and (len(after) < 2 or after[1] != '=')):
+                                        access_type = "READ"
+                                    # Case 2: *alias... = val (deref write)
+                                    elif before.endswith('*'):
+                                        access_type = "READ"
+                                    # Case 3: alias->field (member access through ptr)
+                                    elif after.startswith('->') or after.startswith('.'):
+                                        access_type = "READ"
+                            else:
+                                access_type = "READ"
                             refs.append({
                                 "name": global_name,
                                 "access_type": access_type,
@@ -1040,6 +1178,22 @@ class _ClangAnalyzer:
         # Requires an initializer_map built from config files.
         if self._initializer_map and not self._initializer_map.is_empty:
             self._phase4_struct_chains(func_cursor, src_path, refs, seen)
+
+        # ── Phase 5: Critical section annotation ──────────────────────
+        # Tag each global access with whether it falls inside a critical
+        # section (SchM_Enter/Exit or SchMEnterFnPtr/SchMExitFnPtr).
+        # DaFA team needs this for race condition / mutual access analysis.
+        try:
+            extent = func_cursor.extent
+            func_start = extent.start.line
+            func_end = extent.end.line
+            cs_ranges = self._detect_critical_sections(
+                src_path, func_start, func_end
+            )
+            if cs_ranges:
+                self._annotate_critical_sections(refs, cs_ranges)
+        except Exception:
+            pass  # Non-fatal — don't block parsing if CS detection fails
 
         return refs
 
@@ -1138,6 +1292,12 @@ class _ClangAnalyzer:
                 # Build per-step via_chain showing how we reach *this* global
                 step_idx = res.get("step_index", 0)
                 via_fields = fields[: step_idx + 1]
+                # For leaf entries, append unresolved trailing fields so
+                # the via_chain shows the actual member being accessed
+                # (e.g. "RuntimeInfoPtr->GrpDataPtr->ResultBufferPtr").
+                unresolved = res.get("unresolved_fields", [])
+                if not res["is_intermediate"] and unresolved:
+                    via_fields = via_fields + unresolved
                 via_chain = "->".join([root_var] + via_fields)
 
                 if res["is_intermediate"]:
@@ -1151,6 +1311,16 @@ class _ClangAnalyzer:
                     else:
                         access = "READ"
 
+                # Determine the accessed struct member name.
+                # For leaf entries with unresolved trailing fields,
+                # use the last unresolved field (deepest member).
+                # Otherwise use the last field in the chain.
+                if not res["is_intermediate"]:
+                    accessed_member = (unresolved[-1] if unresolved
+                                       else fields[-1])
+                else:
+                    accessed_member = ""
+
                 key = (gname, line, "STRUCT_CHAIN", via_chain)
                 if key not in seen:
                     seen.add(key)
@@ -1161,6 +1331,7 @@ class _ClangAnalyzer:
                         "data_type": "",
                         "access_context": "STRUCT_CHAIN",
                         "via_chain": via_chain,
+                        "accessed_member": accessed_member,
                     })
 
     def _resolve_runtime_chain(
@@ -1174,8 +1345,24 @@ class _ClangAnalyzer:
         Walk the fields until finding one whose type has known globals,
         then continue normal chain resolution from that point.
         """
+        # Primitive/scalar types should never be resolved as struct chains.
+        # A field of type uint8 matching a global of type uint8 is
+        # coincidental, not a struct pointer relationship.
+        _PRIMITIVE_TYPES = frozenset({
+            "uint8", "uint16", "uint32", "uint64",
+            "sint8", "sint16", "sint32", "sint64",
+            "int8_t", "int16_t", "int32_t", "int64_t",
+            "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+            "int", "unsigned", "char", "short", "long",
+            "float", "double", "boolean", "void",
+            "size_t", "ptrdiff_t", "uintptr_t", "intptr_t",
+            "Std_ReturnType", "StatusType",
+        })
+
         results: List[Dict[str, Any]] = []
         for i, (field, ftype) in enumerate(zip(fields, field_types)):
+            if ftype in _PRIMITIVE_TYPES:
+                continue
             type_globals = resolver.get_globals_for_type(ftype)
             if not type_globals:
                 continue
@@ -1308,12 +1495,52 @@ class _ClangAnalyzer:
             return False
         rest = line[idx + len(field_name):]
         import re as _re_local
+        # Check if field is followed by -> (pointer dereference).
+        # field->member = val means field is READ (provides address);
+        # the write targets the member, not the field itself.
+        has_ptr_deref = bool(_re_local.match(r'\s*->', rest))
+        # Check if field is a pointer used with subscript: PtrField[i] = val
+        # means the pointer provides an address (READ), write goes to
+        # pointed-to memory.  Array members (no "Ptr" suffix) are genuinely
+        # modified by subscript assignment (Issue 20: ActiveSRMap[i] = val).
+        has_ptr_subscript = (
+            bool(_re_local.match(r'\s*\[', rest))
+            and field_name.endswith("Ptr")
+        )
         # Strip trailing brackets, array subscripts, parens, deref, spaces
-        rest = _re_local.sub(r'^(\s*\[[^\]]*\]|\s*\)|\s*\]|\s)+', '', rest)
+        rest = _re_local.sub(r'^(\s*\[[^\]]*\]|\s*\)|\s*\]|\s*->|\s)+', '', rest)
+        if has_ptr_deref or has_ptr_subscript:
+            # Field is pointer-dereferenced — assignment after deref writes to
+            # pointed-to memory, not to the field. Field is READ only.
+            return False
+        # Check for leading * dereference: *chain->field = val
+        # The entire expression is dereferenced, so the field provides an
+        # address (READ); the write goes to the pointed-to memory.
+        before = line[:idx]
+        before_tail = before.rstrip()
+        if before_tail.endswith('->') or before_tail.endswith('.'):
+            lhs_stripped = line.lstrip()
+            if lhs_stripped.startswith('*'):
+                return False
         for op in ('|=', '&=', '^=', '+=', '-=', '<<=', '>>='):
             if rest.startswith(op):
                 return True
         if rest.startswith('=') and not rest.startswith('=='):
+            return True
+        # Detect ++ and -- (increment/decrement = read + write)
+        if rest.startswith('++') or rest.startswith('--'):
+            return True
+        # Also check for prefix ++/-- before the expression containing field_name
+        # e.g. "++GrpData->CurrSampCount" — the ++ is before the chain root
+        before = line[:idx]
+        import re as _re_local2
+        # Check if the non-whitespace content before the field starts with ++/--
+        # Strip the struct chain part (identifiers, ->, ., []) to find the operator
+        # e.g. "    ++GrpData->" → strip "GrpData->" → "    ++"
+        before_stripped = _re_local2.sub(r'[\w.\[\]]+\s*->\s*$', '', before)
+        before_stripped = _re_local2.sub(r'[\w.\[\]]+\s*\.\s*$', '', before_stripped)
+        before_stripped = before_stripped.rstrip()
+        if before_stripped.endswith('++') or before_stripped.endswith('--'):
             return True
         return False
 
@@ -1328,6 +1555,8 @@ class _ClangAnalyzer:
         - It appears as a function argument.
         - It's used with a compound-assign op like |= (read+write).
         - It appears without any assignment to it.
+        - It is subscripted or dereferenced (ptr[x] or ptr->member) — the
+          pointer field itself is read to obtain the address.
         """
         if line_no < 1 or line_no > len(src_lines):
             return True  # default assume read
@@ -1337,6 +1566,18 @@ class _ClangAnalyzer:
             return True
         rest = line[idx + len(field_name):]
         import re as _re_local
+        # If field is subscripted [x] or dereferenced ->, it is always READ
+        # (the pointer is read to compute the target address)
+        if _re_local.match(r'\s*(\[[^\]]*\]|->)', rest):
+            return True
+        # If the line has a leading * and the field is accessed via ->/.,
+        # the field is always READ (provides address for dereference).
+        before = line[:idx]
+        before_tail = before.rstrip()
+        if before_tail.endswith('->') or before_tail.endswith('.'):
+            lhs_stripped = line.lstrip()
+            if lhs_stripped.startswith('*'):
+                return True
         # Strip trailing brackets, array subscripts, parens, deref, spaces
         rest = _re_local.sub(r'^(\s*\[[^\]]*\]|\s*\)|\s*\]|\s)+', '', rest)
         # Compound operators are both read and write
@@ -1348,6 +1589,164 @@ class _ClangAnalyzer:
             return False  # pure write
         # Everything else is a read (RHS, argument, condition, etc.)
         return True
+
+    # ------------------------------------------------------------------
+    # Phase 5 helpers — Critical section detection & annotation
+    # ------------------------------------------------------------------
+
+    # Regex patterns for detecting critical section entry/exit:
+    # Pattern 1: Direct call — SchM_Enter_<Module>_<Name>() / SchM_Exit_<Module>_<Name>()
+    _RE_SCHM_ENTER = re.compile(
+        r'\bSchM_Enter_(\w+)\s*\(\s*\)', re.MULTILINE
+    )
+    _RE_SCHM_EXIT = re.compile(
+        r'\bSchM_Exit_(\w+)\s*\(\s*\)', re.MULTILINE
+    )
+    # Pattern 2: Indirect via function pointer map — .SchMEnterFnPtr() / .SchMExitFnPtr()
+    _RE_FNPTR_ENTER = re.compile(
+        r'(\w+(?:\[.*?\])?(?:\.\w+)*)\s*\.\s*SchMEnterFnPtr\s*\(\s*\)',
+        re.MULTILINE
+    )
+    _RE_FNPTR_EXIT = re.compile(
+        r'(\w+(?:\[.*?\])?(?:\.\w+)*)\s*\.\s*SchMExitFnPtr\s*\(\s*\)',
+        re.MULTILINE
+    )
+
+    def _detect_critical_sections(
+        self, src_path: str, func_start: int, func_end: int
+    ) -> List[tuple]:
+        """Detect critical section line ranges within a function.
+
+        Scans the source text of the function for Enter/Exit patterns and
+        returns a list of (enter_line, exit_line, section_name) tuples.
+
+        Handles two patterns:
+        1. Direct: SchM_Enter_<Module>_<SectionName>() / SchM_Exit_...()
+        2. Indirect: <map>.SchMEnterFnPtr() / <map>.SchMExitFnPtr()
+
+        For nested or multiple critical sections, each Enter is matched
+        with the nearest subsequent Exit of the same type (stack-based).
+        """
+        try:
+            with open(src_path, 'r', encoding='utf-8', errors='replace') as f:
+                all_lines = f.readlines()
+        except OSError:
+            return []
+
+        # Extract the function body lines (keep absolute line numbering)
+        if func_start < 1 or func_end > len(all_lines):
+            return []
+
+        # Build list of (line_no, event_type, section_name)
+        # event_type: "ENTER" or "EXIT"
+        events: List[tuple] = []
+
+        for line_idx in range(func_start - 1, func_end):
+            line_no = line_idx + 1  # 1-based
+            line_text = all_lines[line_idx]
+
+            # Pattern 1: SchM_Enter_<Name>()
+            for m in self._RE_SCHM_ENTER.finditer(line_text):
+                section_name = m.group(1)  # e.g. "Adc_RuntimeProtWriteSeq"
+                events.append((line_no, "ENTER", section_name))
+
+            for m in self._RE_SCHM_EXIT.finditer(line_text):
+                section_name = m.group(1)
+                events.append((line_no, "EXIT", section_name))
+
+            # Pattern 2: <map>.SchMEnterFnPtr()
+            for m in self._RE_FNPTR_ENTER.finditer(line_text):
+                # Use a generic name derived from the map expression
+                # e.g. "Adc_kSchMFnMap[...]" → "SchMFnMap"
+                map_expr = m.group(1)
+                section_name = "SchMFnMap"
+                # Try to extract a more specific name from comment above
+                if line_idx > 0:
+                    prev_line = all_lines[line_idx - 1]
+                    comment_match = re.search(
+                        r'/\*\s*(?:[Ee]nter\s+)?(.+?)\s*[Cc]ritical\s*[Ss]ection\s*\*/',
+                        prev_line
+                    )
+                    if comment_match:
+                        extracted = comment_match.group(1).strip().rstrip('-_ ')
+                        if extracted and extracted.lower() not in ('', 'the', 'a', 'enter', 'exit'):
+                            section_name = extracted
+                    else:
+                        # Check the line before the prev_line (2 lines up)
+                        if line_idx > 1:
+                            prev2_line = all_lines[line_idx - 2]
+                            comment_match = re.search(
+                                r'/\*\s*(?:[Ee]nter\s+)?(.+?)\s*[Cc]ritical\s*[Ss]ection\s*\*/',
+                                prev2_line
+                            )
+                            if comment_match:
+                                extracted = comment_match.group(1).strip().rstrip('-_ ')
+                                if extracted and extracted.lower() not in ('', 'the', 'a', 'enter', 'exit'):
+                                    section_name = extracted
+                events.append((line_no, "ENTER", section_name))
+
+            for m in self._RE_FNPTR_EXIT.finditer(line_text):
+                # Match exit to the most recent enter's name
+                events.append((line_no, "EXIT", "SchMFnMap"))
+
+        # Match Enter/Exit pairs using a stack approach
+        # For indirect (SchMFnMap) entries, match by order (LIFO)
+        # For direct (named) entries, match by name
+        cs_ranges: List[tuple] = []
+        enter_stack: List[tuple] = []  # (line_no, section_name)
+
+        for line_no, event_type, section_name in sorted(events, key=lambda x: x[0]):
+            if event_type == "ENTER":
+                enter_stack.append((line_no, section_name))
+            elif event_type == "EXIT":
+                if not enter_stack:
+                    continue
+                # Try to match by name first
+                matched = False
+                for i in range(len(enter_stack) - 1, -1, -1):
+                    if enter_stack[i][1] == section_name or section_name == "SchMFnMap":
+                        enter_line, enter_name = enter_stack.pop(i)
+                        cs_ranges.append((enter_line, line_no, enter_name))
+                        matched = True
+                        break
+                if not matched:
+                    # Fallback: pop the most recent enter
+                    enter_line, enter_name = enter_stack.pop()
+                    cs_ranges.append((enter_line, line_no, enter_name))
+
+        return cs_ranges
+
+    @staticmethod
+    def _annotate_critical_sections(
+        refs: List[Dict[str, Any]],
+        cs_ranges: List[tuple],
+    ) -> None:
+        """Tag each global reference with critical section membership.
+
+        Adds two fields to each ref dict:
+        - ``in_critical_section``: bool
+        - ``critical_section_name``: str (empty if not in CS)
+
+        A ref is considered inside a CS if its ``line`` falls strictly
+        between the Enter line and Exit line (exclusive of both markers).
+        """
+        for ref in refs:
+            line = ref.get("line", 0)
+            if line == 0:
+                ref["in_critical_section"] = False
+                ref["critical_section_name"] = ""
+                continue
+
+            cs_name = ""
+            in_cs = False
+            for enter_line, exit_line, section_name in cs_ranges:
+                if enter_line < line < exit_line:
+                    in_cs = True
+                    cs_name = section_name
+                    break  # Take the first (innermost) match
+
+            ref["in_critical_section"] = in_cs
+            ref["critical_section_name"] = cs_name
 
     def _extract_internal_calls(self, func_cursor: Any, src_path: str,
                                 current_name: str) -> List[Dict[str, Any]]:

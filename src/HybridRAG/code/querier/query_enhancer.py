@@ -28,6 +28,13 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Config-driven default alpha (MEG_SW-308)
+try:
+    from env_config import get_default_search_alpha as _get_default_alpha
+    _DEFAULT_SEARCH_ALPHA = _get_default_alpha()
+except Exception:
+    _DEFAULT_SEARCH_ALPHA = 0.6
+
 
 # ═════════════════════════════════════════════════════════════════════════
 #  Query Complexity
@@ -172,7 +179,7 @@ class EnhancedQuery:
     synonyms_added: List[str] = field(default_factory=list)
     complexity: QueryComplexity = QueryComplexity.SIMPLE
     strategy: SearchStrategy = SearchStrategy.HYBRID
-    suggested_alpha: float = 0.6
+    suggested_alpha: float = _DEFAULT_SEARCH_ALPHA
     suggested_max_results: int = 10
     detected_entities: List[str] = field(default_factory=list)
     detected_modules: List[str] = field(default_factory=list)

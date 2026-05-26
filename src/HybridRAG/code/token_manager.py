@@ -82,8 +82,8 @@ def is_token_expired(token: str, buffer_minutes: int = _EXPIRY_BUFFER_MINUTES) -
     payload = _decode_jwt_payload(token)
     exp = payload.get("exp")
     if exp is None:
-        logger.warning("JWT has no 'exp' claim — treating as expired.")
-        return True
+        logger.info("JWT has no 'exp' claim — treating as non-expiring.")
+        return False
     expiry_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
     now = datetime.now(tz=timezone.utc)
     remaining = expiry_dt - now
@@ -236,10 +236,13 @@ def ensure_valid_token(
 
     if not force_refresh and not is_token_expired(current_token):
         info = get_token_info(current_token)
-        logger.info(
-            "Token is still valid (expires %s, remaining %s).",
-            info.get("exp", "?"), info.get("remaining", "?"),
-        )
+        if "exp" in info:
+            logger.info(
+                "Token is still valid (expires %s, remaining %s).",
+                info["exp"], info.get("remaining", "?"),
+            )
+        else:
+            logger.info("Token is valid (no expiry — non-expiring service token).")
         return current_token
 
     reason = "forced refresh" if force_refresh else "expired / missing"

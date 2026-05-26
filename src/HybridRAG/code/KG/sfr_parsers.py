@@ -48,6 +48,7 @@ _MODULE_SFR_MAP: dict[str, str] = {
     "CAN_17_MCMCAN": "Can",
     "LIN_17_ASCLIN": "Asclin",
     "WDG_17_WTU": "Wtu",
+    "FR_17_ERAY": "Eray",
 }
 
 # Reverse map: upper-cased SFR peripheral → canonical MCAL module name.

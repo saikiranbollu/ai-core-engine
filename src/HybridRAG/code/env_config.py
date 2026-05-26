@@ -93,3 +93,28 @@ def load_yaml_with_env(path: Path | str) -> dict:
         raw = yaml.safe_load(fh)
 
     return _walk_and_resolve(raw)
+
+
+# ---------------------------------------------------------------------------
+# Config-driven defaults (MEG_SW-308)
+# ---------------------------------------------------------------------------
+_STORAGE_CONFIG_PATH = _SCRIPT_DIR.parent / "config" / "storage_config.yaml"
+_cached_default_alpha: float | None = None
+
+
+def get_default_search_alpha() -> float:
+    """Return the default hybrid-search alpha from storage_config.yaml (cached).
+
+    Falls back to 0.6 if the config file cannot be read.
+    """
+    global _cached_default_alpha
+    if _cached_default_alpha is not None:
+        return _cached_default_alpha
+    try:
+        cfg = load_yaml_with_env(_STORAGE_CONFIG_PATH)
+        _cached_default_alpha = float(
+            cfg.get("hybrid_search", {}).get("default_alpha", 0.6)
+        )
+    except Exception:
+        _cached_default_alpha = 0.6
+    return _cached_default_alpha

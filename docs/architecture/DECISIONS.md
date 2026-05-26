@@ -120,10 +120,10 @@
 |-------|-------|
 | **Status** | Adopted |
 | **Date** | Sprint 1, hardened Sprint 6 |
-| **Context** | 56 tools with different sensitivity levels (read-only search vs. data mutation vs. admin operations). Need per-request authorization, not just per-session. API keys are DA-specific. |
-| **Decision** | Use **Cerbos PDP** (Policy Decision Point) running as a sidecar subprocess. 3-tier RBAC: `public` (36 tools), `developer` (14 tools), `admin` (6 tools). Derived roles for tier inheritance. |
+| **Context** | 55 active tools with different sensitivity levels (read-only search vs. data mutation vs. admin operations). Need per-request authorization, not just per-session. API keys are DA-specific. |
+| **Decision** | Use **Cerbos PDP** (Policy Decision Point) running as a sidecar subprocess. 3-tier RBAC: `public` (34 tools), `developer` (16 tools), `admin` (5 tools). Derived roles for tier inheritance. |
 | **Rationale** | (1) Cerbos policies are declarative YAML with CEL expressions — no code changes to update access rules. (2) Derived roles handle tier inheritance (`admin` inherits `developer` inherits `public`) cleanly. (3) Sidecar model keeps PDP co-located with the MCP server for low-latency checks. (4) Graceful fallback: if Cerbos is unavailable, `auth_middleware.py` falls back to local tier-check from `tool_tiers.py`. |
-| **Alternatives considered** | OPA/Rego (more complex expression language), custom middleware only (lacks policy-as-code separation), OAuth2 scopes (too coarse for 56 tools). |
+| **Alternatives considered** | OPA/Rego (more complex expression language), custom middleware only (lacks policy-as-code separation), OAuth2 scopes (too coarse for per-tool authorization across 55 tools). |
 | **Implementation** | `auth_middleware.py` → `check_authorization(api_key, tool_name, workspace)`. API keys defined in `api_keys.yaml`. Policies in `mcp/auth/policies/`. Cerbos binary bundled in Docker image (multi-stage build). |
 
 ---
@@ -475,12 +475,12 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Adopted |
-| **Date** | Sprint 14 |
+| **Status** | **Planned — not implemented** |
+| **Date** | Sprint 14 (decision) |
 | **Context** | DA output claims are not verified against source context. DocJockey's citation verification reduces hallucinations by 85%. |
 | **Decision** | Add post-generation citation verification: extract claims (GPT4IFX or regex), match against source KG nodes (text overlap + entity matching), flag unverified claims. Integrates with ConfidenceCalculator as additional scoring signal. |
 | **Rationale** | (1) Safety-critical automotive domain demands claim verification. (2) Dual extraction (LLM + regex fallback). (3) Deterministic verification via text overlap. |
-| **Implementation** | `CitationVerifier` in `src/ReviewGate/citation_verifier.py`. New MCP tool: `verify_citations` (Cat 9). |
+| **Implementation status** | Not yet implemented. `src/ReviewGate/citation_verifier.py` does not exist in the current codebase and the `verify_citations` MCP tool is not registered in [`mcp/core/tool_tiers.py`](../../mcp/core/tool_tiers.py). Tracked as an open ADR pending prioritization. |
 
 ---
 

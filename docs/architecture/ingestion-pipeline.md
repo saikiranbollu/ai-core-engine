@@ -43,18 +43,22 @@ Polarion ─────┘                         │
 
 All ingestion tools require **admin** tier authorization (Cerbos RBAC).
 
+> **MCP exposure note (Plan 2 Phase 2).** The admin ingestion tools `ingest_file`, `ingest_module_from_repo`, `batch_ingest_modules`, and `ingest_repository` were **removed from MCP registration** — see [`mcp/core/tool_tiers.py`](../../mcp/core/tool_tiers.py) where they are commented out. The only MCP-exposed ingestion tool today is `process_results` (admin). Per-session ingestion via MCP flows through `sandbox_upload` (public, Cat 6) into the in-process sandbox overlay; repository-scale jobs invoke `IngestionService` directly from library code, scripts, or Celery workers (out-of-band of MCP).
+
 ---
 
 ## 2. Ingestion Modes
 
-| Mode | Tool | Scope | Use Case |
-|------|------|-------|----------|
+> The library-level service still exposes four ingestion modes; the table below describes the `IngestionService` API surface. None of these are MCP tools today — they are invoked from library code.
+
+| Mode | Library method | Scope | Use Case |
+|------|----------------|-------|----------|
 | **Single file** | `ingest_file` | One file | Quick testing, targeted updates |
 | **Module** | `ingest_module_from_repo` | All files in a module directory | Module onboarding |
 | **Batch** | `batch_ingest_modules` | Multiple modules in parallel | Bulk onboarding |
-
-Sprint 9: `batch_ingest()` uses `ThreadPoolExecutor(max_workers=4)` with `as_completed()` for parallel module processing (~4x speedup).
 | **Repository** | `ingest_repository` | Auto-discover and ingest all modules | Initial setup |
+
+`batch_ingest()` uses `ThreadPoolExecutor(max_workers=4)` with `as_completed()` for parallel module processing (~4x speedup).
 
 ### Single File Flow
 

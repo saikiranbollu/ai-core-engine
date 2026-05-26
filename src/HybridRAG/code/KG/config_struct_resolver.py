@@ -347,9 +347,24 @@ class ConfigStructResolver:
                     "    %s[] element → %s", var_name, ref,
                 )
 
+    # Primitive/scalar types that should not participate in struct chain resolution.
+    _PRIMITIVE_TYPES = frozenset({
+        "uint8", "uint16", "uint32", "uint64",
+        "sint8", "sint16", "sint32", "sint64",
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "int", "unsigned", "char", "short", "long",
+        "float", "double", "boolean", "void",
+        "size_t", "ptrdiff_t", "uintptr_t", "intptr_t",
+        "Std_ReturnType", "StatusType",
+    })
+
     def _record_global(self, var_name: str, type_name: str) -> None:
         """Register a global variable and its type."""
         self._global_types[var_name] = type_name
+        # Skip primitive types — they would cause false matches in chain resolution
+        if type_name in self._PRIMITIVE_TYPES:
+            return
         bucket = self._type_to_globals.setdefault(type_name, [])
         if var_name not in bucket:
             bucket.append(var_name)
@@ -500,6 +515,25 @@ class ConfigStructResolver:
             return
         targets = self._field_map.get((current, fields[step]))
         if not targets:
+            # Can't resolve this step — emit the accumulated path so far.
+            # The last resolved global becomes the leaf, and we record
+            # the unresolved trailing fields so the caller can include
+            # them in the via_chain (e.g. "->ResultBufferPtr").
+            if path:
+                path[-1]["is_intermediate"] = False
+                path[-1]["unresolved_fields"] = list(fields[step:])
+                out.extend(path)
+            elif step == 0:
+                # Path is empty but current IS a root global. The field
+                # is a scalar member (not a pointer to another global).
+                # Emit current as the leaf with unresolved_fields so the
+                # caller knows which member was accessed.
+                out.append({
+                    "global_name": current,
+                    "is_intermediate": False,
+                    "step_index": 0,
+                    "unresolved_fields": list(fields[step:]),
+                })
             return
         is_final = step == len(fields) - 1
         for target in targets:

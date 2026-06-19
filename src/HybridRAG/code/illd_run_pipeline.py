@@ -79,7 +79,7 @@ logger = logging.getLogger("illd_pipeline")
 
 def _import_parsers():
     """Import ILLD parsers from IngestionPipeline."""
-    from src.IngestionPipeline.Parsers import (
+    from src.IngestionPipeline.parsers import (
         illd_swa_parser,
         c_parser,
         sfr_parser,
@@ -90,7 +90,7 @@ def _import_parsers():
     # pdf_parser pulls in heavy optional deps (PyMuPDF, langchain_openai).
     # Import it lazily so steps that don't need it can still run.
     try:
-        from src.IngestionPipeline.Parsers import pdf_parser
+        from src.IngestionPipeline.parsers import pdf_parser
     except ImportError as exc:  # pragma: no cover - optional dep
         logging.getLogger(__name__).warning(
             "pdf_parser unavailable (%s); HW PDF step will be skipped.", exc
@@ -105,7 +105,6 @@ def _import_parsers():
         "pdf": pdf_parser,
         "srs": srs_dox_parser,
     }
-
 
 def _import_jama():
     """Import Jama connector."""
@@ -130,7 +129,6 @@ def _load_config():
     from env_config import load_env, load_yaml_with_env
     load_env()
     return load_yaml_with_env(CONFIG_DIR / "storage_config.yaml")
-
 
 # ---------------------------------------------------------------------------
 # Remote Source Fetcher — downloads files from GitLab & Bitbucket APIs
@@ -308,29 +306,83 @@ class RemoteSourceFetcher:
         results = self.fetch_all_swa_headers()
         return results[0] if results else None
 
+    def _doc_arch_dirs(self) -> List[str]:
+        """Return candidate directories for doc/arch/input (SWA, SRS, PUML)."""
+        return [
+            f"lld/peripheral/{self.module_cap}/doc/arch/input",
+            f"lld/base/{self.module_cap}/doc/arch/input",
+            f"lld/{self.module_cap}/doc/arch/input",
+        ]
+
+    def _source_dirs(self) -> List[str]:
+        """Return candidate directories for C source files."""
+        return [
+            f"lld/peripheral/{self.module_cap}",
+            f"lld/base/{self.module_cap}",
+            f"lld/{self.module_cap}/src",
+            f"lld/{self.module_cap}",
+        ]
+
+    # Some modules use a different token in the SFR filename than the module name.
+    # Key: module name (upper); Value: token (str) or list of tokens to search for
+    # in *_regdef.h filenames.  A list means the module has multiple SFR sub-blocks.
+    _SFR_NAME_ALIASES: Dict[str, Any] = {
+        "PORTS":   "PORTX",                              # IfxPortx_regdef.h
+        "CLOCKSC": ["LPCCU", "LPPLL", "MCCU", "MPLL"],  # 4 sub-block SFRs
+    }
+
+    def _sfr_dirs(self) -> List[str]:
+        """Return candidate directories for SFR regdef headers."""
+        return [
+            "lld/RC1S16A/sfr/inc",
+            "infra/sfr/inc",
+        ]
+
     def fetch_all_swa_headers(self) -> List[Path]:
         """Fetch ALL SWA headers for this module from GitLab.
 
+        Searches for ``*_swa.h`` first.  If none found, falls back to
+        ``Ifx{Module}.h`` — some modules (e.g. BTM, XDMA, SMU) use the
+        plain header name without the ``_swa`` suffix.
+
         Returns a list of local Paths (may be empty).
         """
-        remote_dir = f"lld/{self.module_cap}/doc/arch/input"
-        entries = self._gl_list_tree(remote_dir)
-        swa_files = [
-            e for e in entries
-            if e.get("name", "").lower().endswith("_swa.h")
-        ]
-        if not swa_files:
-            self.logger.warning("No SWA header found for module %s", self.module)
-            return []
+        for remote_dir in self._doc_arch_dirs():
+            entries = self._gl_list_tree(remote_dir)
+            swa_files = [
+                e for e in entries
+                if e.get("name", "").lower().endswith("_swa.h")
+            ]
+            if swa_files:
+                results: List[Path] = []
+                for sf in swa_files:
+                    match_path = f"{remote_dir}/{sf['name']}"
+                    self.logger.info("Fetching SWA: %s", match_path)
+                    local = self.fetch_gitlab_file(match_path)
+                    if local:
+                        results.append(local)
+                return results
 
-        results: List[Path] = []
-        for sf in swa_files:
-            match_path = f"{remote_dir}/{sf['name']}"
-            self.logger.info("Fetching SWA: %s", match_path)
-            local = self.fetch_gitlab_file(match_path)
-            if local:
-                results.append(local)
-        return results
+        # Fallback: Ifx{Module}.h (no _swa suffix) — e.g. IfxBtm.h, IfxSmu.h
+        fallback_name = f"Ifx{self.module_cap}.h"
+        for remote_dir in self._doc_arch_dirs():
+            entries = self._gl_list_tree(remote_dir)
+            fallback_files = [
+                e for e in entries
+                if e.get("name", "").lower() == fallback_name.lower()
+            ]
+            if fallback_files:
+                results = []
+                for sf in fallback_files:
+                    match_path = f"{remote_dir}/{sf['name']}"
+                    self.logger.info("Fetching SWA (Ifx*.h fallback): %s", match_path)
+                    local = self.fetch_gitlab_file(match_path)
+                    if local:
+                        results.append(local)
+                return results
+
+        self.logger.warning("No SWA header found for module %s", self.module)
+        return []
 
     def fetch_source_code(self) -> Optional[Path]:
         """Fetch the C source file for this module from GitLab.
@@ -346,56 +398,89 @@ class RemoteSourceFetcher:
 
         Returns a list of local Paths (may be empty).
         """
-        remote_dir = f"lld/{self.module_cap}/src"
-        entries = self._gl_list_tree(remote_dir)
-        c_files = [
-            e for e in entries
-            if e.get("name", "").lower().endswith(".c")
-            and self.module_cap.lower() in e.get("name", "").lower()
-        ]
-        if not c_files:
-            self.logger.warning("No C source found for module %s", self.module)
-            return []
+        for remote_dir in self._source_dirs():
+            entries = self._gl_list_tree(remote_dir)
+            c_files = [
+                e for e in entries
+                if e.get("name", "").lower().endswith(".c")
+                and self.module_cap.lower() in e.get("name", "").lower()
+            ]
+            if c_files:
+                results: List[Path] = []
+                for cf in c_files:
+                    match_path = f"{remote_dir}/{cf['name']}"
+                    self.logger.info("Fetching C source: %s", match_path)
+                    local = self.fetch_gitlab_file(match_path)
+                    if local:
+                        results.append(local)
+                return results
 
-        results: List[Path] = []
-        for cf in c_files:
-            match_path = f"{remote_dir}/{cf['name']}"
-            self.logger.info("Fetching C source: %s", match_path)
-            local = self.fetch_gitlab_file(match_path)
-            if local:
-                results.append(local)
-        return results
+        self.logger.warning("No C source found for module %s", self.module)
+        return []
 
     def fetch_sfr_regdef(self) -> Optional[Path]:
-        """Fetch the SFR regdef header from GitLab."""
-        path = f"infra/sfr/inc/Ifx{self.module_cap}_regdef.h"
-        return self.fetch_gitlab_file(path)
+        """Fetch the SFR regdef header from GitLab (backward-compat wrapper)."""
+        all_paths = self.fetch_all_sfr_regdefs()
+        return all_paths[0] if all_paths else None
+
+    def fetch_all_sfr_regdefs(self) -> List[Path]:
+        """Fetch ALL SFR regdef headers for this module from GitLab.
+
+        Scans multiple candidate directories for files matching
+        ``*{module}*_regdef.h`` (case-insensitive) and downloads each one.
+        Applies ``_SFR_NAME_ALIASES`` for modules whose SFR filename token
+        differs from the module name (e.g. PORTS → PORTX).
+
+        Returns a list of local Paths (may be empty).
+        """
+        # Use alias token(s) if defined, else fall back to the capitalised module name.
+        # The alias may be a single string or a list of strings (multi-block modules).
+        alias = self._SFR_NAME_ALIASES.get(self.module, self.module_cap)
+        sfr_tokens = [t.lower() for t in (alias if isinstance(alias, list) else [alias])]
+        for remote_dir in self._sfr_dirs():
+            entries = self._gl_list_tree(remote_dir)
+            regdef_files = [
+                e for e in entries
+                if e.get("name", "").lower().endswith("_regdef.h")
+                and any(tok in e.get("name", "").lower() for tok in sfr_tokens)
+            ]
+            if regdef_files:
+                results: List[Path] = []
+                for rf in regdef_files:
+                    match_path = f"{remote_dir}/{rf['name']}"
+                    self.logger.info("Fetching SFR regdef: %s", match_path)
+                    local = self.fetch_gitlab_file(match_path)
+                    if local:
+                        results.append(local)
+                return results
+
+        self.logger.warning("No SFR regdef found for module %s", self.module)
+        return []
 
     def fetch_all_srs_dox(self) -> List[Path]:
         """Fetch ALL Ifx<Module>_srs.dox files for this module from GitLab.
 
-        SRS .dox files live alongside the SWA headers in
-        ``lld/<Module>/doc/arch/input``.  Returns a list of local Paths
-        (may be empty).
+        SRS .dox files live alongside the SWA headers.
+        Returns a list of local Paths (may be empty).
         """
-        remote_dir = f"lld/{self.module_cap}/doc/arch/input"
-        entries = self._gl_list_tree(remote_dir)
-        srs_files = [
-            e for e in entries
-            if e.get("name", "").lower().endswith("_srs.dox")
-        ]
-        if not srs_files:
-            self.logger.warning("No SRS .dox found for module %s", self.module)
-            return []
+        for remote_dir in self._doc_arch_dirs():
+            entries = self._gl_list_tree(remote_dir)
+            srs_files = [
+                e for e in entries
+                if e.get("name", "").lower().endswith("_srs.dox")
+            ]
+            if srs_files:
+                results: List[Path] = []
+                for sf in srs_files:
+                    match_path = f"{remote_dir}/{sf['name']}"
+                    self.logger.info("Fetching SRS: %s", match_path)
+                    local = self.fetch_gitlab_file(match_path)
+                    if local:
+                        results.append(local)
+                return results
 
-        results: List[Path] = []
-        for sf in srs_files:
-            match_path = f"{remote_dir}/{sf['name']}"
-            self.logger.info("Fetching SRS: %s", match_path)
-            local = self.fetch_gitlab_file(match_path)
-            if local:
-                results.append(local)
-        return results
+        self.logger.warning("No SRS .dox found for module %s", self.module)
+        return []
 
     def fetch_puml_files(self) -> Optional[Path]:
         """Fetch all .puml files for this module from GitLab.
@@ -403,26 +488,34 @@ class RemoteSourceFetcher:
         Returns the local directory containing the downloaded .puml files,
         or None if none found.
         """
-        remote_dir = f"lld/{self.module_cap}/doc/arch/input"
-        entries = self._gl_list_tree(remote_dir)
-        pumls = [e for e in entries if e.get("name", "").endswith(".puml")]
+        for remote_dir in self._doc_arch_dirs():
+            entries = self._gl_list_tree(remote_dir)
+            pumls = [e for e in entries if e.get("name", "").endswith(".puml")]
 
-        if not pumls:
-            self.logger.warning("No .puml files found at %s", remote_dir)
-            return None
+            if pumls:
+                local_dir = self.gitlab_root / remote_dir
+                local_dir.mkdir(parents=True, exist_ok=True)
 
-        local_dir = self.gitlab_root / remote_dir
-        local_dir.mkdir(parents=True, exist_ok=True)
+                for p in pumls:
+                    remote_path = f"{remote_dir}/{p['name']}"
+                    content = self._gl_download_file(remote_path)
+                    if content:
+                        (local_dir / p["name"]).write_bytes(content)
 
-        for p in pumls:
-            remote_path = f"{remote_dir}/{p['name']}"
-            content = self._gl_download_file(remote_path)
-            if content:
-                (local_dir / p["name"]).write_bytes(content)
+                count = len(list(local_dir.glob("*.puml")))
+                self.logger.info("Downloaded %d .puml files to %s", count, local_dir)
+                return local_dir if count > 0 else None
 
-        count = len(list(local_dir.glob("*.puml")))
-        self.logger.info("Downloaded %d .puml files to %s", count, local_dir)
-        return local_dir if count > 0 else None
+        self.logger.warning("No .puml files found for module %s", self.module)
+        return None
+
+    # Modules whose Bitbucket PDF folder does NOT follow the RC1_IP_{MODULE} naming
+    # convention and cannot be found by prefix matching.  Maps module → explicit BB
+    # folder name (relative to BB_BASE_PATH).
+    _PDF_FOLDER_MAP: Dict[str, str] = {
+        "CLOCKSC": "RC1_IP_N28RRA_CTROOT",   # RC1_CLOCKSC_HWA_Nom_v20251107_01.pdf
+        "CHIPMON": "RC1_IP_N28RRA_DTS_HP",   # CHIPMON_FBcontent_INTERNAL_*.pdf
+    }
 
     def fetch_hw_pdf(self) -> Optional[Path]:
         """Fetch the HW manual PDF from Bitbucket.
@@ -440,21 +533,43 @@ class RemoteSourceFetcher:
             entries = self._bb_list_dir(bb_dir)
             return [e for e in entries if e["name"].lower().endswith(".pdf")]
 
-        # 1) Try exact match: RC1_IP_CANXS
-        bb_dir = f"{self.BB_BASE_PATH}/RC1_IP_{mod_upper}"
-        pdfs = _find_pdfs(bb_dir)
+        # 0) Explicit override for modules with non-standard BB folder names
+        if self.module in self._PDF_FOLDER_MAP:
+            bb_dir = f"{self.BB_BASE_PATH}/{self._PDF_FOLDER_MAP[self.module]}"
+            pdfs = _find_pdfs(bb_dir)
+            if pdfs:
+                self.logger.info("Using PDF folder map: %s → %s", mod_upper, bb_dir)
+            else:
+                pdfs = []
+        else:
+            pdfs = []
+            bb_dir = f"{self.BB_BASE_PATH}/RC1_IP_{mod_upper}"
 
-        # 2) Fallback: scan parent for folders that share a prefix with the module
-        #    e.g. module=CANXS → finds RC1_IP_CAN (CAN is a prefix of CANXS)
+        # 1) Try exact match: RC1_IP_{MODULE}
+        if not pdfs:
+            bb_dir = f"{self.BB_BASE_PATH}/RC1_IP_{mod_upper}"
+            pdfs = _find_pdfs(bb_dir)
+
+        # 2) Fallback: scan parent for folders that share a prefix with the module.
+        #    Two directions are checked:
+        #      a) module name starts with folder suffix
+        #         e.g. CANXS → RC1_IP_CAN  ("CANXS".startswith("CAN"))
+        #      b) folder suffix starts with module name
+        #         e.g. SMU   → RC1_IP_SMUSAT  ("SMUSAT".startswith("SMU"))
+        #         e.g. SCU   → RC1_IP_SCU_RC1 ("SCU_RC1".startswith("SCU"))
+        #         e.g. PMS   → RC1_IP_PMS_MON ("PMS_MON".startswith("PMS"))
         if not pdfs:
             parent_entries = self._bb_list_dir(self.BB_BASE_PATH)
             candidates = sorted(
                 [e["name"] for e in parent_entries
-                 if e["type"] == "DIRECTORY"
+                 if e.get("type") == "DIRECTORY"
                  and e["name"].startswith("RC1_IP_")
-                 and mod_upper.startswith(e["name"][7:])  # 7 = len("RC1_IP_")
+                 and (
+                     mod_upper.startswith(e["name"][7:])       # (a) CANXS → CAN
+                     or e["name"][7:].startswith(mod_upper)    # (b) SMU → SMUSAT
+                 )
                  and e["name"] != f"RC1_IP_{mod_upper}"],
-                key=lambda n: len(n), reverse=True,  # prefer longest match
+                key=lambda n: len(n), reverse=True,  # prefer longest / most specific match
             )
             for folder in candidates:
                 bb_dir = f"{self.BB_BASE_PATH}/{folder}"
@@ -573,8 +688,22 @@ class ILLDPipeline:
             return
         out_path = self._intermediary_dir / f"{step_name}.json"
         try:
+            # Convert dataclass instances (e.g. JamaItem) to dicts for proper
+            # JSON serialization instead of falling back to str()/repr().
+            from dataclasses import asdict, is_dataclass
+
+            def _make_serializable(obj):
+                if is_dataclass(obj) and not isinstance(obj, type):
+                    return asdict(obj)
+                if isinstance(obj, list):
+                    return [_make_serializable(i) for i in obj]
+                if isinstance(obj, dict):
+                    return {k: _make_serializable(v) for k, v in obj.items()}
+                return obj
+
+            serializable_data = _make_serializable(data)
             with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, default=str)
+                json.dump(serializable_data, f, indent=2, default=str)
             logger.info("Saved intermediary: %s (%d KB)", out_path, out_path.stat().st_size // 1024)
         except Exception as e:
             logger.warning("Failed to save intermediary %s: %s", step_name, e)
@@ -607,6 +736,7 @@ class ILLDPipeline:
             self._rag = RAGIngestor(
                 module=self.module,
                 dry_run=self.dry_run,
+                clear=self.clear,
             )
         return self._rag
 
@@ -662,37 +792,48 @@ class ILLDPipeline:
     # -- Step 2: SFR regdef -------------------------------------------------
 
     def step_sfr(self):
-        """Parse SFR register definition and ingest."""
+        """Parse SFR register definition file(s) and ingest."""
         logger.info("=" * 60)
         logger.info("STEP 2: SFR Register Definitions (%s)", self.module)
         logger.info("=" * 60)
 
-        sfr_path = None
+        sfr_paths: List[Path] = []
 
         if self._fetcher:
-            sfr_path = self._fetcher.fetch_sfr_regdef()
+            sfr_paths = self._fetcher.fetch_all_sfr_regdefs()
         elif self.gitlab_repo:
-            sfr_path = (self.gitlab_repo / "infra" / "sfr" / "inc" /
-                        f"Ifx{self.module_cap}_regdef.h")
-            if not sfr_path.exists():
-                sfr_path = None
+            sfr_dir = (self.gitlab_repo / "infra" / "sfr" / "inc")
+            if sfr_dir.exists():
+                sfr_paths = sorted(
+                    p for p in sfr_dir.glob("*_regdef.h")
+                    if self.module_cap.lower() in p.name.lower()
+                )
 
-        if not sfr_path:
+        if not sfr_paths:
             logger.warning("SFR file not available — skipping.")
             return
 
         parsers = _import_parsers()
-        logger.info("Parsing: %s", sfr_path)
-        sfr_data = parsers["sfr"].parse(str(sfr_path))
-        self.data["sfr"] = sfr_data
+        merged_sfr: dict = {"registers": {}}  # accumulator
 
-        regs = len(sfr_data.get("registers", {}))
-        logger.info("Parsed: %d registers", regs)
+        for sfr_path in sfr_paths:
+            source_file = sfr_path.name
+            logger.info("Parsing: %s", sfr_path)
+            sfr_data = parsers["sfr"].parse(str(sfr_path))
 
-        if self.kg:
-            self.kg.ingest_sfr(sfr_data)
-        if self.rag:
-            self.rag.ingest_sfr(sfr_data)
+            regs = len(sfr_data.get("registers", {}))
+            logger.info("Parsed %s: %d registers", source_file, regs)
+
+            if self.kg:
+                self.kg.ingest_sfr(sfr_data, source_file=source_file)
+            if self.rag:
+                self.rag.ingest_sfr(sfr_data, source_file=source_file)
+
+            # Merge for intermediary
+            merged_sfr["registers"].update(sfr_data.get("registers", {}))
+
+        self.data["sfr"] = merged_sfr
+        logger.info("SFR complete: %d file(s) processed", len(sfr_paths))
 
     # -- Step 3: C Source Code ----------------------------------------------
 
@@ -844,9 +985,10 @@ class ILLDPipeline:
                         print()  # newline at end
 
                 md_parts = parsers["pdf"].parse(str(pdf_path), progress_callback=_pdf_progress)
+                md_text = parsers["pdf"].postprocess_markdown("\n\n".join(md_parts))
                 md_path = pdf_path.with_suffix(".md")
                 with open(md_path, "w", encoding="utf-8") as f:
-                    f.write("\n\n".join(md_parts))
+                    f.write(md_text)
                 logger.info("PDF → Markdown: %s", md_path)
 
                 # Save PDF + markdown to intermediary
@@ -886,10 +1028,22 @@ class ILLDPipeline:
 
     # -- Jama folder discovery ----------------------------------------------
 
+    # Jama folder names that differ from the pipeline module name
+    _JAMA_FOLDER_MAP: dict[str, str] = {
+        "CPUB": "cpu-base",
+        "CPUP": "cpu-eb",
+        "LPBTM": "btm",
+        "LPCAN": "can",
+    }
+
+    # Alias modules share requirement_ids with a parent module.
+    # They get Qdrant data but skip Neo4j to avoid overwriting the parent.
+    _ALIAS_MODULES: set[str] = {"LPBTM", "LPCAN"}
+
     def _find_jama_module_folder(self, connector, container_id: int):
         """Walk container → 'iLLD' folder → module folder, return folder ID or None."""
         FOLDER_TYPE = 32
-        target = self.module.lower()
+        target = self._JAMA_FOLDER_MAP.get(self.module, self.module).lower()
 
         # Level 1: find the 'iLLD' top-level folder under the container
         top_children = connector.get_children_items(container_id)
@@ -954,23 +1108,29 @@ class ILLDPipeline:
                 )
                 items = connector.get_module_items(folder_id, recurse=True)
             else:
-                # Fallback: fetch all items in the project (unfiltered)
-                project_id = illd_jama.get("project_id", 1986)
-                item_type = illd_jama.get("item_type", 83)
+                # No module folder found — skip (do NOT fallback to all-project fetch)
                 logger.warning(
-                    "No Jama folder for module '%s' — falling back to "
-                    "full project fetch (project %d, item_type %d)",
-                    self.module, project_id, item_type,
+                    "No Jama folder for module '%s' — skipping requirements.",
+                    self.module,
                 )
-                items = connector.get_items(
-                    project_id=project_id,
-                    item_type_id=item_type,
-                )
+                return
             logger.info("Fetched: %d requirements", len(items))
+
+            # Resolve picklist IDs to human-readable labels (status, importance)
+            connector.enrich_items(items)
             self.data["requirements"] = items
 
-            if self.kg:
+            # Alias modules (e.g. LPBTM→BTM) share requirement_ids with their
+            # parent.  Skip KG to avoid overwriting the parent module's nodes.
+            is_alias = self.module in self._ALIAS_MODULES
+            if self.kg and not is_alias:
                 self.kg.ingest_requirements(items)
+            elif is_alias:
+                logger.info(
+                    "Alias module '%s' — skipping Neo4j requirement ingestion "
+                    "(parent '%s' owns these nodes).",
+                    self.module, self._JAMA_FOLDER_MAP[self.module].upper(),
+                )
             if self.rag:
                 self.rag.ingest_requirements(items)
         finally:

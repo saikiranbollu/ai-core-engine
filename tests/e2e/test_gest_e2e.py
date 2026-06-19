@@ -402,12 +402,12 @@ class TestDATaskCoverage:
         gest_tools = ["search_database", "query_api_function", "query_dependencies",
                       "find_requirement_traces", "evaluate_confidence",
                       "complete_review", "submit_human_feedback",
-                      "sandbox_upload", "sandbox_query"]
+                      "sandbox_upload"]
         for t in gest_tools:
             assert t in TOOL_TIERS, f"GEST requires '{t}' but not in TOOL_TIERS"
 
-    def test_all_21_das_have_task_mapping(self):
-        expected = {"GEST", "ACRA", "CIA", "CTA", "SAGA", "PAGE", "TripleA",
-                    "KW", "SAVA", "SASA", "DaFaA", "HazopA", "GECA", "GEVT",
-                    "ATRA", "ATQA", "VoltAI", "REVA", "StopTyping", "PRQ_Drafter", "RMA"}
+    def test_all_das_have_task_mapping(self):
+        expected = {"GEST", "GECA", "GEVT", "ACRA", "ATRA", "ATQA", "TripleA",
+                    "REVA", "SAVA", "SASA", "DaFaA", "HAZOPA", "PRQGEN",
+                    "SWQMA", "J-WIZ", "Zephyr", "EDA"}
         assert set(DA_TASK_MAPPING.keys()) == expected

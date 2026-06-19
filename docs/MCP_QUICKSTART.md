@@ -1,6 +1,6 @@
 # AICE MCP Server — Quick Start & Configuration Guide
 
-**Companion to [DETAILED_DOCUMENTATION.md](DETAILED_DOCUMENTATION.md) — practical setup and usage reference for Domain Assistant developers.**
+**Companion to [DOCUMENTATION.md](DOCUMENTATION.md) — practical setup and usage reference for Domain Assistant developers.**
 
 > **Deployment model:** The AICE MCP server, Neo4j, Qdrant, Redis, PostgreSQL, and Cerbos are **already deployed and running** on the Infineon Cloud. You do **not** need to install or configure any server-side infrastructure. This guide focuses on connecting your Domain Assistant (running locally or in CI/CD) to the cloud-hosted AICE server.
 
@@ -639,7 +639,7 @@ curl -X POST "$AICE_URL" \
 ### 7.3 Getting Help
 
 - **Server-side issues** (backends down, ingestion problems, new API key requests): Contact the **platform team**.
-- **DA integration issues** (how to call tools, context assembly, session management): See [DETAILED_DOCUMENTATION.md](DETAILED_DOCUMENTATION.md) for the full technical reference.
+- **DA integration issues** (how to call tools, context assembly, session management): See [DOCUMENTATION.md](DOCUMENTATION.md) for the full technical reference.
 
 ---
 
@@ -655,8 +655,8 @@ curl -X POST "$AICE_URL" \
 | Auth | `Authorization: Bearer key-cia-001` header on every request |
 | Workspaces | `illd` (iLLD drivers) or `mcal` (AUTOSAR MCAL) |
 | Response format | `{"error": false, "data": {...}}` or `{"error": true, "error_code": "...", "message": "..."}` |
-| Need help? | Platform issues → platform team · DA integration → [DETAILED_DOCUMENTATION.md](DETAILED_DOCUMENTATION.md) |
+| Need help? | Platform issues → platform team · DA integration → [DOCUMENTATION.md](DOCUMENTATION.md) |
 
 ---
 
-*See [DETAILED_DOCUMENTATION.md](DETAILED_DOCUMENTATION.md) for the complete technical reference.*
+*See [DOCUMENTATION.md](DOCUMENTATION.md) for the complete technical reference.*

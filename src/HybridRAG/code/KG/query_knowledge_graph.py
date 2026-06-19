@@ -47,7 +47,7 @@ import yaml
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError
 
-from src.HybridRAG.code.KG._kg_safety import sanitize_label
+from _kg_safety import sanitize_label
 
 # ---------------------------------------------------------------------------
 # Paths  (file lives at HybridRAG/code/KG/)

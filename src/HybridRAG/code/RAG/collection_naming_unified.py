@@ -189,11 +189,14 @@ def module_collections(
 
 
 def _mcal_module_collections(mod: str) -> List[str]:
-    """MCAL collection naming: {module}_{doc_source}_{category}."""
-    return [
+    """MCAL collection naming: {module}_{doc_source}_{category} + mcal_{module}_sourcecode."""
+    colls = [
         collection_name(mod, src, cat)
         for src, cat in _MCAL_COLLECTION_TYPES
     ]
+    # Include the source code collection (mcal_{module}_sourcecode)
+    colls.append(f"mcal_{mod}_sourcecode")
+    return colls
 
 
 def _illd_module_collections(mod: str) -> List[str]:

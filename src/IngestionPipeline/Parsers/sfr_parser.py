@@ -8,7 +8,7 @@ module name, registers, bitfields, and statistics.
 
 Usage::
 
-    from IngestionPipeline.Parsers import sfr_parser
+    from IngestionPipeline.parsers import sfr_parser
 
     result = sfr_parser.parse("IfxCxpi_regdef.h")
     # result is a dict with module, file, registers, statistics
@@ -44,10 +44,15 @@ def parse(path: str) -> Dict[str, Any]:
     lines = p.read_text(encoding="utf-8").splitlines()
 
     struct_decl_re = re.compile(r'typedef struct\s+_?([A-Za-z0-9_]+)')
+    # Group 1: access qualifier (__IOM/__IM/__OM/etc.)
+    # Group 2: field name (empty for anonymous/reserved fields)
+    # Group 3: bit width
+    # Group 4: full comment text
     bitfield_re = re.compile(
-        r'^\s*\w+\s+Ifx_UReg_32Bit(?:\s+(\w+))?\s*:(\d+);\s*/\*\*<(.*?)\*/\s*$'
+        r'^\s*(__\w+)\s+Ifx_UReg_32Bit(?:\s+(\w+))?\s*:(\d+);\s*/\*\*<(.*?)\*/\s*$'
     )
     comment_re = re.compile(r'\\brief\s*\[([^\]]+)\]\s*(.*)')
+    access_type_re = re.compile(r'\(([a-zA-Z0-9]+)\)\s*$')  # e.g. (rw), (rh), (rw1sh)
 
     registers: Dict[str, List[Dict[str, str]]] = {}
     waiting = False
@@ -71,13 +76,18 @@ def parse(path: str) -> Dict[str, Any]:
 
         bm = bitfield_re.search(line)
         if bm and current_struct is not None:
-            field_name = bm.group(1) or ''
-            bit_width = bm.group(2)
-            comment = bm.group(3).strip()
+            access_qualifier = bm.group(1)        # e.g. __IOM, __IM, __OM (raw, as-is)
+            field_name       = bm.group(2) or ''
+            bit_width        = bm.group(3)
+            comment          = bm.group(4).strip()
 
             cm = comment_re.search(comment)
-            bit_range = cm.group(1) if cm else ''
+            bit_range   = cm.group(1) if cm else ''
             description = cm.group(2).strip() if cm else comment
+
+            # Extract hardware access notation e.g. (rw), (rh), (rw1sh)
+            am = access_type_re.search(description)
+            access_type = am.group(1) if am else None
 
             if not field_name:
                 safe = bit_range.replace(':', '_')
@@ -87,13 +97,17 @@ def parse(path: str) -> Dict[str, Any]:
             else:
                 label = f"{field_name} [{bit_range}]" if bit_range else field_name
 
-            registers[current_struct].append({
+            entry = {
                 'name': field_name,
                 'width': bit_width,
                 'bit_range': bit_range,
                 'description': description,
                 'label': label,
-            })
+                'access_qualifier': access_qualifier,
+            }
+            if access_type is not None:
+                entry['access_type'] = access_type
+            registers[current_struct].append(entry)
 
         if line.strip().startswith('}'):
             current_struct = None

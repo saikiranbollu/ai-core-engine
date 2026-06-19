@@ -19,7 +19,7 @@ The output contains:
 
 Usage::
 
-    from IngestionPipeline.Parsers import arxml_parser
+    from IngestionPipeline.parsers import arxml_parser
 
     result = arxml_parser.parse("EcuC_001.arxml")
     # result["modules"]           → hierarchical tree

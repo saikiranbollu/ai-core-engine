@@ -17,6 +17,7 @@ Components:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -29,6 +30,8 @@ from typing import Any, Dict, List, Optional, Protocol
 import yaml as _yaml
 
 logger = logging.getLogger(__name__)
+
+_ILLD_MODULE_ALIAS_CACHE: Optional[Dict[str, str]] = None
 
 # Config-driven default alpha (MEG_SW-308)
 try:
@@ -297,6 +300,19 @@ class EphemeralGraph:
         for edge in to_remove:
             self._graph.remove_edge(*edge)
         return len(to_remove)
+
+    def remove_node(self, node_id: str) -> bool:
+        """Remove a node and all its incident edges from the graph.
+
+        Also purges the node from the keyword index so keyword search stays
+        consistent.  Returns True if the node existed, False otherwise.
+        """
+        if node_id not in self._graph:
+            return False
+        self._graph.remove_node(node_id)   # NetworkX removes all incident edges too
+        for token_set in self._keyword_index.values():
+            token_set.discard(node_id)
+        return True
 
     def get_all_nodes(self):
         """Return iterator of (node_id, data_dict) for all nodes."""
@@ -791,12 +807,19 @@ class SandboxParserDispatcher:
                     "functions": [], "content": content, "file": str(p)}
 
     def _parse_pdf(self, p: Path) -> Dict:
+        # Uses pymupdf4llm-based section parser (no GPT, offline-capable).
+        # Returns "pdf_md" type → SandboxAdapter creates per-section vector chunks only.
         try:
-            from src.IngestionPipeline.Parsers.pdf_parser import parse as pdf_parse
-            pages = pdf_parse(str(p))
-            return {"type": "pdf", "pages": pages, "file": str(p)}
+            from src.IngestionPipeline.Parsers.offline_pdf_parser import (
+                convert_pdf_to_sections,
+            )
+            return convert_pdf_to_sections(str(p))
         except ImportError:
-            return {"type": "pdf", "pages": [], "file": str(p)}
+            logger.warning("[SandboxParserDispatcher] offline_pdf_parser not available for %s", p.name)
+        except Exception as _exc:
+            logger.warning("[SandboxParserDispatcher] PDF parser failed for %s: %s", p.name, _exc)
+
+        return {"type": "pdf_md", "sections": [], "raw_md": "", "file": str(p)}
 
     def _parse_xlsx(self, p: Path, fname_lower: str) -> Dict:
         if "_ts_" in fname_lower or "testspec" in fname_lower:
@@ -976,6 +999,12 @@ class SandboxAdapter:
             for e in parsed.get("enums", []):
                 if isinstance(e, dict) and e.get("name"):
                     node_names.append(e["name"])
+            for td in parsed.get("typedefs", []):
+                if isinstance(td, dict) and td.get("name"):
+                    node_names.append(td["name"])
+            for macro in parsed.get("macros", []):
+                if isinstance(macro, dict) and macro.get("name"):
+                    node_names.append(macro["name"])
         elif ptype == "illd_sfr":
             for reg_name in parsed.get("registers", {}):
                 node_names.append(reg_name)
@@ -1031,8 +1060,9 @@ class SandboxAdapter:
                 node_names = self._ingest_requirements_illd(sandbox, parsed, filename, module)
             else:
                 node_names = self._ingest_json(sandbox, parsed, filename, module)
-        elif ptype in ("pdf", "text", "rst", "generic"):
-            self._ingest_document(sandbox, parsed, filename, module)
+        elif ptype == "pdf_md":
+            node_names = self._ingest_pdf_md(sandbox, parsed, filename, module)
+            illd_semantic_chunks = True  # per-section chunks already created
         elif ptype == "xlsx":
             self._ingest_xlsx(sandbox, parsed, filename, module)
         elif ptype == "testspec":
@@ -1049,9 +1079,19 @@ class SandboxAdapter:
                 sandbox.vectors.remove_by_metadata(source_file=filename)
                 sandbox.vectors.add_chunks(chunks)
 
+        # Deletion: remove production nodes from this file that were NOT
+        # re-created by this ingest pass (= deleted in the developer's edit).
+        # Only run for iLLD types where the ingest completely replaces the
+        # file's content.  Vectors are already clean (remove_by_metadata was
+        # called at the start of each _ingest_*_illd method).
+        deleted_count = 0
+        if illd_semantic_chunks and ptype != "pdf_md":
+            deleted_count = self._remove_deleted_prod_nodes(sandbox, filename)
+
         sandbox.files_ingested.append({
             "filename": filename, "source": "parser_dispatch",
             "type": ptype, "node_names_extracted": len(node_names),
+            "prod_nodes_deleted": deleted_count,
         })
         return node_names
 
@@ -1059,7 +1099,7 @@ class SandboxAdapter:
                    has_include_paths: bool = False) -> List[str]:
         """Ingest C/H parsed functions into graph."""
         node_names = []
-        mod = module or "unknown"
+        mod = (module or "unknown").upper()  # Match prod KG convention (always uppercase)
         # When include_paths were provided, clang detects SFR+globals reliably
         # so we should clear those prod edge types and re-create from sandbox.
         clear_types = (
@@ -1073,11 +1113,26 @@ class SandboxAdapter:
                 continue
             node_type = "SRC_Function"
             node_id = EphemeralGraph._canonical_id(node_type, {"name": name, "module": mod})
+            # Normalize parameters to match prod format: json.dumps(["type name", ...])
+            raw_params = fn.get("parameters", "")
+            if isinstance(raw_params, list):
+                # Convert [{"name": "x", "type": "int"}, ...] → ["int x", ...]
+                param_strs = []
+                for p in raw_params:
+                    if isinstance(p, dict):
+                        param_strs.append(f"{p.get('type', '')} {p.get('name', '')}".strip())
+                    else:
+                        param_strs.append(str(p))
+                params_serialized = json.dumps(param_strs) if param_strs else None
+            elif raw_params:
+                params_serialized = raw_params if raw_params.startswith("[") else json.dumps([raw_params])
+            else:
+                params_serialized = None
             props = {
                 "name": name,
                 "module": mod,
                 "return_type": fn.get("return_type", ""),
-                "parameters": fn.get("parameters", ""),
+                "parameters": params_serialized,
                 "source_file": filename,
                 "function_name": name,
             }
@@ -1182,23 +1237,34 @@ class SandboxAdapter:
                 node_names.append(req_id)
         return node_names
 
-    def _ingest_document(self, sandbox, parsed, filename, module):
-        """Ingest PDF/text/rst document."""
+    def _ingest_pdf_md(self, sandbox, parsed, filename, module) -> List[str]:
+        """Ingest a fast-parsed PDF (type="pdf_md") as in-memory vector chunks only.
+
+        Touches ONLY the in-memory vector store (no graph nodes, no KG edges).
+        Creates one semantic chunk per section: heading + content (up to 2000 chars).
+        """
         mod = module or "unknown"
-        node_type = "Document"
-        node_id = EphemeralGraph._canonical_id(node_type, {"name": filename, "module": mod})
-        content = ""
-        ptype = parsed.get("type", "")
-        if ptype == "pdf":
-            content = "\n".join(parsed.get("pages", []))[:50000]
-        elif ptype == "rst":
-            import json as _json
-            content = _json.dumps(parsed.get("sections", []))[:50000]
-        else:
-            content = (parsed.get("content") or "")[:50000]
-        props = {"name": filename, "module": mod, "content": content,
-                 "doc_type": ptype, "source_file": filename}
-        self._add_node_with_shadow(sandbox, node_type, node_id, props)
+        sandbox.vectors.remove_by_metadata(source_file=filename)
+
+        for sec in parsed.get("sections", []):
+            heading = sec.get("heading", "")
+            if not heading:
+                continue
+            section_num = sec.get("section_num", "")
+            content = sec.get("content", "")
+            chunk_text = f"{heading}\n\n{content}".strip()
+            sandbox.vectors.add_chunks([Chunk(
+                text=chunk_text[:2000],
+                source_file=filename,
+                metadata={
+                    "source_file": filename,
+                    "module": mod,
+                    "section_num": section_num,
+                    "heading": heading,
+                },
+            )])
+
+        return []
 
     def _ingest_xlsx(self, sandbox, parsed, filename, module):
         """Ingest XLSX sheets."""
@@ -1290,6 +1356,7 @@ class SandboxAdapter:
             text = f"Function: {name}\nReturn: {fn.get('return_type', 'void')}\nParams: {fn.get('parameters', '')}"
             chunk = Chunk(
                 text=text,
+                source_file=filename,
                 metadata={"source_file": filename, "node_type": "Function",
                           "node_id": f"Function:{name}:{mod.upper()}", "module": mod},
             )
@@ -1303,7 +1370,7 @@ class SandboxAdapter:
         Matches production node types and IDs from illd_kg_builder.py.
         """
         node_names = []
-        mod = module or "unknown"
+        mod = module or (parsed.get("module") or "unknown").upper()
         sandbox.vectors.remove_by_metadata(source_file=filename)
 
         # Functions
@@ -1332,6 +1399,7 @@ class SandboxAdapter:
             text = f"Function: {name}\nReturn: {fn.get('return_type', 'void')}\nBrief: {brief}"
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
+                source_file=filename,
                 metadata={"source_file": filename, "node_type": "Function",
                           "node_id": node_id, "module": mod},
             )])
@@ -1367,6 +1435,7 @@ class SandboxAdapter:
             text = f"Struct: {sname}\nBrief: {s.get('brief', '')}\nMembers: {members_text}"
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
+                source_file=filename,
                 metadata={"source_file": filename, "node_type": "Struct",
                           "node_id": node_id, "module": mod},
             )])
@@ -1417,6 +1486,7 @@ class SandboxAdapter:
             text = f"Enum: {ename}\nBrief: {e.get('brief', '')}\nValues: {vals_text}"
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
+                source_file=filename,
                 metadata={"source_file": filename, "node_type": "Enum",
                           "node_id": node_id, "module": mod},
             )])
@@ -1463,83 +1533,173 @@ class SandboxAdapter:
             }
             self._add_node_with_shadow(sandbox, node_type, node_id, props)
             node_names.append(tname)
+            # Semantic chunk — enables search_database to find typedefs
+            text = f"Typedef: {tname}\nUnderlying type: {td.get('type', '')}\nBrief: {td.get('brief', '')}"
+            sandbox.vectors.add_chunks([Chunk(
+                text=text,
+                source_file=filename,
+                metadata={"source_file": filename, "node_type": "Typedef",
+                          "node_id": node_id, "module": mod},
+            )])
 
-        # Macros (not in prod KG as separate nodes, but useful for vector search)
+        # Macros — add KG node (for Cypher MATCH) + vector chunk (for search_database)
         for macro in parsed.get("macros", []):
             if not isinstance(macro, dict):
                 continue
             mname = macro.get("name", "")
             if not mname:
                 continue
+            node_type = "Macro"
+            node_id = EphemeralGraph._canonical_id(node_type, {"name": mname, "module": mod})
+            props = {
+                "name": mname,
+                "id": f"MACRO_{mname}",
+                "value": macro.get("value", ""),
+                "description": macro.get("description", ""),
+                "source": "SWA_Macros",
+                "module": mod,
+                "source_file": filename,
+            }
+            self._add_node_with_shadow(sandbox, node_type, node_id, props)
+            node_names.append(mname)
             text = f"Macro: {mname}\nValue: {macro.get('value', '')}\nDescription: {macro.get('description', '')}"
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
+                source_file=filename,
                 metadata={"source_file": filename, "node_type": "Macro",
-                          "node_id": f"MACRO:{mname}:{mod.upper()}", "module": mod},
+                          "node_id": node_id, "module": mod},
             )])
 
         return node_names
 
     def _ingest_sfr(self, sandbox, parsed, filename, module) -> List[str]:
-        """Ingest SFR parser output → Register + BitField nodes + HAS_BITFIELD edges.
+        """Ingest SFR parser output → HardwareRegister + RegisterField nodes + HAS_FIELD edges.
 
-        Matches production node types from illd_kg_builder.py.
+        Matches production node types from illd_kg_builder.py (v3.0 collapsed labels).
+        Production IDs: HWREG_{MODULE}_{reg_name}, REGFIELD_{MODULE}_{reg_name}_{field_name}
         """
         node_names = []
-        mod = module or "unknown"
+        # Canonicalize submodule regdef tokens (e.g. PMSCORE/PMSMON → PMS).
+        mod = self._canonicalize_illd_module(module or parsed.get("module"), filename)
         registers_dict = parsed.get("registers", {})
         sandbox.vectors.remove_by_metadata(source_file=filename)
+
+        hw_reg_count = 0
+        reg_field_count = 0
 
         for reg_name, bitfields in registers_dict.items():
             if not isinstance(bitfields, list):
                 continue
 
-            node_type = "Register"
+            # HardwareRegister node — matches prod ID convention
+            node_type = "HardwareRegister"
+            reg_id = f"HWREG_{mod}_{reg_name}"
             node_id = EphemeralGraph._canonical_id(
                 node_type, {"name": reg_name, "module": mod})
             props = {
-                "register_name": reg_name,
+                "id": reg_id,
                 "name": reg_name,
                 "module": mod,
+                "label": reg_name,
+                "sfr_source_file": filename,
                 "source_file": filename,
             }
             self._add_node_with_shadow(sandbox, node_type, node_id, props)
             node_names.append(reg_name)
+            hw_reg_count += 1
 
             # Semantic chunk for the register
             bf_text = ", ".join(bf.get("name", "") for bf in bitfields if isinstance(bf, dict))
-            text = f"Register: {reg_name}\nBitfields: {bf_text}"
+            text = f"HardwareRegister: {reg_name}\nModule: {mod}\nFields: {bf_text}"
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
-                metadata={"source_file": filename, "node_type": "Register",
+                source_file=filename,
+                metadata={"source_file": filename, "node_type": "HardwareRegister",
                           "node_id": node_id, "module": mod},
             )])
 
-            # Bitfield nodes
+            # RegisterField nodes + HAS_FIELD edges
             for bf in bitfields:
                 if not isinstance(bf, dict):
                     continue
                 bfname = bf.get("name", "")
                 if not bfname:
                     continue
-                bf_node_type = "BitField"
-                bfid = f"BITFIELD_{reg_name}_{bfname}"
-                bf_node_id = EphemeralGraph._canonical_id(
-                    bf_node_type, {"name": bfid, "module": mod})
-                bf_props = {
+                field_node_type = "RegisterField"
+                field_id = f"REGFIELD_{mod}_{reg_name}_{bfname}"
+                field_node_id = EphemeralGraph._canonical_id(
+                    field_node_type, {"name": field_id, "module": mod})
+                field_props = {
                     "name": bfname,
-                    "id": bfid,
+                    "id": field_id,
+                    "register": reg_name,
+                    "module": mod,
                     "bit_range": bf.get("bit_range", ""),
+                    "bits": bf.get("bit_range", "") or bf.get("bits", ""),
                     "width": bf.get("width", ""),
                     "description": bf.get("description", ""),
-                    "module": mod,
+                    "sfr_source_file": filename,
                     "source_file": filename,
+                    "label": bf.get("label", "") or f"{bfname} {bf.get('bit_range', '')}",
                 }
-                self._add_node_with_shadow(sandbox, bf_node_type, bf_node_id, bf_props)
+                if bf.get("access_type"):
+                    field_props["access_type"] = bf["access_type"]
+                self._add_node_with_shadow(sandbox, field_node_type, field_node_id, field_props)
                 sandbox.graph.add_relationship(
-                    node_id, bf_node_id, "HAS_BITFIELD", {"_origin": "sandbox"})
+                    node_id, field_node_id, "HAS_FIELD", {"_origin": "sandbox"})
+                reg_field_count += 1
 
+        logger.info(
+            "[SandboxAdapter] SFR ingestion: %d HardwareRegisters, %d RegisterFields, "
+            "file=%s, module=%s",
+            hw_reg_count, reg_field_count, filename, mod,
+        )
         return node_names
+
+    @staticmethod
+    def _canonicalize_illd_module(module: Optional[str], filename: Optional[str] = None) -> str:
+        """Resolve regdef submodule tokens to canonical iLLD module names."""
+        global _ILLD_MODULE_ALIAS_CACHE
+        if _ILLD_MODULE_ALIAS_CACHE is None:
+            aliases: Dict[str, str] = {
+                "LPBTM": "BTM",
+                "LPCAN": "CAN",
+            }
+            try:
+                cfg_path = Path(__file__).resolve().parents[2] / "HybridRAG" / "config" / "illd_module_map.yaml"
+                raw = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+                modules = raw.get("modules", raw) if isinstance(raw, dict) else {}
+                for module_name, info in modules.items():
+                    if not isinstance(info, dict):
+                        continue
+                    canonical = str(module_name).upper()
+                    aliases[canonical] = canonical
+                    for sfr_name in info.get("sfr") or []:
+                        if not isinstance(sfr_name, str):
+                            continue
+                        stem = Path(sfr_name).stem
+                        aliases[stem.lower()] = canonical
+                        match = re.search(r"Ifx(\w+)_regdef", stem, re.IGNORECASE)
+                        if match:
+                            aliases[match.group(1).upper()] = canonical
+            except Exception:
+                pass
+            _ILLD_MODULE_ALIAS_CACHE = aliases
+
+        aliases = _ILLD_MODULE_ALIAS_CACHE or {}
+        if module:
+            token = str(module).strip()
+            if token:
+                return aliases.get(token.upper(), token.upper())
+        if filename:
+            stem = Path(filename).stem
+            if stem.lower() in aliases:
+                return aliases[stem.lower()]
+            match = re.search(r"Ifx(\w+)_regdef", stem, re.IGNORECASE)
+            if match:
+                token = match.group(1).upper()
+                return aliases.get(token, token)
+        return "unknown"
 
     def _ingest_xlsx_requirements_illd(self, sandbox, parsed, filename, module) -> List[str]:
         """Ingest iLLD requirements from xlsx Jama export.
@@ -1573,6 +1733,7 @@ class SandboxAdapter:
             text = f"Requirement: {req_id}\nName: {req.get('name', '')}"
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
+                source_file=filename,
                 metadata={"source_file": filename, "node_type": "Requirement",
                           "node_id": node_id, "module": mod},
             )])
@@ -1618,6 +1779,7 @@ class SandboxAdapter:
             text = f"Requirement: {req_id}\nName: {req.get('name', '')}\nDescription: {desc[:300]}"
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
+                source_file=filename,
                 metadata={"source_file": filename, "node_type": "Requirement",
                           "node_id": node_id, "module": mod},
             )])
@@ -1631,6 +1793,32 @@ class SandboxAdapter:
     # of these types are cleared so the sandbox parser re-creates only
     # what actually exists in the developer's modified code.  Prod edges
     # for types NOT in this set (SRC_IMPLEMENTS_EA, etc.) are inherited.
+    def _remove_deleted_prod_nodes(self, sandbox: 'EphemeralSandbox',
+                                    filename: str) -> int:
+        """Remove prod nodes from *filename* that were not re-created by sandbox.
+
+        After ingesting a file, any node whose ``source_file`` matches
+        *filename* and whose ``_origin`` is still ``'production'`` was never
+        shadowed — meaning the developer removed it.  We drop it from the
+        graph so the sandbox reflects reality.
+
+        Vectors are already clean: every ``_ingest_*_illd`` method starts with
+        ``sandbox.vectors.remove_by_metadata(source_file=filename)`` and only
+        re-adds chunks for entities present in the new file.
+
+        Returns the number of nodes removed.
+        """
+        fname_base = Path(filename).name
+        to_delete = [
+            nid
+            for nid, data in list(sandbox.graph.get_all_nodes())
+            if data.get("_origin") == "production"
+            and Path(data.get("source_file", "")).name == fname_base
+        ]
+        for nid in to_delete:
+            sandbox.graph.remove_node(nid)
+        return len(to_delete)
+
     SANDBOX_DETECTABLE_REL_TYPES = {"SRC_CALLS"}
 
     # Extended set: when include_paths are provided, clang can also detect
@@ -1700,6 +1888,8 @@ class SandboxAdapter:
         ptype = parsed.get("type", "")
         if ptype in ("c_source", "c_header"):
             return parsed.get("content", "")
+        elif ptype == "pdf_md":
+            return parsed.get("raw_md", "")
         elif ptype == "pdf":
             return "\n".join(parsed.get("pages", []))
         elif ptype == "rst":
@@ -2066,9 +2256,9 @@ class HybridGraphService:
         Returns list of dicts, each with _origin and optional _patched/_injected flags.
         """
         if not self._driver:
-            # No Neo4j driver — fall back to sandbox-local
+            # No Neo4j driver — execute Cypher against sandbox NetworkX graph
             logger.warning("[HybridGraphService] No Neo4j driver for deep query — sandbox-only")
-            return self._sandbox_only_results()
+            return self._execute_cypher_on_graph(cypher, params)
 
         db = workspace_id if workspace_id in ("illd", "mcal") else "neo4j"
 
@@ -2077,9 +2267,7 @@ class HybridGraphService:
                 prod_results = session.run(cypher, params).data()
         except Exception as e:
             logger.warning("[HybridGraphService] Neo4j unavailable for deep query: %s", e)
-            return self._sandbox_only_results(
-                warning="Full traversal unavailable (Neo4j unreachable). "
-                        "Showing sandbox-local results only.")
+            return self._execute_cypher_on_graph(cypher, params)
 
         # Patch: replace any node that has a sandbox override
         patched = []
@@ -2104,7 +2292,16 @@ class HybridGraphService:
             if cid:
                 existing_ids.add(cid)
 
+        query_labels = set(re.findall(r'\([\w]*:([\w]+)\)', cypher or "", re.IGNORECASE))
+        query_module = (
+            (params or {}).get("module")
+            or (params or {}).get("mod")
+            or (params or {}).get("module_upper")
+        )
+
         for nid, data in self._sandbox.graph.get_nodes_by_origin("sandbox"):
+            if not self._sandbox_node_matches_query(data, query_labels, query_module):
+                continue
             if nid not in existing_ids:
                 injected = {k: v for k, v in data.items() if not k.startswith("_")}
                 injected["_injected"] = True
@@ -2113,6 +2310,25 @@ class HybridGraphService:
                 patched.append(injected)
 
         return patched
+
+    @staticmethod
+    def _sandbox_node_matches_query(data: Dict[str, Any],
+                                    query_labels: set,
+                                    query_module: Optional[str]) -> bool:
+        """Best-effort guard so sandbox injection respects basic Cypher shape.
+
+        Arbitrary Cypher cannot be perfectly re-evaluated in Python, but we can
+        safely require at least a label or module match before injecting
+        sandbox-only nodes. This prevents unrelated nodes from appearing in
+        execute_cypher results.
+        """
+        node_type = data.get("_node_type", "")
+        node_module = str(data.get("module", ""))
+        if query_labels and node_type not in query_labels:
+            return False
+        if query_module and node_module.upper() != str(query_module).upper():
+            return False
+        return bool(query_labels or query_module)
 
     def _sandbox_only_results(self, warning: str = None) -> List[Dict]:
         """Return sandbox nodes as fallback when Neo4j is unavailable."""
@@ -2125,6 +2341,521 @@ class HybridGraphService:
         if warning:
             results.insert(0, {"_warning": warning})
         return results
+
+    # ── Sandbox-local Cypher executor ─────────────────────────────────────
+
+    def _execute_cypher_on_graph(self, cypher: str, params: Dict) -> List[Dict]:
+        """Execute a simplified Cypher MATCH against the in-memory NetworkX graph.
+
+        Supported patterns (DA fetchScopedContext / TestgenPipeline):
+          • MATCH (n:Label) [WHERE …] RETURN n.prop
+          • MATCH (a:L1)-[:REL]->(b:L2) [WHERE …] RETURN a.prop, b.prop
+          • MATCH (a:L1)-[:REL]->(b:L2) RETURN a.prop, collect(b.prop) AS alias
+          • MATCH (a:L1)-[:REL]->(b:L2) RETURN a.prop, collect({k: b.p}) AS alias
+          • MATCH (a:L1)-[:REL]->(b) RETURN …, collect(CASE WHEN b.p IS NOT NULL
+                                                        THEN {k: b.p} ELSE null END)
+          • MATCH (a:L) OPTIONAL MATCH (a)-[:REL]->(b:L2) RETURN a.prop,
+                                                            collect(b.prop) AS alias
+          • MATCH (a:L1)-[:REL*min..max]->(b:L2) RETURN a.prop, b.prop
+          • WHERE var.prop IN $list / [val1, val2]
+        Unsupported syntax is silently skipped (returns []).
+        """
+        import re as _re
+        if not cypher:
+            return []
+
+        # 1. Param substitution — list-aware
+        for k, v in (params or {}).items():
+            if isinstance(v, list):
+                replacement = '[' + ', '.join(
+                    f'"{x}"' if isinstance(x, str) else str(x) for x in v
+                ) + ']'
+            else:
+                replacement = f'"{v}"' if isinstance(v, str) else str(v)
+            cypher = _re.sub(rf'\${k}\b', replacement, cypher)
+
+        # 2. LIMIT
+        limit = 5000
+        lm = _re.search(r'\bLIMIT\s+(\d+)', cypher, _re.IGNORECASE)
+        if lm:
+            limit = int(lm.group(1))
+
+        # 3. RETURN clause (strip optional DISTINCT keyword)
+        rm = _re.search(r'\bRETURN\b(.*?)(?:\bORDER\b|\bLIMIT\b|\bSKIP\b|$)',
+                        cypher, _re.IGNORECASE | _re.DOTALL)
+        if not rm:
+            return []
+        return_clause = rm.group(1).strip()
+        is_distinct = False
+        if _re.match(r'DISTINCT\b', return_clause, _re.IGNORECASE):
+            is_distinct = True
+            return_clause = _re.sub(r'^DISTINCT\s+', '', return_clause, flags=_re.IGNORECASE)
+        has_collect = bool(_re.search(r'\bcollect\s*\(', return_clause, _re.IGNORECASE))
+
+        # 4. WHERE clause (before RETURN / OPTIONAL MATCH)
+        wm = _re.search(r'\bWHERE\b(.*?)(?:\bRETURN\b|\bWITH\b|\bOPTIONAL\b)',
+                        cypher, _re.IGNORECASE | _re.DOTALL)
+        where_clause = wm.group(1).strip() if wm else ""
+
+        # Pre-compute return_items once (respects nested parens + AS aliases)
+        return_items = self._split_return_items(return_clause)
+
+        # 5. Variable-length path: (a:L1)-[:REL*min..max]->(b:L2)
+        vl_m = _re.search(
+            r'\(\s*(\w+)(?::(\w+))?\s*\)\s*-\s*\[:(\w+)\*(\d+)\.\.(\d+)\]\s*->\s*\(\s*(\w+)(?::(\w+))?\s*\)',
+            cypher, _re.IGNORECASE,
+        )
+        if vl_m:
+            return self._traverse_variable_length_rel(
+                src_var=vl_m.group(1), src_label=vl_m.group(2),
+                rel_type=vl_m.group(3),
+                min_depth=int(vl_m.group(4)), max_depth=int(vl_m.group(5)),
+                tgt_var=vl_m.group(6), tgt_label=vl_m.group(7),
+                return_items=return_items, where_clause=where_clause, limit=limit,
+            )
+
+        # 6. OPTIONAL MATCH
+        if _re.search(r'\bOPTIONAL\s+MATCH\b', cypher, _re.IGNORECASE):
+            return self._execute_optional_match(cypher, return_clause, where_clause, limit)
+
+        # 7. Relationship pattern: (a:L1)-[:REL]->(b:L2) or (a:L1)-[:REL]->(b)
+        rel_m = _re.search(
+            r'\(\s*(\w+)(?::(\w+))?\s*\)\s*-\s*\[:(\w+)\]\s*->\s*\(\s*(\w+)(?::(\w+))?\s*\)',
+            cypher, _re.IGNORECASE,
+        )
+        if rel_m:
+            src_var, src_label = rel_m.group(1), rel_m.group(2)
+            rel_type = rel_m.group(3)
+            tgt_var, tgt_label = rel_m.group(4), rel_m.group(5)
+            if has_collect:
+                rows = self._traverse_rel_grouped(
+                    src_var, src_label, rel_type, tgt_var, tgt_label,
+                    return_clause, where_clause, limit,
+                )
+            else:
+                rows = self._traverse_rel(
+                    src_var, src_label, rel_type, tgt_var, tgt_label,
+                    return_items, where_clause, limit,
+                )
+            if is_distinct:
+                rows = self._dedup_rows(rows)
+            return rows
+
+        # 8. Single-node pattern: (n:Label) or (n)
+        node_m = _re.search(r'\(\s*(\w+)(?::(\w+))?\s*\)', cypher, _re.IGNORECASE)
+        if node_m:
+            rows = self._match_single_nodes(
+                node_var=node_m.group(1), node_label=node_m.group(2),
+                return_items=return_items, where_clause=where_clause, limit=limit,
+            )
+            if is_distinct:
+                rows = self._dedup_rows(rows)
+            return rows
+
+        return []
+
+    @staticmethod
+    def _dedup_rows(rows: List[Dict]) -> List[Dict]:
+        """Deduplicate rows for RETURN DISTINCT, preserving order."""
+        seen: set = set()
+        out: List[Dict] = []
+        for row in rows:
+            key = tuple(sorted((k, str(v)) for k, v in row.items()))
+            if key not in seen:
+                seen.add(key)
+                out.append(row)
+        return out
+
+    def _traverse_rel(self, src_var: str, src_label: Optional[str],
+                      rel_type: str,
+                      tgt_var: str, tgt_label: Optional[str],
+                      return_items: List[tuple], where_clause: str,
+                      limit: int) -> List[Dict]:
+        """Walk NetworkX edges matching (src_label)-[:rel_type]->(tgt_label)."""
+        results: List[Dict] = []
+        g = self._sandbox.graph._graph
+        for src_id, tgt_id, edge_data in g.edges(data=True):
+            if edge_data.get("_rel_type") != rel_type:
+                continue
+            src_data = dict(g.nodes.get(src_id, {}))
+            tgt_data = dict(g.nodes.get(tgt_id, {}))
+            if src_label and src_data.get("_node_type") != src_label:
+                continue
+            if tgt_label and tgt_data.get("_node_type") != tgt_label:
+                continue
+            var_map = {src_var: src_data, tgt_var: tgt_data}
+            if where_clause and not self._eval_where(where_clause, var_map):
+                continue
+            results.append(self._build_row(return_items, var_map))
+            if len(results) >= limit:
+                break
+        return results
+
+    def _traverse_rel_grouped(self, src_var: str, src_label: Optional[str],
+                               rel_type: str,
+                               tgt_var: str, tgt_label: Optional[str],
+                               return_clause: str, where_clause: str,
+                               limit: int) -> List[Dict]:
+        """Walk edges and apply collect() grouping from RETURN clause."""
+        import re as _re
+        g = self._sandbox.graph._graph
+        # Build ordered map: src_id → (src_data, [tgt_data, ...])
+        groups: Dict[str, tuple] = {}
+        order: List[str] = []
+        for src_id, tgt_id, edge_data in g.edges(data=True):
+            if edge_data.get("_rel_type") != rel_type:
+                continue
+            src_data = dict(g.nodes.get(src_id, {}))
+            tgt_data = dict(g.nodes.get(tgt_id, {}))
+            if src_label and src_data.get("_node_type") != src_label:
+                continue
+            if tgt_label and tgt_data.get("_node_type") != tgt_label:
+                continue
+            if where_clause and not self._eval_where(
+                    where_clause, {src_var: src_data, tgt_var: tgt_data}):
+                continue
+            if src_id not in groups:
+                groups[src_id] = (src_data, [])
+                order.append(src_id)
+            groups[src_id][1].append(tgt_data)
+
+        return_items = self._split_return_items(return_clause)
+        results: List[Dict] = []
+        for src_id in order:
+            src_data, tgt_list = groups[src_id]
+            row: Dict = {}
+            for expr, alias in return_items:
+                collect_m = _re.match(r'collect\s*\((.+)\)$', expr.strip(),
+                                      _re.IGNORECASE | _re.DOTALL)
+                if collect_m:
+                    collected = []
+                    for tgt_data in tgt_list:
+                        val = self._eval_expr(
+                            collect_m.group(1).strip(),
+                            {src_var: src_data, tgt_var: tgt_data},
+                        )
+                        if val is not None:
+                            collected.append(val)
+                    row[alias] = collected
+                else:
+                    row[alias] = self._eval_expr(expr, {src_var: src_data})
+            results.append(row)
+            if len(results) >= limit:
+                break
+        return results
+
+    def _execute_optional_match(self, cypher: str, return_clause: str,
+                                 where_clause: str, limit: int) -> List[Dict]:
+        """Handle OPTIONAL MATCH … collect() pattern."""
+        import re as _re
+        primary_m = _re.search(
+            r'^\s*MATCH\s+\(\s*(\w+)(?::(\w+))?\s*\)', cypher,
+            _re.IGNORECASE | _re.DOTALL,
+        )
+        opt_m = _re.search(
+            r'\bOPTIONAL\s+MATCH\s+\(\s*(\w+)(?::(\w+))?\s*\)\s*-\s*\[:(\w+)\]\s*->\s*\(\s*(\w+)(?::(\w+))?\s*\)',
+            cypher, _re.IGNORECASE,
+        )
+        if not primary_m:
+            return []
+        anchor_var = primary_m.group(1)
+        anchor_label = primary_m.group(2)
+        return_items = self._split_return_items(return_clause)
+        g = self._sandbox.graph._graph
+        results: List[Dict] = []
+        for nid, data in self._sandbox.graph.get_all_nodes():
+            if anchor_label and data.get("_node_type") != anchor_label:
+                continue
+            anchor_data = dict(data)
+            if where_clause and not self._eval_where(where_clause, {anchor_var: anchor_data}):
+                continue
+            # Collect optional targets
+            opt_tgt_list: List[Dict] = []
+            if opt_m:
+                opt_rel_type = opt_m.group(3)
+                opt_tgt_var = opt_m.group(4)
+                opt_tgt_label = opt_m.group(5)
+                for _, tgt_id, edge_data in g.out_edges(nid, data=True):
+                    if edge_data.get("_rel_type") != opt_rel_type:
+                        continue
+                    tgt_data = dict(g.nodes.get(tgt_id, {}))
+                    if opt_tgt_label and tgt_data.get("_node_type") != opt_tgt_label:
+                        continue
+                    opt_tgt_list.append(tgt_data)
+            row: Dict = {}
+            for expr, alias in return_items:
+                collect_m = _re.match(r'collect\s*\((.+)\)$', expr.strip(),
+                                      _re.IGNORECASE | _re.DOTALL)
+                if collect_m and opt_m:
+                    opt_tgt_var_name = opt_m.group(4)
+                    collected = []
+                    for tgt_data in opt_tgt_list:
+                        val = self._eval_expr(
+                            collect_m.group(1).strip(),
+                            {anchor_var: anchor_data, opt_tgt_var_name: tgt_data},
+                        )
+                        if val is not None:
+                            collected.append(val)
+                    row[alias] = collected
+                else:
+                    row[alias] = self._eval_expr(expr, {anchor_var: anchor_data})
+            results.append(row)
+            if len(results) >= limit:
+                break
+        return results
+
+    def _traverse_variable_length_rel(self, src_var: str, src_label: Optional[str],
+                                       rel_type: str, min_depth: int, max_depth: int,
+                                       tgt_var: str, tgt_label: Optional[str],
+                                       return_items: List[tuple], where_clause: str,
+                                       limit: int) -> List[Dict]:
+        """BFS for variable-length paths (a)-[:REL*min..max]->(b)."""
+        from collections import deque
+        results: List[Dict] = []
+        seen_pairs: set = set()
+        g = self._sandbox.graph._graph
+        for start_id, start_props in g.nodes(data=True):
+            start_data = dict(start_props)
+            if src_label and start_data.get("_node_type") != src_label:
+                continue
+            queue: deque = deque([(start_id, 1)])
+            visited: set = {start_id}
+            while queue:
+                current_id, depth = queue.popleft()
+                if depth > max_depth:
+                    continue
+                for _, next_id, edge_data in g.out_edges(current_id, data=True):
+                    if edge_data.get("_rel_type") != rel_type:
+                        continue
+                    next_data = dict(g.nodes.get(next_id, {}))
+                    if depth >= min_depth and next_id != start_id:
+                        if (not tgt_label or next_data.get("_node_type") == tgt_label):
+                            pair = (start_id, next_id)
+                            if pair not in seen_pairs:
+                                seen_pairs.add(pair)
+                                var_map = {src_var: start_data, tgt_var: next_data}
+                                if not where_clause or self._eval_where(where_clause, var_map):
+                                    results.append(self._build_row(return_items, var_map))
+                                    if len(results) >= limit:
+                                        return results
+                    if depth < max_depth and next_id not in visited:
+                        visited.add(next_id)
+                        queue.append((next_id, depth + 1))
+        return results
+
+    def _match_single_nodes(self, node_var: str, node_label: Optional[str],
+                            return_items: List[tuple], where_clause: str,
+                            limit: int) -> List[Dict]:
+        """Scan graph nodes matching (node_var:node_label)."""
+        results: List[Dict] = []
+        for _nid, data in self._sandbox.graph.get_all_nodes():
+            if node_label and data.get("_node_type") != node_label:
+                continue
+            var_map = {node_var: dict(data)}
+            if where_clause and not self._eval_where(where_clause, var_map):
+                continue
+            results.append(self._build_row(return_items, var_map))
+            if len(results) >= limit:
+                break
+        return results
+
+    @staticmethod
+    def _build_row(return_items: List[tuple], var_map: Dict) -> Dict:
+        """Build a result row from [(expr, alias)] using _eval_expr for full expression support."""
+        row: Dict = {}
+        for expr, alias in return_items:
+            row[alias] = HybridGraphService._eval_expr(expr, var_map)
+        return row
+
+    @staticmethod
+    def _split_return_items(return_clause: str) -> List[tuple]:
+        """Split RETURN clause respecting nested parentheses → [(expr, alias), …]."""
+        import re as _re
+        depth = 0
+        current: List[str] = []
+        items: List[str] = []
+        for ch in return_clause:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            if ch == ',' and depth == 0:
+                items.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            items.append(''.join(current).strip())
+        result: List[tuple] = []
+        for item in items:
+            item = item.strip()
+            alias_m = _re.match(r'(.+?)\s+AS\s+(\w+)\s*$', item, _re.IGNORECASE)
+            if alias_m:
+                result.append((alias_m.group(1).strip(), alias_m.group(2).strip()))
+            else:
+                result.append((item, item))
+        return result
+
+    @staticmethod
+    def _eval_expr(expr: str, var_map: Dict) -> Any:
+        """Evaluate a single RETURN expression against a variable→data map.
+
+        Handles:
+          • var.prop
+          • {key: var.prop, key2: var.prop2}
+          • CASE WHEN var.prop IS NOT NULL THEN <expr> ELSE null END
+          • coalesce(var.prop, var2.prop2, 'default')
+        """
+        import re as _re
+        expr = expr.strip()
+
+        # coalesce(arg1, arg2, ...) — return first non-None/non-empty value
+        coalesce_m = _re.match(r'^coalesce\s*\((.+)\)\s*$', expr, _re.IGNORECASE | _re.DOTALL)
+        if coalesce_m:
+            # Split args on commas at depth 0
+            depth = 0
+            current: list = []
+            args: list = []
+            for ch in coalesce_m.group(1):
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                if ch == ',' and depth == 0:
+                    args.append(''.join(current).strip())
+                    current = []
+                else:
+                    current.append(ch)
+            if current:
+                args.append(''.join(current).strip())
+            for arg in args:
+                arg = arg.strip()
+                # String literal: 'value' or "value"
+                lit_m = _re.match(r'^["\'](.*)["\']\ *$', arg)
+                if lit_m:
+                    return lit_m.group(1)  # return literal (may be empty string)
+                val = HybridGraphService._eval_expr(arg, var_map)
+                if val is not None and val != '':
+                    return val
+            # All args exhausted — return the last literal fallback or empty string
+            for arg in reversed(args):
+                lit_m = _re.match(r'^["\'](.*)["\']\ *$', arg.strip())
+                if lit_m:
+                    return lit_m.group(1)
+            return ''
+
+        # CASE WHEN var.prop IS NOT NULL THEN <then_expr> ELSE null END
+        case_m = _re.match(
+            r'CASE\s+WHEN\s+(\w+)\.(\w+)\s+IS\s+NOT\s+NULL\s+THEN\s+(.+?)\s+ELSE\s+null\s+END\s*$',
+            expr, _re.IGNORECASE | _re.DOTALL,
+        )
+        if case_m:
+            chk_var, chk_prop = case_m.group(1), case_m.group(2)
+            then_expr = case_m.group(3).strip()
+            if var_map.get(chk_var, {}).get(chk_prop) is not None:
+                return HybridGraphService._eval_expr(then_expr, var_map)
+            return None
+
+        # Map literal: {key: var.prop, key2: var.prop2}
+        map_m = _re.match(r'^\{(.+)\}$', expr, _re.DOTALL)
+        if map_m:
+            result: Dict = {}
+            for pair in map_m.group(1).split(','):
+                pair = pair.strip()
+                km = _re.match(r'(\w+)\s*:\s*(\w+\.\w+|\w+)', pair)
+                if km:
+                    key, val_expr = km.group(1), km.group(2)
+                    if '.' in val_expr:
+                        v, p = val_expr.split('.', 1)
+                        result[key] = var_map.get(v.strip(), {}).get(p.strip())
+                    else:
+                        result[key] = val_expr
+            return result if result else None
+
+        # var.prop
+        dot_m = _re.match(r'^(\w+)\.(\w+)$', expr)
+        if dot_m:
+            return var_map.get(dot_m.group(1), {}).get(dot_m.group(2))
+
+        # whole variable
+        if _re.match(r'^\w+$', expr):
+            return var_map.get(expr)
+        return None
+
+    @staticmethod
+    def _extract_row(return_vars: List[str], var_map: Dict) -> Dict:
+        """Build a result row from the RETURN variable list and node data map."""
+        row: Dict = {}
+        for rv in return_vars:
+            rv = rv.strip()
+            if '.' in rv:
+                var, prop = rv.split('.', 1)
+                row[rv] = var_map.get(var.strip(), {}).get(prop.strip())
+            else:
+                row[rv] = var_map.get(rv)
+        return row
+
+    @staticmethod
+    def _eval_where(where_clause: str, var_map: Dict) -> bool:
+        """Evaluate a simple WHERE clause against a variable→data map.
+
+        Supports: =, IN [...], IS NOT NULL, IS NULL, AND.
+        Unsupported predicates pass through (permissive — avoids false negatives).
+        """
+        import re as _re
+        wc = where_clause.strip().lower()
+        if wc == 'true':
+            return True
+        if wc == 'false':
+            return False
+
+        # Top-level OR: return True if any OR branch passes
+        or_branches = _re.split(r'\bOR\b', where_clause, flags=_re.IGNORECASE)
+        if len(or_branches) > 1:
+            return any(
+                HybridGraphService._eval_where(branch.strip(), var_map)
+                for branch in or_branches
+            )
+
+        for clause in _re.split(r'\bAND\b', where_clause, flags=_re.IGNORECASE):
+            clause = clause.strip()
+
+            # var.prop IN [v1, v2, ...]
+            in_m = _re.match(r'(\w+)\.(\w+)\s+IN\s+\[([^\]]*)\]', clause, _re.IGNORECASE)
+            if in_m:
+                var, prop, vals_str = in_m.group(1), in_m.group(2), in_m.group(3)
+                values = [v.strip().strip('"\'') for v in vals_str.split(',') if v.strip()]
+                actual = str(var_map.get(var, {}).get(prop, ""))
+                if actual not in values:
+                    return False
+                continue
+
+            # var.prop IS NOT NULL
+            inn_m = _re.match(r'(\w+)\.(\w+)\s+IS\s+NOT\s+NULL', clause, _re.IGNORECASE)
+            if inn_m:
+                if var_map.get(inn_m.group(1), {}).get(inn_m.group(2)) is None:
+                    return False
+                continue
+
+            # var.prop IS NULL
+            inull_m = _re.match(r'(\w+)\.(\w+)\s+IS\s+NULL', clause, _re.IGNORECASE)
+            if inull_m:
+                if var_map.get(inull_m.group(1), {}).get(inull_m.group(2)) is not None:
+                    return False
+                continue
+
+            # var.prop = "value" / 'value' / number
+            eq_m = _re.match(
+                r'(\w+)\.(\w+)\s*(?:=|=~)\s*["\']?([^"\']+?)["\']?\s*$', clause
+            )
+            if eq_m:
+                var, prop, expected = eq_m.group(1), eq_m.group(2), eq_m.group(3).strip()
+                actual = str(var_map.get(var, {}).get(prop, ""))
+                if actual.upper() != expected.upper():
+                    return False
+                continue
+            # Unsupported predicate — pass through
+        return True
 
     def _canonical_id_from_record(self, record: Dict) -> Optional[str]:
         """Derive canonical node ID from a Neo4j result record."""

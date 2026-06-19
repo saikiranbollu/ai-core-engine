@@ -7,6 +7,20 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# ── Alerting rules (W-12: silent-failure detection, Sprint 27) ──
+# Mount ./monitoring/prometheus/ into the Prometheus container so the rule
+# files land at /etc/prometheus/rules/
+# (e.g. ./monitoring/prometheus:/etc/prometheus/rules:ro).
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+# Optional: route firing alerts to Alertmanager. Uncomment and set the
+# target once an Alertmanager instance is available.
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
 scrape_configs:
   # ── MCP Server metrics ──
   - job_name: "aice-mcp-server"

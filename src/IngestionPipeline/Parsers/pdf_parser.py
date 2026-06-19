@@ -21,7 +21,7 @@ Features:
 
 Usage::
 
-    from IngestionPipeline.Parsers import pdf_parser
+    from IngestionPipeline.parsers import pdf_parser
 
     # Minimal — uses token_manager for automatic auth
     pages = pdf_parser.parse("report.pdf")
@@ -41,7 +41,9 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -243,6 +245,88 @@ def _process_batch(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing — deterministic fixes applied after LLM output
+# ---------------------------------------------------------------------------
+
+_SECTION_HEADING_RE = re.compile(
+    r"^(#{1,6})\s+(\d+(?:\.\d+)*)\s+(.*)$", re.MULTILINE
+)
+
+_PAGE_MARKER_RE = re.compile(
+    r"^## Pages?\s+\d+(?:\s*[–\-]\s*\d+)?\s*\n?", re.MULTILINE
+)
+
+
+def _fix_numbered_heading_levels(text: str) -> str:
+    """Fix heading levels based on section numbers (deterministic).
+
+    The LLM sometimes assigns wrong heading depths.  This function
+    recomputes the correct Markdown heading level from the dot-separated
+    section number:  ``1`` → ``#``, ``1.1`` → ``##``, ``1.1.1`` → ``###``.
+    """
+    def _replace(m: re.Match) -> str:
+        number = m.group(2)
+        title = m.group(3)
+        level = max(1, min(6, len(number.split("."))))
+        return f"{'#' * level} {number} {title}"
+
+    return _SECTION_HEADING_RE.sub(_replace, text)
+
+
+def _remove_repeated_page_titles(text: str) -> str:
+    """Remove chapter-level headings that repeat across pages (PDF headers).
+
+    Running headers like ``# 1 Local Interconnect Network (LIN)`` appear on
+    every page in the PDF.  The LLM is instructed to remove them but often
+    fails.  This function detects any ``# N Title`` heading that appears
+    more than twice and keeps only the *first* occurrence.
+    """
+    # Match top-level headings: # N Title (single number, no dots)
+    chapter_re = re.compile(r"^(# \d+\s+.+)$", re.MULTILINE)
+    matches = chapter_re.findall(text)
+    if not matches:
+        return text
+
+    counts = Counter(matches)
+    duplicates = {h for h, c in counts.items() if c > 2}
+    if not duplicates:
+        return text
+
+    seen: set[str] = set()
+
+    def _dedup(m: re.Match) -> str:
+        heading = m.group(1)
+        if heading in duplicates:
+            if heading in seen:
+                return ""  # remove duplicate
+            seen.add(heading)
+        return heading
+
+    # Remove the duplicate lines and collapse resulting extra blank lines
+    result = chapter_re.sub(_dedup, text)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result
+
+
+def postprocess_markdown(text: str) -> str:
+    """Apply all deterministic post-processing to joined LLM markdown output.
+
+    This should be called on the **full** joined markdown (after all batch
+    parts have been concatenated).  It performs:
+
+      1. Remove ``## Pages X–Y`` batch markers (artifacts of parallel processing)
+      2. Fix numbered heading levels (deterministic from section numbers)
+      3. Remove repeated page-title headings (PDF running headers)
+    """
+    text = _PAGE_MARKER_RE.sub("", text)
+    text = _fix_numbered_heading_levels(text)
+    text = _remove_repeated_page_titles(text)
+    # Clean up excessive blank lines introduced by removals
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -376,6 +460,7 @@ def parse(
     parts: list[str] = []
     for idx in range(len(batch_ranges)):
         pages, md = results_by_idx[idx]
+        md = _fix_numbered_heading_levels(md)
         parts.append(f"## Pages {pages[0]+1}\u2013{pages[-1]+1}\n\n{md}")
 
     # Clear checkpoint on success

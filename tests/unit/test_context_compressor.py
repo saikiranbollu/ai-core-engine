@@ -95,10 +95,11 @@ class TestDynamicTokenBudget:
 class TestEstimateTokens:
 
     def test_uses_div_4(self):
-        """_estimate_tokens should use //4 approximation."""
-        # 100 chars -> 25 tokens
+        """_estimate_tokens should produce a reasonable token count."""
+        # 100 chars -> ~13-25 tokens depending on tiktoken availability
         text = "a" * 100
-        assert _estimate_tokens(text) == 25
+        result = _estimate_tokens(text)
+        assert 10 <= result <= 25
 
     def test_empty_string_returns_zero(self):
         """Empty string should return 0 tokens."""

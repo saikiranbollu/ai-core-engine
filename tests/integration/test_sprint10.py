@@ -72,15 +72,15 @@ class TestMetricDefinitions:
                 f"Metric '{name}' does not use 'aice_' prefix"
 
     def test_metric_count(self):
-        """Should have exactly 11 metric definitions."""
+        """Should have 23 metric definitions (17 base + 6 per-DA productivity, F-P5-M01)."""
         metrics_path = Path(__file__).resolve().parents[2] / "src" / "Observability" / "metrics.py"
         content = metrics_path.read_text(encoding="utf-8")
 
         import re
         # Count Counter, Gauge, Histogram constructors with aice_ prefix
         metric_defs = re.findall(r'(?:Counter|Gauge|Histogram)\(\s*"aice_', content)
-        assert len(metric_defs) == 11, \
-            f"Expected 11 metric definitions, found {len(metric_defs)}"
+        assert len(metric_defs) == 23, \
+            f"Expected 23 metric definitions, found {len(metric_defs)}"
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -145,10 +145,10 @@ class TestAutoInstrumentation:
             "_ok() does not call _finish_tool"
 
     def test_err_calls_finish_tool(self):
-        """_err() should call _finish_tool('error')."""
+        """_err() should call _finish_tool('error', ...)."""
         server_path = Path(__file__).resolve().parents[2] / "mcp" / "core" / "mcp_server.py"
         content = server_path.read_text(encoding="utf-8")
-        assert '_finish_tool("error")' in content or "_finish_tool('error')" in content, \
+        assert '_finish_tool("error"' in content or "_finish_tool('error'" in content, \
             "_err() does not call _finish_tool"
 
     def test_tool_requests_total_incremented(self):

@@ -127,7 +127,6 @@ def _make_connector(transport: MockTransport) -> BitbucketConnector:
         ref="main",
         max_retries=1,
         backoff_factor=0.0,
-        verify_ssl=False,
     )
     conn._client = httpx.Client(
         base_url="http://bitbucket.test/rest/api/latest",

@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import httpx
 
 from ..config import get_max_workers
+from src._common.tls_config import enforce_tls_policy
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -195,6 +196,7 @@ class BitbucketConnector:
         timeout: Optional[float] = 30.0,
         verify_ssl: bool = True,
     ) -> None:
+        verify_ssl = enforce_tls_policy(verify_ssl)
         self._base_url = base_url.rstrip("/")
         self._project = project
         self._repo = repo

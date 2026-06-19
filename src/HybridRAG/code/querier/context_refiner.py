@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
+from src.HybridRAG.code.querier.context_builder import estimate_tokens
+
 logger = logging.getLogger(__name__)
 
 REFINER_ENABLED = os.getenv("CONTEXT_REFINER_ENABLED", "true").lower() == "true"
@@ -375,7 +377,7 @@ class ContextRefiner:
                 system=system_prompt, user=user_prompt,
                 max_tokens=min(300, remaining),
             )
-            tokens_used = len(response) // 4 if response else 0  # M09 fix
+            tokens_used = estimate_tokens(response) if response else 0
             elapsed = (time.monotonic() - start) * 1000
             parsed = self._parse_json(response)
 

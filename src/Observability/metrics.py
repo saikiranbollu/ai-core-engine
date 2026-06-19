@@ -42,7 +42,7 @@ if ENABLE_METRICS:
         TOOL_REQUESTS_TOTAL = Counter(
             "aice_tool_requests_total",
             "Total MCP tool invocations",
-            ["da_name", "tool", "status"],
+            ["da_name", "tier", "tool", "status"],
             registry=REGISTRY,
         )
 
@@ -174,7 +174,48 @@ if ENABLE_METRICS:
             buckets=(10, 30, 60, 120, 300, 600, 1200, 1800, 3600),
             registry=REGISTRY,
         )
-
+        # ── Per-DA productivity metrics (F-P5-M01, Pass 5 §4.2) ──────────
+        # Label `da_name` is used (not the plan's `da`) for consistency with the
+        # existing per-DA tool metrics and the `$da_name` Grafana variable.
+        DA_SESSION_DURATION = Histogram(
+            "aice_da_session_duration_seconds",
+            "DA working-session duration (session_start → session_end)",
+            ["da_name", "task_type"],
+            buckets=(1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600),
+            registry=REGISTRY,
+        )
+        DA_SESSION_OUTCOMES = Counter(
+            "aice_da_session_outcomes_total",
+            "Human-review outcomes per DA",
+            ["da_name", "task_type", "outcome"],  # outcome: APPROVE|REJECT|...
+            registry=REGISTRY,
+        )
+        DA_CONTEXT_TOKENS = Histogram(
+            "aice_da_context_assembly_tokens",
+            "Tokens assembled into context per DA",
+            ["da_name", "task_type"],
+            buckets=(256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
+            registry=REGISTRY,
+        )
+        DA_FIRST_RESULT_LATENCY = Histogram(
+            "aice_da_first_result_latency_seconds",
+            "Latency from session_start to first evaluate_confidence per DA",
+            ["da_name", "task_type"],
+            buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
+            registry=REGISTRY,
+        )
+        DA_PATTERN_HITS = Counter(
+            "aice_da_pattern_hits_total",
+            "Learned patterns surfaced (reused) per DA",
+            ["da_name", "task_type"],
+            registry=REGISTRY,
+        )
+        DA_LLM_TOKENS = Counter(
+            "aice_da_session_llm_tokens_total",
+            "LLM tokens consumed per DA",
+            ["da_name", "task_type", "llm_call_type"],
+            registry=REGISTRY,
+        )
         PROMETHEUS_AVAILABLE = True
         logger.info("[Metrics] prometheus_client loaded — metrics enabled")
 
@@ -219,6 +260,12 @@ if not ENABLE_METRICS or not globals().get("PROMETHEUS_AVAILABLE", False):
     CACHE_SIZE = _noop
     ERROR_TOTAL = _noop
     INGESTION_DURATION = _noop
+    DA_SESSION_DURATION = _noop
+    DA_SESSION_OUTCOMES = _noop
+    DA_CONTEXT_TOKENS = _noop
+    DA_FIRST_RESULT_LATENCY = _noop
+    DA_PATTERN_HITS = _noop
+    DA_LLM_TOKENS = _noop
 
 
 def make_metrics_app():

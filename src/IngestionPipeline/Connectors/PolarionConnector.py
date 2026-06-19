@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import ssl
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
@@ -38,6 +39,8 @@ from typing import Any, Dict, List, Optional, Union
 import httpx
 
 from ..config import get_max_workers
+from src._common.path_safety import allowed_roots_from_env, safe_path_under
+from src._common.tls_config import enforce_tls_policy
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +481,7 @@ class PolarionConnector:
         verify_ssl: bool = True,
         sync_state_dir: Optional[Union[str, Path]] = None,
     ) -> None:
+        verify_ssl = enforce_tls_policy(verify_ssl)
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._max_retries = max_retries
@@ -498,12 +502,19 @@ class PolarionConnector:
             },
         )
 
-        # Sync-state persistence
-        self._sync_state_dir: Optional[Path] = (
-            Path(sync_state_dir) if sync_state_dir else None
-        )
-        if self._sync_state_dir is not None:
+        # Sync-state persistence (F-CF-X04: contain under an allowed root before
+        # creating it; AICE_SYNC_STATE_ROOTS overrides the defaults).
+        if sync_state_dir is not None:
+            sync_roots = allowed_roots_from_env(
+                "AICE_SYNC_STATE_ROOTS",
+                ["/data/aice/sync_state", tempfile.gettempdir()],
+            )
+            self._sync_state_dir: Optional[Path] = safe_path_under(
+                sync_state_dir, sync_roots
+            )
             self._sync_state_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._sync_state_dir = None
 
         # In-memory sync state cache  {project_id: SyncState}
         self._sync_states: Dict[str, SyncState] = {}

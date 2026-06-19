@@ -19,7 +19,7 @@ so the same KG builder and RAG ingestion code can consume the results.
 
 Usage::
 
-    from IngestionPipeline.Parsers import hw_um_llm_parser
+    from IngestionPipeline.parsers import hw_um_llm_parser
 
     result = hw_um_llm_parser.parse("hw_um_gpt12_tc44x.md", max_workers=3)
 """

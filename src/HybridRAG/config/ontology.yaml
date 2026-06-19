@@ -10,7 +10,7 @@
 # The active profile is selected via `active_instance` in storage_config.yaml.
 # Both profiles can be loaded simultaneously for cross-profile queries.
 #
-# Version : 2.0.0
+# Version : 3.1.0
 # Domain  : Automotive Embedded Software
 # Compliance: ASPICE V-Model, ISO 26262, AUTOSAR Classic, MISRA C
 # =============================================================================
@@ -20,13 +20,15 @@
 # -----------------------------------------------------------------------------
 metadata:
   name: "Automotive Embedded Software Ontology"
-  version: "3.0.0"
+  version: "3.1.0"
   domain: "automotive_embedded_software"
   description: >
     Unified ontology covering MCAL productive-software requirements
     (Jama-based), EA-extracted architecture/design (QEAX), and ILLD
     reference-software artefacts (code, HW specs, tests).
     v3.0: SWA_*/SWUD_* node types replaced by EA_* (QEAX extraction).
+    v3.1: ILLD profile extended to 31 confirmed modules; LPBTM/LPCAN
+    alias resolution added; AccessMode sharing documented.
     Activate a profile via storage_config.yaml.
   compliance:
     - "ASPICE"
@@ -2952,6 +2954,970 @@ profiles:
             data_type: "string"
             required: true
             description: "Peripheral module name"
+      # ================================================================
+      #  HW UM (Hardware User Manual) — ReqIF-Extracted Node Types
+      # ================================================================
+      # Ingested from ReqIF (.reqifz) exports of the AURIX TC4xx Hardware
+      # User Manual.  Each device variant (TC44x … TC4Zx) produces its
+      # own set of nodes; the `device` property distinguishes them.
+      #
+      # Builder: src/HybridRAG/code/KG/reqif_kg_builder.py
+      # ================================================================
+
+      - name: "HW_Module"
+        jama_item_type: null
+        description: >
+          Top-level container representing one peripheral chapter from the
+          Hardware User Manual (e.g. ADC, DMA, GPT12).  One HW_Module node
+          is created per device variant per module.
+        extraction_strategy: "reqif_ingestion"
+        source_formats: ["reqifz"]
+        properties:
+          - name: "module_id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'HW_<device>_<module_name>'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Module name (e.g. ADC, DMA, GPT12)"
+          - name: "prefix"
+            data_type: "string"
+            required: false
+            description: "Module prefix from ReqIF (e.g. EVADC, EGTM)"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "AURIX device variant (e.g. TC44x, TC49x)"
+          - name: "um_version"
+            data_type: "string"
+            required: false
+            description: "User Manual version string"
+          - name: "reqif_obj_id"
+            data_type: "string"
+            required: false
+            description: "ReqIF object identifier for the chapter"
+          - name: "source"
+            data_type: "string"
+            required: false
+            description: "Always 'reqif'"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name for cross-referencing"
+
+      - name: "HW_Section"
+        jama_item_type: null
+        description: >
+          A section or subsection within a HW UM chapter.  Captures the
+          hierarchical document structure including headings and body text.
+          Sections form a linked list via NEXT_SECTION for reading order.
+        extraction_strategy: "reqif_ingestion"
+        source_formats: ["reqifz"]
+        properties:
+          - name: "section_id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '<module_id>_sec_<nnnn>'"
+          - name: "title"
+            data_type: "string"
+            required: true
+            description: "Section heading (max 500 chars)"
+          - name: "kind"
+            data_type: "string"
+            required: true
+            description: "Section type (e.g. heading, table, definition)"
+          - name: "text_content"
+            data_type: "text"
+            required: false
+            description: "Body text of the section (max 50000 chars)"
+          - name: "has_table"
+            data_type: "boolean"
+            required: false
+            description: "Whether the section contains a table"
+          - name: "reqif_obj_id"
+            data_type: "string"
+            required: false
+            description: "ReqIF object identifier"
+          - name: "order_index"
+            data_type: "integer"
+            required: true
+            description: "0-based position within the module"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "AURIX device variant"
+          - name: "um_version"
+            data_type: "string"
+            required: false
+            description: "User Manual version string"
+
+      - name: "HW_Register"
+        jama_item_type: null
+        description: >
+          A hardware register extracted from the HW UM register description
+          tables.  Linked to HW_Module via HAS_REGISTER and to the
+          describing HW_Section via DESCRIBES_REGISTER.
+        extraction_strategy: "reqif_ingestion"
+        source_formats: ["reqifz"]
+        properties:
+          - name: "register_id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '<module_id>_reg_<register_name>'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Register short name (e.g. CLC, GxRESULTy)"
+          - name: "long_name"
+            data_type: "string"
+            required: false
+            description: "Full descriptive register name"
+          - name: "offset"
+            data_type: "string"
+            required: false
+            description: "Memory offset from module base (e.g. '0028H')"
+          - name: "size"
+            data_type: "string"
+            required: false
+            description: "Register width (e.g. '32 bits')"
+          - name: "reset_value"
+            data_type: "string"
+            required: false
+            description: "Value after reset (e.g. '00000000H')"
+          - name: "access"
+            data_type: "string"
+            required: false
+            description: "Access type (e.g. RW, R, W)"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "AURIX device variant"
+          - name: "um_version"
+            data_type: "string"
+            required: false
+            description: "User Manual version string"
+
+      - name: "HW_BitField"
+        jama_item_type: null
+        description: >
+          A bitfield within a HW_Register, extracted from the register
+          description tables in the HW UM.  Captures field name, bit
+          positions, access type, and functional description.
+        extraction_strategy: "reqif_ingestion"
+        source_formats: ["reqifz"]
+        properties:
+          - name: "bitfield_id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '<register_id>_bf_<field_name>'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Bitfield name (e.g. DISR, DISS, EDIS)"
+          - name: "bits"
+            data_type: "string"
+            required: true
+            description: "Bit position or range (e.g. '0', '7:4', '31:16')"
+          - name: "field_type"
+            data_type: "string"
+            required: false
+            description: "Access type (e.g. rw, rh, r, w)"
+          - name: "reset_value"
+            data_type: "string"
+            required: false
+            description: "Field reset value"
+          - name: "description"
+            data_type: "text"
+            required: false
+            description: "Functional description of the bitfield (max 2000 chars)"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "AURIX device variant"
+          - name: "um_version"
+            data_type: "string"
+            required: false
+            description: "User Manual version string"
+
+      - name: "HW_Image"
+        jama_item_type: null
+        description: >
+          A diagram or image embedded in a HW UM section.  The description
+          property contains an LLM-generated textual description of the
+          image content (block diagrams, timing charts, signal flows, etc.).
+        extraction_strategy: "reqif_ingestion"
+        source_formats: ["reqifz"]
+        properties:
+          - name: "image_id"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '<section_id>_img_<nnn>'"
+          - name: "path"
+            data_type: "string"
+            required: true
+            description: "Original image file path within the ReqIF archive"
+          - name: "image_type"
+            data_type: "string"
+            required: false
+            description: "Image format (e.g. png, svg, emf)"
+          - name: "alt_text"
+            data_type: "string"
+            required: false
+            description: "Alt text or caption (max 500 chars)"
+          - name: "description"
+            data_type: "text"
+            required: false
+            description: "LLM-generated description of image content (max 8000 chars)"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "AURIX device variant"
+          - name: "um_version"
+            data_type: "string"
+            required: false
+            description: "User Manual version string"
+
+      # ================================================================
+      #  BVEC (Boundary Value & Equivalence Class) Analysis Nodes
+      # ================================================================
+
+      - name: "BVEC_InputParameter"
+        jama_item_type: null
+        description: >
+          A boundary value / equivalence class entry for an API input
+          parameter.  Each node represents one boundary value test point
+          (Upper Limit, Nominal, Lower Limit) within an equivalence class
+          for a specific API parameter on a specific device variant.
+        extraction_strategy: "bvec_excel_ingestion"
+        source_formats: ["xlsx"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '{module}_{device}_input_{seq}_{eq_class}_{bv}'"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name (e.g. ETH_17_LETH)"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier (e.g. A3G)"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Device variant (TC4DX, TC49X, TC45X, TC48X)"
+          - name: "api_name"
+            data_type: "string"
+            required: true
+            description: "API function name (e.g. Eth_17_Leth_Init)"
+          - name: "parameter_name"
+            data_type: "string"
+            required: true
+            description: "Input parameter declaration (e.g. 'Eth_17_Leth_ConfigType * CfgPtr')"
+          - name: "parameter_range"
+            data_type: "string"
+            required: false
+            description: "Full valid/invalid range (e.g. 'Valid/Invalid Pointer', '0-255')"
+          - name: "equivalence_class"
+            data_type: "string"
+            required: true
+            description: "Equivalence class identifier (e.g. 'Eq Class - 1')"
+          - name: "class_name"
+            data_type: "string"
+            required: false
+            description: "Class category (e.g. 'Valid Range', 'Invalid Range')"
+          - name: "class_range"
+            data_type: "string"
+            required: false
+            description: "Value range for this class (e.g. 'Valid CfgPtr', '0-7')"
+          - name: "boundary_value"
+            data_type: "string"
+            required: true
+            description: "Boundary type: 'Upper Limit (Max)', 'Nominal', or 'Lower Limit (Min)'"
+          - name: "actual_value"
+            data_type: "string"
+            required: false
+            description: "Concrete test value (e.g. 'Null Pointer', '255', 'NA')"
+          - name: "test_case_id"
+            data_type: "string"
+            required: false
+            description: "Mapped test case ID (e.g. 'Leth_Tc_Fn_004(AS460_TC4DX_C021_P01)')"
+          - name: "remarks"
+            data_type: "text"
+            required: false
+            description: "Justification or comment for NA/excluded entries"
+
+      - name: "BVEC_OutputParameter"
+        jama_item_type: null
+        description: >
+          A boundary value / equivalence class entry for an API output
+          or return parameter.  Each node represents one boundary value
+          test point for a return value / out parameter.
+        extraction_strategy: "bvec_excel_ingestion"
+        source_formats: ["xlsx"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '{module}_output_{seq}_{eq_class}_{bv}'"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier"
+          - name: "device"
+            data_type: "string"
+            required: false
+            description: "Device variant (shared sheet, may reference multiple)"
+          - name: "api_name"
+            data_type: "string"
+            required: true
+            description: "API function name"
+          - name: "parameter_name"
+            data_type: "string"
+            required: true
+            description: "Output parameter name or return type"
+          - name: "parameter_range"
+            data_type: "string"
+            required: false
+            description: "Range of return values (e.g. '0-255')"
+          - name: "equivalence_class"
+            data_type: "string"
+            required: true
+            description: "Equivalence class identifier"
+          - name: "class_name"
+            data_type: "string"
+            required: false
+            description: "Not used for output — maps to class_range directly"
+          - name: "class_range"
+            data_type: "string"
+            required: false
+            description: "Expected output value class (e.g. 'E_OK', 'E_NOT_OK')"
+          - name: "boundary_value"
+            data_type: "string"
+            required: true
+            description: "Boundary type: 'Upper Limit (Max)', 'Nominal', or 'Lower Limit (Min)'"
+          - name: "actual_value"
+            data_type: "string"
+            required: false
+            description: "Concrete expected value (e.g. '0', '1')"
+          - name: "test_case_id"
+            data_type: "string"
+            required: false
+            description: "Mapped test case ID(s), may be comma-separated for multi-device"
+          - name: "remarks"
+            data_type: "text"
+            required: false
+            description: "Justification or comment"
+
+      - name: "BVEC_ConfigParameter"
+        jama_item_type: null
+        description: >
+          A boundary value / equivalence class entry for a configuration
+          parameter.  Each node represents one boundary value test point
+          for a config param on a specific device variant.
+        extraction_strategy: "bvec_excel_ingestion"
+        source_formats: ["xlsx"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '{module}_{device}_config_{seq}_{eq_class}_{bv}'"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Device variant (TC4DX, TC49X, TC45X, TC48X)"
+          - name: "api_name"
+            data_type: "string"
+            required: false
+            description: "Applicable API or sequence of APIs (comma-separated)"
+          - name: "parameter_name"
+            data_type: "string"
+            required: true
+            description: "Configuration parameter name (e.g. 'EthCtrlEnableCrcStripping')"
+          - name: "parameter_range"
+            data_type: "string"
+            required: false
+            description: "Full range of the config parameter"
+          - name: "equivalence_class"
+            data_type: "string"
+            required: true
+            description: "Equivalence class identifier"
+          - name: "class_name"
+            data_type: "string"
+            required: false
+            description: "Class category (e.g. 'Valid Class')"
+          - name: "class_range"
+            data_type: "string"
+            required: false
+            description: "Value range for this class"
+          - name: "boundary_value"
+            data_type: "string"
+            required: true
+            description: "Boundary type: 'Upper Limit (Max)', 'Nominal', or 'Lower Limit (Min)'"
+          - name: "actual_value"
+            data_type: "string"
+            required: false
+            description: "Concrete test value"
+          - name: "test_case_id"
+            data_type: "string"
+            required: false
+            description: "Mapped test case ID"
+          - name: "remarks"
+            data_type: "text"
+            required: false
+            description: "Justification or comment"
+
+      # ================================================================
+      #  TD (Test Data) Nodes
+      # ================================================================
+
+      - name: "TD_TestParameter"
+        jama_item_type: null
+        description: >
+          An IO parameter entry from the Test Data workbook.  Each node
+          represents one parameter row for a specific test case, storing
+          the expected values per configuration as a JSON map.
+        extraction_strategy: "td_excel_ingestion"
+        source_formats: ["xlsx"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '{module}_{tc_id}_{param_name}_{direction}[_n]'"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name (e.g. ETH_17_LETH)"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier (e.g. A3G)"
+          - name: "test_case_id"
+            data_type: "string"
+            required: true
+            description: "Test case identifier (e.g. Leth_Tc_Fn_005)"
+          - name: "direction"
+            data_type: "string"
+            required: true
+            description: "Parameter direction: 'DUT Input' or 'DUT Output'"
+          - name: "data_type"
+            data_type: "string"
+            required: false
+            description: "Data type of the parameter (e.g. uint8, boolean)"
+          - name: "parameter_name"
+            data_type: "string"
+            required: true
+            description: "IO parameter name"
+          - name: "condition"
+            data_type: "string"
+            required: false
+            description: "Condition under which the parameter applies"
+          - name: "config_values"
+            data_type: "text"
+            required: false
+            description: "JSON map of config_id → expected value"
+          - name: "config_count"
+            data_type: "integer"
+            required: false
+            description: "Number of configurations referencing this parameter"
+
+      - name: "TD_Configuration"
+        jama_item_type: null
+        description: >
+          A test configuration from the Test Data workbook.  Each node
+          represents one configuration file with its device applicability
+          and regression options.
+        extraction_strategy: "td_excel_ingestion"
+        source_formats: ["xlsx"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '{module}_CFG_{index}'"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier"
+          - name: "config_index"
+            data_type: "string"
+            required: true
+            description: "3-digit config index (e.g. '021')"
+          - name: "config_file_name"
+            data_type: "string"
+            required: true
+            description: "Config file name (e.g. Eth_17_Leth_Config021)"
+          - name: "devices"
+            data_type: "text"
+            required: false
+            description: "JSON map of device applicability"
+          - name: "regression_options"
+            data_type: "text"
+            required: false
+            description: "JSON map of regression option flags"
+          - name: "comments"
+            data_type: "text"
+            required: false
+            description: "Free-text comments"
+
+      - name: "TD_HWConnection"
+        jama_item_type: null
+        description: >
+          A hardware pin/signal connection from the Test Data workbook.
+          Each node represents one physical signal connected to a device
+          pin with its electrical characteristics.
+        extraction_strategy: "td_excel_ingestion"
+        source_formats: ["xlsx"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '{module}_{device}_{signal}_{pin}'"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier"
+          - name: "signal_name"
+            data_type: "string"
+            required: true
+            description: "Signal name (e.g. LETH0_P0_RMIIB_TXD0)"
+          - name: "pin_number"
+            data_type: "string"
+            required: false
+            description: "Physical pin number on device"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Device family (TC4DX, TC49N, TC45, TC48X)"
+          - name: "section_header"
+            data_type: "string"
+            required: false
+            description: "Sheet section header (interface type + port)"
+          - name: "characteristics"
+            data_type: "text"
+            required: false
+            description: "JSON map of pin characteristics (PinDirection, PinInitialMode, etc.)"
+
+      - name: "TD_InterfaceMode"
+        jama_item_type: null
+        description: >
+          An interface mode entry from the Test Data workbook.  Each node
+          represents a supported interface type at a specific speed with
+          its PHY configuration.
+        extraction_strategy: "td_excel_ingestion"
+        source_formats: ["xlsx"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '{module}_IFACE_{interface}_{speed}_{phy_cfg}'"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier"
+          - name: "interface"
+            data_type: "string"
+            required: true
+            description: "Interface type (e.g. RMII, MII, RGMII, SGMII)"
+          - name: "speed_mbps"
+            data_type: "string"
+            required: false
+            description: "Link speed in Mbps"
+          - name: "phy_config_decimal"
+            data_type: "string"
+            required: false
+            description: "ETHTEST PhyConfig decimal value"
+          - name: "properties"
+            data_type: "text"
+            required: false
+            description: "JSON map of all interface mode properties"
+
+      # ----- ConfigMap (CM) Node Types -----
+
+      - name: "CM_DeviceVariant"
+        jama_item_type: null
+        description: >
+          A hardware device/board variant from the ConfigMap.  Each node
+          represents a specific target device that test configurations
+          can execute on (e.g., TC4D9_COM, TC499N_STD).
+        extraction_strategy: "configmap_excel_ingestion"
+        source_formats: ["xlsx"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: '{module}_DEV_{device_name}'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Device variant name (e.g., TC4D9_COM)"
+          - name: "device_family"
+            data_type: "string"
+            required: true
+            description: "Chip family code (e.g., TC4DX, TC49X)"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module name"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier"
+
+      # -- DS_Device – Datasheet package variant (e.g. BGA436_COM) -----------
+      - name: "DS_Device"
+        jama_item_type: null
+        description: >
+          A BGA package variant from the datasheet pin mux tables.
+          Represents one physical IC package (e.g., BGA436_COM, BGA292_STD).
+        extraction_strategy: "datasheet_camelot_table_extraction"
+        source_formats: ["pdf", "csv"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'DS_DEV_{device_name}'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Package variant name (e.g., BGA436_COM)"
+          - name: "datasheet"
+            data_type: "string"
+            required: true
+            description: "Source datasheet filename"
+          - name: "pin_count"
+            data_type: "integer"
+            required: false
+            description: "Number of physical balls in the package"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier (e.g., A3G)"
+
+      # -- DS_Port – Port group (e.g. port 00, port 10) ----------------------
+      - name: "DS_Port"
+        jama_item_type: null
+        description: >
+          A port group within a package variant.  Each port contains
+          multiple physical pins (e.g., port 00 has P00.0–P00.15).
+        extraction_strategy: "datasheet_camelot_table_extraction"
+        source_formats: ["pdf", "csv"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'DS_PORT_{device}_{port_number}'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Port name (e.g., port 00, analog, special, supply)"
+          - name: "port_number"
+            data_type: "string"
+            required: true
+            description: "Port number or category (e.g., 00, 10, analog, supply)"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Parent device name (e.g., BGA436_COM)"
+
+      # -- DS_Pin – Physical ball/pin ----------------------------------------
+      - name: "DS_Pin"
+        jama_item_type: null
+        description: >
+          A physical ball on the BGA package.  Each pin has one or more
+          alternate functions (mux modes) defined in the datasheet tables.
+        extraction_strategy: "datasheet_camelot_table_extraction"
+        source_formats: ["pdf", "csv"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'DS_PIN_{device}_{ball}'"
+          - name: "ball"
+            data_type: "string"
+            required: true
+            description: "Ball position on BGA grid (e.g., P4, R5, AB8)"
+          - name: "port_pin"
+            data_type: "string"
+            required: false
+            description: "GPIO port pin symbol (e.g., P00.0, P10.5)"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Parent device name"
+          - name: "buffer_type"
+            data_type: "string"
+            required: false
+            description: "Buffer characteristics (e.g., FAST/PU1/VDDEXT/ES)"
+
+      # -- DS_PinFunction – One mux mode of a pin ----------------------------
+      - name: "DS_PinFunction"
+        jama_item_type: null
+        description: >
+          One alternate function (mux mode) of a physical pin.
+          Each pin can have multiple input modes (I), output modes (O0–O15),
+          analog input (AI), and special modes.
+        extraction_strategy: "datasheet_camelot_table_extraction"
+        source_formats: ["pdf", "csv"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'DS_FUNC_{device}_{ball}_{ctrl}_{symbol}'"
+          - name: "symbol"
+            data_type: "string"
+            required: true
+            description: "Peripheral signal name (e.g., CAN10_TXD, QSPI3_SLSO4)"
+          - name: "ctrl"
+            data_type: "string"
+            required: true
+            description: "Control mode (I, O0–O15, AI, O)"
+          - name: "direction"
+            data_type: "string"
+            required: true
+            description: "Signal direction: input, output, analog, or bidirectional"
+          - name: "function_desc"
+            data_type: "string"
+            required: false
+            description: "Function description from datasheet (e.g., CAN transmit output)"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Parent device name"
+          - name: "ball"
+            data_type: "string"
+            required: true
+            description: "Ball position of the pin this function belongs to"
+          - name: "peripheral"
+            data_type: "string"
+            required: false
+            description: "Inferred peripheral module (e.g., CAN, SPI, ADC)"
+
+      # ================================================================
+      #  ARXML (AUTOSAR ECUC Configuration) Node Types
+      # ================================================================
+      # Parsed from .arxml files in validation repos (e.g.,
+      # aurix3g_sw_mcal_tc4xx_val_eth_17_leth).  Represents actual
+      # configured parameter values for specific device variants.
+
+      # -- ARXML_Module – Top-level ECUC module config ----------------------
+      - name: "ARXML_Module"
+        jama_item_type: null
+        description: >
+          A top-level ECUC module configuration (ECUC-MODULE-CONFIGURATION-VALUES).
+          One node per module per device per source file.
+        extraction_strategy: "arxml_ecuc_ingestion"
+        source_formats: ["arxml"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'ARXML_{device}_{module}_{config_index}'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Module SHORT-NAME (e.g., Eth)"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Device variant (e.g., TC489_COM)"
+          - name: "config_index"
+            data_type: "string"
+            required: true
+            description: "Configuration index from filename (e.g., 021)"
+          - name: "source_file"
+            data_type: "string"
+            required: true
+            description: "Source ARXML filename"
+          - name: "module"
+            data_type: "string"
+            required: true
+            description: "MCAL module identifier (e.g., ETH_17_LETH)"
+          - name: "project"
+            data_type: "string"
+            required: true
+            description: "Project identifier (e.g., A3G)"
+
+      # -- ARXML_Container – ECUC container at any depth -------------------
+      - name: "ARXML_Container"
+        jama_item_type: null
+        description: >
+          An ECUC container (ECUC-CONTAINER-VALUE) at any nesting depth.
+          Full path from module root stored as the unique address.
+        extraction_strategy: "arxml_ecuc_ingestion"
+        source_formats: ["arxml"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'ARXML_{device}_{config_index}:{path}'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Container SHORT-NAME (e.g., EthCtrlConfig_0)"
+          - name: "path"
+            data_type: "string"
+            required: true
+            description: "Full path from module root (e.g., Eth/EthConfigSet/EthCtrlConfig_0)"
+          - name: "depth"
+            data_type: "integer"
+            required: true
+            description: "Nesting depth (1 = direct child of module)"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Device variant"
+          - name: "config_index"
+            data_type: "string"
+            required: true
+            description: "Configuration index from filename"
+          - name: "module"
+            data_type: "string"
+            required: false
+            description: "MCAL module identifier"
+
+      # -- ARXML_Parameter – ECUC parameter value (leaf) -------------------
+      - name: "ARXML_Parameter"
+        jama_item_type: null
+        description: >
+          An ECUC parameter value (ECUC-NUMERICAL-PARAM-VALUE or
+          ECUC-TEXTUAL-PARAM-VALUE).  Stores the actual configured value
+          with full path for unique identification.
+        extraction_strategy: "arxml_ecuc_ingestion"
+        source_formats: ["arxml"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'ARXML_{device}_{config_index}:{container_path}/{param_name}'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Parameter short name (leaf of DEFINITION-REF)"
+          - name: "value"
+            data_type: "string"
+            required: true
+            description: "Configured value (string-encoded)"
+          - name: "value_type"
+            data_type: "string"
+            required: true
+            description: "Parameter type: numerical or textual"
+          - name: "container_path"
+            data_type: "string"
+            required: true
+            description: "Full container path this parameter lives in"
+          - name: "definition_ref"
+            data_type: "string"
+            required: false
+            description: "Full DEFINITION-REF path from ARXML"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Device variant"
+          - name: "config_index"
+            data_type: "string"
+            required: true
+            description: "Configuration index from filename"
+
+      # -- ARXML_Reference – ECUC reference value (cross-link) -------------
+      - name: "ARXML_Reference"
+        jama_item_type: null
+        description: >
+          An ECUC reference value (ECUC-REFERENCE-VALUE).  Points to
+          another container or parameter via VALUE-REF path.
+        extraction_strategy: "arxml_ecuc_ingestion"
+        source_formats: ["arxml"]
+        properties:
+          - name: "uid"
+            data_type: "string"
+            required: true
+            unique: true
+            description: "Unique ID: 'ARXML_{device}_{config_index}:{container_path}/{ref_name}'"
+          - name: "name"
+            data_type: "string"
+            required: true
+            description: "Reference short name (leaf of DEFINITION-REF)"
+          - name: "value_ref"
+            data_type: "string"
+            required: true
+            description: "Target path (VALUE-REF content)"
+          - name: "container_path"
+            data_type: "string"
+            required: true
+            description: "Full container path this reference lives in"
+          - name: "definition_ref"
+            data_type: "string"
+            required: false
+            description: "Full DEFINITION-REF path from ARXML"
+          - name: "device"
+            data_type: "string"
+            required: true
+            description: "Device variant"
+          - name: "config_index"
+            data_type: "string"
+            required: true
+            description: "Configuration index from filename"
 
     # -------------------------------------------------------------------------
     # RELATIONSHIP TYPES
@@ -3753,6 +4719,241 @@ profiles:
             data_type: "string"
             description: "READ or WRITE"
 
+      # ================================================================
+      #  HW UM (Hardware User Manual) Relationships
+      # ================================================================
+
+      - name: "HAS_SECTION"
+        description: >
+          HW_Module contains a document section.  Every section in the
+          chapter is linked to its parent module.
+        from_types: ["HW_Module"]
+        to_types: ["HW_Section"]
+        extraction_source: "reqif_ingestion"
+        properties: []
+
+      - name: "NEXT_SECTION"
+        description: >
+          Linked-list ordering of sections within a module.  Preserves
+          the original document reading order.
+        from_types: ["HW_Section"]
+        to_types: ["HW_Section"]
+        extraction_source: "reqif_ingestion"
+        properties: []
+
+      - name: "HAS_REGISTER"
+        description: >
+          HW_Module owns a hardware register.  Direct ownership link
+          from the module container to each register node.
+        from_types: ["HW_Module"]
+        to_types: ["HW_Register"]
+        extraction_source: "reqif_ingestion"
+        properties: []
+
+      - name: "DESCRIBES_REGISTER"
+        description: >
+          A documentation section describes / defines a register.  Links
+          the narrative text to the structured register node.
+        from_types: ["HW_Section"]
+        to_types: ["HW_Register"]
+        extraction_source: "reqif_ingestion"
+        properties: []
+
+      - name: "HAS_BITFIELD"
+        description: >
+          HW_Register contains a bitfield.  Maps the register to each
+          of its constituent fields.
+        from_types: ["HW_Register"]
+        to_types: ["HW_BitField"]
+        extraction_source: "reqif_ingestion"
+        properties: []
+
+      - name: "HAS_IMAGE"
+        description: >
+          A documentation section contains an embedded image or diagram.
+          The HW_Image node holds the LLM-generated textual description.
+        from_types: ["HW_Section"]
+        to_types: ["HW_Image"]
+        extraction_source: "reqif_ingestion"
+        properties: []
+
+      # ================================================================
+      #  BVEC (Boundary Value & Equivalence Class) Relationships
+      # ================================================================
+
+      - name: "BVEC_VERIFIED_BY"
+        description: >
+          A BVEC entry is verified/exercised by a test case.  Links the
+          boundary value analysis to the actual test that covers it.
+        from_types: ["BVEC_InputParameter", "BVEC_OutputParameter", "BVEC_ConfigParameter"]
+        to_types: ["TS_FunctionalTestCase", "TS_ConfigTestCase"]
+        extraction_source: "bvec_excel_ingestion"
+        properties: []
+
+      - name: "BVEC_FOR_API"
+        description: >
+          A BVEC entry analyses a specific API function.  Links the
+          boundary value node to the source code function node.
+        from_types: ["BVEC_InputParameter", "BVEC_OutputParameter", "BVEC_ConfigParameter"]
+        to_types: ["SRC_Function"]
+        extraction_source: "bvec_excel_ingestion"
+        properties: []
+
+      # ================================================================
+      #  TD (Test Data) Relationships
+      # ================================================================
+
+      - name: "TD_FOR_TESTCASE"
+        description: >
+          A TD test parameter entry belongs to / provides data for a test
+          case.  Links the IO parameter values to the test case that uses them.
+        from_types: ["TD_TestParameter"]
+        to_types: ["TS_FunctionalTestCase", "TS_ConfigTestCase", "TS_WCETTestCase", "TS_StaticInterfaceTestCase"]
+        extraction_source: "td_excel_ingestion"
+        properties: []
+
+      - name: "TD_USES_CONFIG"
+        description: >
+          A TD test parameter references a specific test configuration.
+          Links the IO parameter to the configuration file that defines
+          the expected value context.
+        from_types: ["TD_TestParameter"]
+        to_types: ["TD_Configuration"]
+        extraction_source: "td_excel_ingestion"
+        properties: []
+
+      # ----- ConfigMap (CM) Relationships -----
+
+      - name: "CM_RUNS_ON_DEVICE"
+        description: >
+          A test configuration can execute on a specific device variant.
+          Derived from the ConfigMap Excel which maps configurations to
+          their supported hardware targets.
+        from_types: ["TD_Configuration"]
+        to_types: ["CM_DeviceVariant"]
+        extraction_source: "configmap_excel_ingestion"
+        properties: []
+
+      - name: "BVEC_TARGETS_DEVICE"
+        description: >
+          A BVEC input parameter targets a specific device variant.
+          Links BVEC boundary-value test data to the hardware device
+          family it was designed for, via family-to-variant mapping.
+        from_types: ["BVEC_InputParameter"]
+        to_types: ["CM_DeviceVariant"]
+        extraction_source: "configmap_excel_ingestion"
+        properties: []
+
+      # -- Datasheet Pin Mux Relationships -----------------------------------
+
+      - name: "DS_HAS_FUNCTION"
+        description: >
+          A physical pin has an available mux function.  Each DS_Pin node
+          connects to multiple DS_PinFunction nodes representing all the
+          alternate modes available on that ball.
+        from_types: ["DS_Pin"]
+        to_types: ["DS_PinFunction"]
+        extraction_source: "datasheet_camelot_table_extraction"
+        properties: []
+
+      - name: "DS_BELONGS_TO_PORT"
+        description: >
+          A physical pin belongs to a port group within the package.
+        from_types: ["DS_Pin"]
+        to_types: ["DS_Port"]
+        extraction_source: "datasheet_camelot_table_extraction"
+        properties: []
+
+      - name: "DS_BELONGS_TO_DEVICE"
+        description: >
+          A port group belongs to a specific device package variant.
+        from_types: ["DS_Port"]
+        to_types: ["DS_Device"]
+        extraction_source: "datasheet_camelot_table_extraction"
+        properties: []
+
+      - name: "DS_USES_PERIPHERAL"
+        description: >
+          A pin function uses a specific MCAL peripheral module.
+          Inferred from the signal symbol name (e.g., CAN10_TXD → CAN module,
+          QSPI3_SLSO4 → SPI module, ADC_TMADC2CH11 → ADC module).
+        from_types: ["DS_PinFunction"]
+        to_types: ["MCALModule"]
+        extraction_source: "datasheet_camelot_table_extraction"
+        properties: []
+
+      - name: "DS_VARIANT_OF"
+        description: >
+          Links a datasheet device package to an existing CM_DeviceVariant
+          node when a matching variant exists in the ConfigMap data.
+        from_types: ["DS_Device"]
+        to_types: ["CM_DeviceVariant"]
+        extraction_source: "datasheet_camelot_table_extraction"
+        properties: []
+
+      # ================================================================
+      #  ARXML Relationships
+      # ================================================================
+
+      - name: "ARXML_HAS_CONTAINER"
+        description: >
+          Links an ARXML_Module to its direct child ARXML_Container nodes (depth=1).
+        from_types: ["ARXML_Module"]
+        to_types: ["ARXML_Container"]
+        extraction_source: "arxml_ecuc_ingestion"
+        properties: []
+
+      - name: "ARXML_HAS_SUB_CONTAINER"
+        description: >
+          Links a parent ARXML_Container to a child ARXML_Container
+          (recursive nesting of ECUC containers).
+        from_types: ["ARXML_Container"]
+        to_types: ["ARXML_Container"]
+        extraction_source: "arxml_ecuc_ingestion"
+        properties: []
+
+      - name: "ARXML_HAS_PARAMETER"
+        description: >
+          Links an ARXML_Container to an ARXML_Parameter (leaf value).
+        from_types: ["ARXML_Container"]
+        to_types: ["ARXML_Parameter"]
+        extraction_source: "arxml_ecuc_ingestion"
+        properties: []
+
+      - name: "ARXML_HAS_REFERENCE"
+        description: >
+          Links an ARXML_Container to an ARXML_Reference (cross-link value).
+        from_types: ["ARXML_Container"]
+        to_types: ["ARXML_Reference"]
+        extraction_source: "arxml_ecuc_ingestion"
+        properties: []
+
+      - name: "ARXML_INSTANCE_OF"
+        description: >
+          Links an ARXML_Parameter to an EA_ConfigParameter when the
+          parameter name matches the EA model parameter definition.
+        from_types: ["ARXML_Parameter"]
+        to_types: ["EA_ConfigParameter"]
+        extraction_source: "arxml_ecuc_ingestion"
+        properties: []
+
+      - name: "ARXML_TESTED_BY_BVEC"
+        description: >
+          Links an ARXML_Parameter to a BVEC_ConfigParameter when the
+          parameter name matches a BVEC test vector parameter.
+        from_types: ["ARXML_Parameter"]
+        to_types: ["BVEC_ConfigParameter"]
+        extraction_source: "arxml_ecuc_ingestion"
+        properties: []
+
+      - name: "ARXML_USED_IN_CONFIG"
+        description: >
+          Links a TD_Configuration to an ARXML_Module indicating this
+          module config is used in the test design configuration.
+        from_types: ["TD_Configuration"]
+        to_types: ["ARXML_Module"]
+        extraction_source: "arxml_ecuc_ingestion"
+        properties: []
     # -------------------------------------------------------------------------
     # EXTRACTION RULES
     # -------------------------------------------------------------------------
@@ -4149,12 +5350,12 @@ profiles:
   illd:
     metadata:
       name: "Automotive Embedded LLD Ontology"
-      version: "3.0.0"
+      version: "3.1.0"
       domain: "automotive_embedded_lld"
       description: >
         Comprehensive ontology for low-level driver development lifecycle.
         Node labels and relationship types match the live ILLD Neo4j
-        database (bolt-passthrough-neo4j-mcswai-legato).
+        database (bolt+ssc://bolt-passthrough-neo4j-ai-core-engine-legato).
 
         Version 3.0.0 changes
         ---------------------
@@ -4183,19 +5384,84 @@ profiles:
           ``HAS_CASE``, ``HAS_CONSTRAINT``, ``HAS_STEP``, ``NEXT_STEP``,
           ``STEP_OPERATION``, ``STEP_USES_REGISTER``,
           ``REALIZES_SEQUENCE``.
+
+        Version 3.1.0 changes
+        ---------------------
+        * ``supported_modules`` updated to reflect all 31 modules
+          confirmed ingested in the live Neo4j + Qdrant databases
+          (as of 2026-06-01).  Generic placeholder names (SPI, I2C,
+          ADC…) removed and replaced by actual Aurix RC1 iLLD module IDs.
+        * LP-variant alias modules documented:
+            - ``LPBTM`` → alias for ``BTM`` in Neo4j (hardware shared)
+            - ``LPCAN`` → alias for ``CAN`` in Neo4j (hardware shared)
+          These have their own Qdrant collections (lpbtm / lpcan) and
+          their own Jama requirement sets, but share HardwareRegister /
+          RegisterField / HwConstraint / ProgrammingSequence nodes with
+          BTM / CAN respectively.  The ``search_service._neo4j_module()``
+          helper performs the rewrite at query time.
+        * ``AccessMode`` nodes (rw, rh, rwh, w, r, wh, rw1sh) are
+          global singletons — not owned by any single module.  The
+          ``module`` property on these nodes reflects the last ingest
+          writer and should be treated as informational only.
+        * ``BITFIELD_CONTROLS`` corrected: ``from_types`` is now
+          ``RegisterField`` (not the legacy ``BitField`` label).
+
+      # Modules confirmed ingested in Neo4j + Qdrant (as of 2026-06-01)
+      # ─────────────────────────────────────────────────────────────────
+      # Modules NOT YET ingested (expected; data pending): 
+      #   CLOCKSC, CPUP, GST, NVMR, SPU
       supported_modules:
-        - "CXPI"
-        - "CAN"
-        - "LIN"
-        - "SPI"
-        - "I2C"
-        - "UART"
-        - "ADC"
-        - "PWM"
-        - "GPIO"
-        - "Timer"
-        - "DMA"
-        - "Interrupt"
+        # Communication
+        - "BTM"        # Basic Transceiver Module
+        - "CAN"        # Controller Area Network
+        - "CXPI"       # Clock Extension Peripheral Interface
+        - "FRAY"       # FlexRay
+        - "ICN"        # Internal Communication Network
+        - "LIN"        # Local Interconnect Network
+        - "PSI5"       # Peripheral Sensor Interface 5
+        - "PSI5S"      # PSI5-S (synchronous)
+        - "SENT"       # Single Edge Nibble Transmission
+        - "WCAN"       # Wide Controller Area Network
+        # Memory & DMA
+        - "CMEM"       # Code Memory
+        - "RAMC"       # RAM Controller
+        - "SCB"        # System Control Block / Cache
+        - "SDMMC"      # SD / MMC interface
+        - "XDMA"       # Extended DMA
+        # Analog
+        - "LPADC"      # Low-Power ADC
+        # Power & Reset
+        - "CHIPMON"    # Chip Monitor
+        - "PMS"        # Power Management System
+        - "RESETSC"    # Reset & Safety Controller
+        - "SMU"        # Safety Management Unit
+        - "TINFRA"     # Test Infrastructure
+        # CPU & System
+        - "CPUB"       # CPU Base
+        - "LCSS"       # Low-power Clock & Safety Subsystem
+        - "MXAES"      # AES / crypto engine
+        - "PORTS"      # GPIO Ports
+        - "PSAR"       # Power Supply / Analog Reference
+        - "RNG"        # Random Number Generator
+        - "SCU"        # System Control Unit
+        - "XSPI"       # External SPI / Hyperbus
+        # Security
+        - "NVMR"       # Non-Volatile Memory (partially ingested)
+        # LP-variant aliases (share HW nodes with BTM/CAN in Neo4j)
+        - "LPBTM"      # LP-variant BTM  (alias → BTM in Neo4j KG)
+        - "LPCAN"      # LP-variant CAN  (alias → CAN in Neo4j KG)
+
+      # Alias resolution — apply when querying Neo4j for LP-variants
+      alias_modules:
+        LPBTM: "BTM"
+        LPCAN: "CAN"
+
+      # Modules expected but not yet fully ingested
+      pending_modules:
+        - "CLOCKSC"    # Clock Controller
+        - "CPUP"       # CPU Plus / Extended
+        - "GST"        # Guard / Safety Timer
+        - "SPU"
 
     # -------------------------------------------------------------------------
     # NODE TYPES
@@ -5619,8 +6885,8 @@ profiles:
         properties: []
 
       - name: "BITFIELD_CONTROLS"
-        description: "Bitfield controls a hardware or software operation"
-        from_types: ["BitField"]
+        description: "Register field controls a hardware or software operation"
+        from_types: ["RegisterField"]
         to_types: ["Operation"]
         properties:
           - name: "control_semantics"
@@ -5638,7 +6904,12 @@ profiles:
         properties: []
 
       - name: "HAS_ACCESS_TYPE"
-        description: "Register field has an access mode (rw, rh, r, w, etc.)"
+        description: >
+          Register field has an access mode (rw, rh, r, w, rwh, wh, rw1sh, etc.).
+          NOTE: AccessMode nodes are global singletons shared across all modules.
+          7 AccessMode nodes exist (rw, rh, rwh, w, r, wh, rw1sh).  The
+          ``module`` property on AccessMode reflects the last ingest writer and
+          is informational only — it does NOT mean the node belongs to that module.
         from_types: ["RegisterField"]
         to_types: ["AccessMode"]
         properties: []

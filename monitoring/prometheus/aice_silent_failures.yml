@@ -1,0 +1,95 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  AICE Silent-Failure Alert Rules — workstream W-12 (Sprint 27)
+#
+#  These rules surface failures that would otherwise pass unnoticed:
+#  a backend that is quietly down, a rising tool-error ratio, ingestion
+#  silently dropping files, or the metrics pipeline itself breaking.
+#
+#  Every expression targets a metric that is *actually emitted* by the MCP
+#  server (see src/Observability/metrics.py + mcp/core/mcp_server.py), so the
+#  alerts evaluate against live series rather than aspirational names.
+#
+#  Wiring: referenced from monitoring/prometheus.yml via `rule_files`.
+#  Mount this directory into the Prometheus container so the file lands at
+#  /etc/prometheus/rules/ (e.g. ./monitoring/prometheus:/etc/prometheus/rules:ro).
+# ═══════════════════════════════════════════════════════════════════════
+groups:
+  - name: aice_silent_failures
+    interval: 30s
+    rules:
+      # ── The MCP server cannot be scraped at all (process down / unreachable).
+      - alert: AICEServiceDown
+        expr: up{job="aice-mcp-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AICE MCP server is unreachable"
+          description: >-
+            Prometheus has failed to scrape the aice-mcp-server target for more
+            than 2 minutes. The MCP server process may be down.
+
+      # ── A specific backend is reporting unhealthy via the health_check tool.
+      - alert: AICEBackendDown
+        expr: aice_backend_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AICE backend {{ $labels.backend }} is down"
+          description: >-
+            aice_backend_up is 0 for backend "{{ $labels.backend }}". The MCP
+            server is up but a dependency (neo4j/qdrant/redis/postgres) is
+            failing health checks.
+
+      # ── Tool calls are failing even though traffic is still flowing.
+      - alert: AICEHighToolErrorRate
+        expr: |
+          sum(rate(aice_tool_requests_total{status="error"}[5m]))
+            /
+          clamp_min(sum(rate(aice_tool_requests_total[5m])), 1)
+            > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AICE tool error rate above 10%"
+          description: >-
+            More than 10% of MCP tool invocations returned an error envelope
+            over the last 5 minutes.
+
+      # ── Backend error counter climbing for a component (neo4j/qdrant/llm/…).
+      - alert: AICEBackendErrorSpike
+        expr: sum by (component) (rate(aice_error_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AICE error spike in {{ $labels.component }}"
+          description: >-
+            aice_error_total for component "{{ $labels.component }}" is rising
+            (>1 error/s averaged over 5 minutes).
+
+      # ── Ingestion is silently dropping files.
+      - alert: AICEIngestionFailures
+        expr: sum(rate(aice_ingestion_files_total{status="error"}[15m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AICE ingestion is failing files"
+          description: >-
+            aice_ingestion_files_total{status="error"} has been increasing for
+            10 minutes — files are being dropped during ingestion.
+
+      # ── Deadman: the tool metric series vanished (instrumentation/scrape broke).
+      - alert: AICEToolMetricsAbsent
+        expr: absent(aice_tool_requests_total)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AICE tool metrics absent"
+          description: >-
+            aice_tool_requests_total has had no series for 15 minutes. The
+            metrics pipeline or Prometheus scraping may be broken.

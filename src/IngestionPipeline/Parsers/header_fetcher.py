@@ -26,6 +26,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from src._common.tls_config import get_verify_setting
+
 logger = logging.getLogger(__name__)
 
 # Map: header filename → (repo_slug, path_in_repo)
@@ -184,7 +186,7 @@ class HeaderFetcher:
                 username=username,
                 password=password,
                 ref="master",
-                verify_ssl=False,
+                verify_ssl=get_verify_setting(),
             )
             conn.ensure_connected()
             return conn

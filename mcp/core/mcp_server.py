@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import json, logging, os, sys, time
+import json, logging, os, re, sys, time
 import uuid as _uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -62,7 +62,7 @@ for _i, _p in reversed(_saved_paths):
 del _saved_paths, _saved_mcp, _repo_root, _il
 # ── end SDK import shim ───────────────────────────────────────────────────
 
-from .auth_middleware import check_authorization, extract_workspace_id, _err_permission_denied
+from .auth_middleware import check_authorization
 from .tool_tiers import TOOL_TIERS
 
 # ── Path bootstrapping: make src/ importable ──────────────────────────────
@@ -85,6 +85,8 @@ try:
         REVIEW_ROUTING_TOTAL, PROMETHEUS_AVAILABLE,
         QUERY_LATENCY, CACHE_HIT_RATE, CACHE_SIZE, ERROR_TOTAL,
         INGESTION_DURATION,
+        DA_SESSION_DURATION, DA_SESSION_OUTCOMES, DA_CONTEXT_TOKENS,
+        DA_FIRST_RESULT_LATENCY, DA_PATTERN_HITS, DA_LLM_TOKENS,
         make_metrics_app,
     )
 except ImportError:
@@ -117,6 +119,12 @@ except ImportError:
     CACHE_SIZE = _noop
     ERROR_TOTAL = _noop
     INGESTION_DURATION = _noop
+    DA_SESSION_DURATION = _noop
+    DA_SESSION_OUTCOMES = _noop
+    DA_CONTEXT_TOKENS = _noop
+    DA_FIRST_RESULT_LATENCY = _noop
+    DA_PATTERN_HITS = _noop
+    DA_LLM_TOKENS = _noop
 
 from .config import get_settings as _get_settings
 _get_settings.cache_clear()  # ensure fresh settings on module reload
@@ -144,16 +152,52 @@ _tool_start_time: contextvars.ContextVar[float] = contextvars.ContextVar(
     "_tool_start_time", default=0.0,
 )
 
-def _finish_tool(status: str) -> None:
-    """Record Prometheus metrics for the just-completed tool call."""
-    if not PROMETHEUS_AVAILABLE:
-        return
+def _finish_tool(status: str, response_code: Optional[str] = None) -> None:
+    """Record Prometheus metrics and the completion-time audit row.
+
+    Invoked once per tool call from _ok/_err, so the elapsed duration and any
+    token usage recorded by the tool are known here (unlike at authorization
+    time). The Prometheus *status* stays "ok"/"error"; the audit *response_code*
+    may be more specific (e.g. "denied").
+    """
     name = _tool_name_ctx.get("")
+    if not name:
+        return
     t0 = _tool_start_time.get(0.0)
-    da = _current_da_name.get("unknown")
-    if name:
-        TOOL_REQUESTS_TOTAL.labels(da_name=da, tool=name, status=status).inc()
-        TOOL_REQUEST_DURATION.labels(da_name=da, tool=name).observe(time.time() - t0)
+    duration_s = max(0.0, time.time() - t0) if t0 else 0.0
+    if PROMETHEUS_AVAILABLE:
+        da = _current_da_name.get("unknown")
+        tier = _current_da_tier.get("unknown")
+        TOOL_REQUESTS_TOTAL.labels(da_name=da, tier=tier, tool=name, status=status).inc()
+        TOOL_REQUEST_DURATION.labels(da_name=da, tool=name).observe(duration_s)
+    _write_audit(name, response_code or status, duration_s)
+
+
+def _write_audit(tool_name: str, response_code: str, duration_s: float) -> None:
+    """Persist a completion-time audit row (best-effort; never blocks the tool).
+
+    Captures workspace, session, correlation id, duration, and token count so the
+    da_productivity view can aggregate real per-DA tool usage and token totals.
+    """
+    api_key = _current_api_key.get("") or _get_settings().mcp_api_key
+    if not api_key:
+        return  # no authenticated principal to attribute the call to
+    pg = _get_postgres_client()
+    if not (pg and pg.available):
+        return
+    try:
+        pg.log_audit(
+            tool_name=tool_name,
+            workspace_id=_current_workspace.get("") or "illd",
+            session_id=_current_session_id.get("") or None,
+            caller_api_key="sha256:" + __import__("hashlib").sha256(api_key.encode()).hexdigest()[:16],
+            correlation_id=_current_request_id.get("") or None,
+            response_code=response_code,
+            duration_ms=int(duration_s * 1000),
+            token_count=int(_current_tokens.get(0) or 0),
+        )
+    except Exception:
+        pass
 
 # ── Envelope helpers ───────────────────────────────────────────────────────
 def _ok(data: Any) -> str:
@@ -163,12 +207,13 @@ def _ok(data: Any) -> str:
     rid = _current_request_id.get("")
     if rid:
         result["request_id"] = rid
+        result["correlation_id"] = rid
     return json.dumps(result, indent=2, default=str)
 
 def _err(code: str, message: str, *, _raw_exception: BaseException | None = None) -> str:
     """Return JSON error response. In production, sanitize internal details."""
-    _finish_tool("error")
-    correlation_id = _current_request_id.get("") or str(_uuid.uuid4())[:8]
+    _finish_tool("error", response_code=("denied" if code == "PERMISSION_DENIED" else "error"))
+    correlation_id = _ensure_correlation_id()
 
     if _SANITIZE_ERRORS and code == "INTERNAL_ERROR":
         logger.error(
@@ -183,6 +228,46 @@ def _err(code: str, message: str, *, _raw_exception: BaseException | None = None
         "error": True, "error_code": code,
         "message": safe_message, "correlation_id": correlation_id,
     })
+
+
+def _err_from_exc(exc: BaseException, component: str) -> str:
+    """Classify *exc* into a typed error envelope (F-CB-08).
+
+    Maps common timeout / validation / backend exceptions to stable error
+    codes so callers receive actionable, typed errors instead of a generic
+    ``INTERNAL_ERROR``. Cancellation is never swallowed. The error metric is
+    recorded and the underlying exception is logged regardless of code.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        raise exc
+
+    try:
+        _classify_and_record_error(
+            exc if isinstance(exc, Exception) else Exception(str(exc)), component
+        )
+    except Exception:
+        pass
+    logger.warning("[%s] %s: %s", component, type(exc).__name__, exc)
+
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or "timeout" in name or "timed out" in text:
+        return _err("INTERNAL_TIMEOUT", f"{component} operation timed out", _raw_exception=exc)
+    if isinstance(exc, (FileNotFoundError, ValueError, KeyError, TypeError)):
+        return _err("INVALID_INPUT", str(exc), _raw_exception=exc)
+    if (
+        any(kw in name for kw in (
+            "serviceunavailable", "connection", "connect", "refused",
+            "unreachable", "unexpectedresponse", "oserror",
+        ))
+        or any(kw in text for kw in ("connection refused", "unavailable", "unreachable"))
+    ):
+        # Detail is logged above but kept out of the envelope (infra hygiene).
+        return _err("BACKEND_UNAVAILABLE", f"{component} backend unavailable", _raw_exception=exc)
+    if any(kw in name for kw in ("permission", "forbidden", "unauthorized")):
+        return _err("PERMISSION_DENIED", str(exc), _raw_exception=exc)
+    return _err("INTERNAL_ERROR", str(exc), _raw_exception=exc)
 
 
 # ── Metrics helpers (Tickets 7 & 8) ──────────────────────────────────────
@@ -235,9 +320,35 @@ _current_api_key: contextvars.ContextVar[str] = contextvars.ContextVar(
 _current_da_name: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_current_da_name", default="unknown",
 )
+_current_da_tier: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_da_tier", default="unknown",
+)
 _current_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_current_request_id", default="",
 )
+_current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_session_id", default="",
+)
+_current_workspace: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_workspace", default="",
+)
+_current_tokens: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_current_tokens", default=0,
+)
+
+
+def _ensure_correlation_id() -> str:
+    """Return the current correlation/request id, generating and storing one if
+    absent. Guarantees a stable id shared by the audit log, the response
+    envelope, and error logs even on stdio transport (where no HTTP middleware
+    runs to seed ``_current_request_id``).
+    """
+    rid = _current_request_id.get("")
+    if not rid:
+        rid = str(_uuid.uuid4())[:8]
+        _current_request_id.set(rid)
+    return rid
+
 
 _SANITIZE_ERRORS = _get_settings().sanitize_errors
 
@@ -250,6 +361,87 @@ def _resolve_da_name(api_key: str) -> str:
         return "unknown"
     return entry.get("principal_id", "unknown")
 
+
+def _resolve_da_tier(api_key: str, workspace_id: str = "illd") -> str:
+    """Look up the caller's role tier for *workspace_id* (metric labelling, F-P5-M01)."""
+    from .auth_middleware import load_api_keys
+    registry = load_api_keys()
+    entry = registry.get(api_key)
+    if not entry:
+        return "unknown"
+    roles = entry.get("roles", {}) or {}
+    ws_roles = roles.get(workspace_id) or roles.get("*") or []
+    return ws_roles[0] if ws_roles else "unknown"
+
+
+def _default_workspace_for_key(api_key: str) -> str:
+    """Default workspace for a request that didn't specify one.
+
+    Falls back to the caller's *own* granted workspace rather than a hard-coded
+    global default, so MCAL-only assistants are not denied on workspace-agnostic
+    tools that authorize without an explicit workspace. When the key grants
+    exactly one concrete workspace, that workspace is used; otherwise (no key,
+    or wildcard/multi-workspace grants) the global default "illd" is returned.
+    """
+    from .auth_middleware import load_api_keys
+    entry = load_api_keys().get(api_key)
+    if not entry:
+        return "illd"
+    roles = entry.get("roles", {}) or {}
+    concrete = [ws for ws in roles if ws != "*"]
+    return concrete[0] if len(concrete) == 1 else "illd"
+
+
+def _effective_workspace(explicit: Optional[str] = None) -> str:
+    """Resolve the workspace a tool will *both* authorize and execute against.
+
+    Returns the caller-supplied value when present, otherwise the caller's own
+    key-aware default. Tools call this once and use the result for both the
+    ``_authorize`` check and execution, so the authorized workspace and the
+    executed workspace can never diverge.
+    """
+    if explicit:
+        return explicit
+    api_key = _current_api_key.get("") or _get_settings().mcp_api_key
+    return _default_workspace_for_key(api_key)
+
+
+def _session_task_type(session_id: Optional[str]) -> str:
+    """Return the task_type recorded at session_start, else 'adhoc' (F-P5-M02)."""
+    if not session_id:
+        return "adhoc"
+    try:
+        mgr = _get_session_manager()
+        if mgr:
+            tt = mgr.retrieve(session_id, "_task_type")
+            if tt:
+                return str(tt)
+    except Exception:
+        pass
+    return "adhoc"
+
+
+def _emit_first_result_latency(session_id: Optional[str], signals: Any) -> None:
+    """Emit aice_da_first_result_latency_seconds once per session (F-P5-M01)."""
+    if not session_id:
+        return
+    try:
+        mgr = _get_session_manager()
+        if not mgr or mgr.retrieve(session_id, "_first_result_at"):
+            return
+        started_at = mgr.retrieve(session_id, "_started_at")
+        mgr.store(session_id, "_first_result_at", time.time())
+        if started_at:
+            tt = mgr.retrieve(session_id, "_task_type")
+            if not tt and isinstance(signals, dict):
+                tt = signals.get("task_type")
+            DA_FIRST_RESULT_LATENCY.labels(
+                da_name=_current_da_name.get("unknown"), task_type=str(tt or "adhoc"),
+            ).observe(max(0.0, time.time() - float(started_at)))
+    except Exception:
+        pass
+
+
 def _authorize(tool_name: str, **kw) -> Optional[str]:
     """Run Cerbos authorization for *tool_name*.
 
@@ -259,32 +451,36 @@ def _authorize(tool_name: str, **kw) -> Optional[str]:
     # ── Set per-tool timing context for Prometheus metrics ──
     _tool_name_ctx.set(tool_name)
     _tool_start_time.set(time.time())
+    # Seed a correlation id (used by the response envelope, error logs, and the
+    # completion-time audit row) and reset per-call token accounting.
+    _ensure_correlation_id()
+    _current_tokens.set(0)
 
     api_key = _current_api_key.get("") or _get_settings().mcp_api_key
     if not api_key:
-        return _err_permission_denied("No API key provided (set MCP_API_KEY env var or send Authorization header)")
+        return _err("PERMISSION_DENIED", "No API key provided (set MCP_API_KEY env var or send Authorization header)")
 
     # Resolve DA name from API key for metrics labelling
     _current_da_name.set(_resolve_da_name(api_key))
 
-    ws = extract_workspace_id(**kw)
+    # Resolve the workspace to authorize against. Workspace-scoped tools pass
+    # their own workspace/profile so the authorized workspace matches the one the
+    # tool actually executes against (no cross-workspace gap). Workspace-agnostic
+    # tools pass nothing and fall back to the caller's *own* granted workspace
+    # (never a hard-coded "illd", which would deny MCAL-only assistants).
+    ws = kw.get("workspace_id") or kw.get("profile") or _default_workspace_for_key(api_key)
+    _current_workspace.set(ws)
+    _current_da_tier.set(_resolve_da_tier(api_key, ws))
+    # Session id for the completion-time audit row (W-14). Decorated tools seed
+    # _current_session_id via with_session_routing; session-lifecycle tools pass
+    # it explicitly here.
+    if kw.get("session_id"):
+        _current_session_id.set(kw["session_id"])
     module_name = kw.get("module_name", None)
     allowed, message = check_authorization(api_key, tool_name, ws, module_name)
 
-    # Audit logging (best-effort, never blocks the tool)
-    pg = _get_postgres_client()
-    if pg and pg.available:
-        try:
-            pg.log_audit(
-                tool_name=tool_name, workspace_id=ws,
-                caller_api_key="sha256:" + __import__('hashlib').sha256(api_key.encode()).hexdigest()[:16],
-                response_code="ok" if allowed else "denied",
-            )
-        except Exception:
-            pass
-
     if not allowed:
-        return _err_permission_denied(message)
+        return _err("PERMISSION_DENIED", message)
     return None
 
 
@@ -303,52 +499,65 @@ def with_session_routing(tool_name: str):
     def decorator(fn):
         @wraps(fn)
         async def wrapper(*args, session_id: Optional[str] = None, **kwargs):
-            if session_id:
-                sm = _get_sandbox_manager()
-                sandbox = sm.get_sandbox(session_id) if sm else None
-                if sandbox:
-                    from src.MemoryLayer.memory.ephemeral_sandbox import (
-                        HybridGraphService, HybridTraversal,
-                    )
-                    ws = kwargs.get("workspace_id", "mcal")
-                    driver = _get_neo4j(ws)
-                    hybrid = HybridGraphService(sandbox, driver,
-                                                qdrant_client=_get_qdrant(),
-                                                workspace_id=ws)
-                    traversal = HybridTraversal(sandbox, driver, ws)
-                    classification = HybridGraphService.classify_tool(tool_name)
-
-                    kwargs["graph_service"] = hybrid
-                    kwargs["hybrid_traversal"] = traversal
-                    kwargs["query_mode"] = classification
-                    kwargs["sandbox_ctx"] = sandbox
-
-            # Only forward kwargs supported by the target function unless it has **kwargs.
-            sig = inspect.signature(fn)
-            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-            if has_varkw:
-                filtered_kwargs = kwargs
-            else:
-                filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-
-            if "session_id" in sig.parameters:
-                coro = fn(*args, session_id=session_id, **filtered_kwargs)
-            else:
-                coro = fn(*args, **filtered_kwargs)
-
-            # ── MEG_SW-333: Async cancellation & timeout ──
+            # W-14/H: seed the session id for _authorize()'s completion-time audit
+            # row, keeping the reset token so the context var never leaks into a
+            # later call that shares this async context.
+            _sid_token = _current_session_id.set(session_id or "")
             try:
-                return await asyncio.wait_for(
-                    coro,
-                    timeout=_get_settings().tool_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                timeout = _get_settings().tool_timeout_seconds
-                logger.warning("Tool %s timed out after %ds", tool_name, timeout)
-                return _err("TIMEOUT", f"Tool execution exceeded {timeout}s limit")
-            except asyncio.CancelledError:
-                logger.warning("Tool %s was cancelled", tool_name)
-                return _err("CANCELLED", "Tool execution was cancelled by client")
+                if session_id:
+                    sm = _get_sandbox_manager()
+                    sandbox = sm.get_sandbox(session_id) if sm else None
+                    if sandbox:
+                        from src.MemoryLayer.memory.ephemeral_sandbox import (
+                            HybridGraphService, HybridTraversal,
+                        )
+                        ws = kwargs.get("workspace_id", "mcal")
+                        driver = _get_neo4j(ws)
+                        hybrid = HybridGraphService(sandbox, driver,
+                                                    qdrant_client=_get_qdrant(),
+                                                    workspace_id=ws)
+                        traversal = HybridTraversal(sandbox, driver, ws)
+                        classification = HybridGraphService.classify_tool(tool_name)
+
+                        kwargs["graph_service"] = hybrid
+                        kwargs["hybrid_traversal"] = traversal
+                        kwargs["query_mode"] = classification
+                        kwargs["sandbox_ctx"] = sandbox
+
+                # Only forward kwargs supported by the target function unless it has **kwargs.
+                sig = inspect.signature(fn)
+                has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                if has_varkw:
+                    filtered_kwargs = kwargs
+                else:
+                    filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+                if "session_id" in sig.parameters:
+                    coro = fn(*args, session_id=session_id, **filtered_kwargs)
+                else:
+                    coro = fn(*args, **filtered_kwargs)
+
+                # ── MEG_SW-333: Async cancellation & timeout ──
+                try:
+                    return await asyncio.wait_for(
+                        coro,
+                        timeout=_get_settings().tool_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    timeout = _get_settings().tool_timeout_seconds
+                    logger.warning("Tool %s timed out after %ds", tool_name, timeout)
+                    return _err("TIMEOUT", f"Tool execution exceeded {timeout}s limit")
+                except asyncio.CancelledError:
+                    logger.warning("Tool %s was cancelled", tool_name)
+                    return _err("CANCELLED", "Tool execution was cancelled by client")
+                except Exception as exc:
+                    # F-CB-08: any exception that propagated out of the tool (i.e.
+                    # was not handled by the tool itself) is classified into a typed
+                    # error envelope instead of crashing the request.
+                    logger.exception("Tool %s failed", tool_name)
+                    return _err_from_exc(exc, tool_name)
+            finally:
+                _current_session_id.reset(_sid_token)
         return wrapper
     return decorator
 
@@ -792,39 +1001,46 @@ async def _warmup():
     """Eagerly initialize heavy resources so the first user request is fast.
 
     Called once at server startup. Failures are logged but non-fatal.
+    Uses asyncio.gather for parallel initialization.
     """
+    import asyncio
     import time as _time
     t0 = _time.monotonic()
     logger.info("[Warmup] Starting eager resource initialization...")
 
-    # 1. Qdrant client (TLS handshake)
-    try:
-        _get_qdrant()
-        logger.info("[Warmup] Qdrant client ready (%.1fs)", _time.monotonic() - t0)
-    except Exception as e:
-        logger.warning("[Warmup] Qdrant client failed: %s", e)
-
-    # 2. SearchService per profile (includes Neo4j driver)
-    for profile in ("illd", "mcal"):
+    async def _warmup_qdrant():
         try:
-            svc = _get_search_service(profile)
+            await asyncio.to_thread(_get_qdrant)
+            logger.info("[Warmup] Qdrant client ready (%.1fs)", _time.monotonic() - t0)
+        except Exception as e:
+            logger.warning("[Warmup] Qdrant client failed: %s", e)
+
+    async def _warmup_search(profile: str):
+        try:
+            svc = await asyncio.to_thread(_get_search_service, profile)
             if svc:
-                # 3. Force-load the SentenceTransformer embedding model
-                svc._embed_query("warmup")
+                await asyncio.to_thread(svc._embed_query, "warmup")
                 logger.info("[Warmup] SearchService('%s') + embedding model ready (%.1fs)",
                             profile, _time.monotonic() - t0)
         except Exception as e:
             logger.warning("[Warmup] SearchService('%s') failed: %s", profile, e)
 
-    # 4. CacheService + its semantic tier model
-    try:
-        cs = _get_cache_service()
-        if cs and hasattr(cs, 'semantic'):
-            cs.semantic._get_model()
-            logger.info("[Warmup] CacheService + SemanticCache model ready (%.1fs)",
-                        _time.monotonic() - t0)
-    except Exception as e:
-        logger.warning("[Warmup] CacheService failed: %s", e)
+    async def _warmup_cache():
+        try:
+            cs = await asyncio.to_thread(_get_cache_service)
+            if cs and hasattr(cs, 'semantic'):
+                await asyncio.to_thread(cs.semantic._get_model)
+                logger.info("[Warmup] CacheService + SemanticCache model ready (%.1fs)",
+                            _time.monotonic() - t0)
+        except Exception as e:
+            logger.warning("[Warmup] CacheService failed: %s", e)
+
+    await asyncio.gather(
+        _warmup_qdrant(),
+        _warmup_search("illd"),
+        _warmup_search("mcal"),
+        _warmup_cache(),
+    )
 
     logger.info("[Warmup] Complete in %.1fs", _time.monotonic() - t0)
 
@@ -1297,12 +1513,35 @@ async def search_database(
         query_mode = query_mode
         if query_mode == "sandbox":
             hybrid = graph_service
-            results = hybrid.search(query, top_k=max_results, alpha=alpha)
+            results = hybrid.search(
+                query,
+                top_k=max_results,
+                alpha=alpha,
+                filter_by_module=filter_by_module,
+            )
+            if filter_by_node_type:
+                allowed = set(filter_by_node_type)
+                results = [
+                    r for r in results
+                    if (r.node_type or r.metadata.get("node_type", "")) in allowed
+                ]
+            total_count = len(results)
+            results = results[offset:offset + max_results]
             return _ok({
-                "results": [{"node_id": r.node_id, "content": r.content,
-                              "score": round(r.score, 4), "origin": r.origin,
-                              "node_type": r.node_type} for r in results],
-                "total_count": len(results), "query": query, "source": "sandbox",
+                "results": [{
+                    "node_id": r.node_id,
+                    "label": r.node_type or r.metadata.get("node_type", ""),
+                    "content": r.content,
+                    "score": round(r.score, 4),
+                    "origin": r.origin,
+                    "node_type": r.node_type or r.metadata.get("node_type", ""),
+                    "properties": {
+                        k: v for k, v in r.metadata.items()
+                        if not str(k).startswith("_")
+                    },
+                    "relationships": None,
+                } for r in results],
+                "total_count": total_count, "query": query, "source": "sandbox",
             })
 
         # ── Cache check (LRU → Semantic → RAG) ──
@@ -1349,7 +1588,7 @@ async def search_database(
     except Exception as exc:
         logger.exception("search_database failed")
         _classify_and_record_error(exc, "search")
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "search_database")
 
 @mcp.tool()
 @with_session_routing("search_nodes")
@@ -1397,23 +1636,46 @@ async def search_nodes(
         if query_mode == "sandbox":
             sandbox = sandbox_ctx
             if sandbox:
-                keywords = [keyword] if keyword else []
-                node_types = [label] if label else None
-                search_results = sandbox.graph.keyword_search(
-                    keywords=keywords, node_types=node_types, top_k=limit)
-                nodes = [
-                    {
-                        "node_id": r.node_id,
-                        "label": r.node_type,
-                        "properties": {
-                            "content": r.content,
-                            "score": r.score,
-                            "_origin": r.origin,
+                def _matches_filters(props: Dict[str, Any], requested: Optional[Dict[str, Any]]) -> bool:
+                    if not requested:
+                        return True
+                    for key, expected in requested.items():
+                        actual = props.get(key)
+                        if isinstance(expected, str):
+                            if str(actual or "").upper() != expected.upper():
+                                return False
+                        else:
+                            if actual != expected:
+                                return False
+                    return True
+
+                nodes = []
+                keyword_lower = keyword.lower() if keyword else None
+                for node_id, node_data in sandbox.graph.get_all_nodes():
+                    props = dict(node_data)
+                    node_label = props.get("_node_type", "Unknown")
+                    if label and node_label != label:
+                        continue
+                    public_props = {k: v for k, v in props.items() if not k.startswith("_")}
+                    if not _matches_filters(public_props, filters):
+                        continue
+                    if keyword_lower:
+                        haystack = " ".join(str(v) for v in public_props.values() if v is not None).lower()
+                        if keyword_lower not in haystack:
+                            continue
+                    if return_properties:
+                        public_props = {
+                            key: value for key, value in public_props.items()
+                            if key in return_properties
                         }
-                    }
-                    for r in search_results
-                ]
-                return _ok({"nodes": nodes, "total_count": len(nodes)})
+                    nodes.append({
+                        "node_id": node_id,
+                        "label": node_label,
+                        "properties": public_props,
+                    })
+                total_count = len(nodes)
+                nodes = nodes[offset:offset + limit]
+                return _ok({"nodes": nodes, "total_count": total_count})
         
         # ── No session → existing production path (unchanged) ──
         svc = _get_search_service(workspace_id)
@@ -1425,7 +1687,7 @@ async def search_nodes(
             limit=limit, offset=offset, workspace_id=workspace_id)
         return _ok(result)
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "_matches_filters")
 
 @mcp.tool()
 @with_session_routing("get_node_by_id")
@@ -1484,7 +1746,7 @@ async def get_node_by_id(
             label=label, workspace_id=workspace_id)
         return _ok(result)
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "get_node_by_id")
 
 @mcp.tool()
 @with_session_routing("get_neighbors")
@@ -1604,7 +1866,7 @@ async def get_neighbors(
             limit=limit, workspace_id=workspace_id)
         return _ok(result)
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "get_neighbors")
 
 @mcp.tool()
 @with_session_routing("shortest_path")
@@ -1674,7 +1936,7 @@ async def shortest_path(
             max_depth=max_depth, workspace_id=workspace_id)
         return _ok(result)
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "shortest_path")
 
 @mcp.tool()
 @with_session_routing("execute_cypher")
@@ -1729,7 +1991,10 @@ async def execute_cypher(
                 result = await asyncio.to_thread(
                     hybrid.deep_query, cypher=query, params=parameters or {}, workspace_id=workspace_id
                 )
-                return _ok({"records": result if isinstance(result, list) else [result], "count": len(result) if isinstance(result, list) else 1, "_origin": "sandbox"})
+                rows = result if isinstance(result, list) else [result]
+                # Strip internal _warning sentinels from the returned rows before sending
+                clean_rows = [r for r in rows if not (isinstance(r, dict) and "_warning" in r and len(r) == 1)]
+                return _ok({"rows": clean_rows, "count": len(clean_rows), "_origin": "sandbox"})
             except Exception:
                 pass  # Fall through to prod query
         
@@ -1741,7 +2006,7 @@ async def execute_cypher(
             svc.execute_cypher, query=query, parameters=parameters, workspace_id=workspace_id)
         return _ok(result)
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "execute_cypher")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1774,7 +2039,7 @@ async def query_api_function(function_name: str, workspace_id: str = "illd",
           "requirements": [...], "test_cases": [...], "description": str, ...
         }
     """
-    denied = _authorize("query_api_function")
+    denied = _authorize("query_api_function", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -1803,7 +2068,7 @@ async def query_api_function(function_name: str, workspace_id: str = "illd",
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.query_api_function, function_name, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "query_api_function")
 
 @mcp.tool()
 @with_session_routing("get_type_definition")
@@ -1833,7 +2098,7 @@ async def get_type_definition(struct_name: str, module: Optional[str] = None, wo
           "related_functions": [{"name": str, "usage": "parameter"|"return"}]
         }
     """
-    denied = _authorize("get_type_definition")
+    denied = _authorize("get_type_definition", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -1858,7 +2123,7 @@ async def get_type_definition(struct_name: str, module: Optional[str] = None, wo
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.get_type_definition, struct_name, module, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "get_type_definition")
 
 @mcp.tool()
 @with_session_routing("generate_initialization_code")
@@ -1893,13 +2158,13 @@ async def generate_initialization_code(
           "fields_from_kg": int, "fields_overridden": int
         }
     """
-    denied = _authorize("generate_initialization_code")
+    denied = _authorize("generate_initialization_code", workspace_id=workspace_id)
     if denied: return denied
     try:
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.generate_initialization_code, struct_name, user_overrides, variable_name, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "generate_initialization_code")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1939,7 +2204,7 @@ async def query_dependencies(
           "hardware_deps": [{"register": str, "access": str}] | None
         }
     """
-    denied = _authorize("query_dependencies")
+    denied = _authorize("query_dependencies", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -1966,7 +2231,7 @@ async def query_dependencies(
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.query_dependencies, function_name, module_name, max_depth, include_hardware, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "query_dependencies")
 
 @mcp.tool()
 @with_session_routing("validate_api_usage")
@@ -1995,7 +2260,7 @@ async def validate_api_usage(function_sequence: List[str], workspace_id: str = "
                           "position": int, "message": str}]
         }
     """
-    denied = _authorize("validate_api_usage")
+    denied = _authorize("validate_api_usage", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -2016,7 +2281,7 @@ async def validate_api_usage(function_sequence: List[str], workspace_id: str = "
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.validate_api_usage, function_sequence, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "validate_api_usage")
 
 @mcp.tool()
 @with_session_routing("detect_polling_requirements")
@@ -2047,7 +2312,7 @@ async def detect_polling_requirements(function_names: List[str], module: Optiona
           }]
         }
     """
-    denied = _authorize("detect_polling_requirements")
+    denied = _authorize("detect_polling_requirements", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -2070,7 +2335,7 @@ async def detect_polling_requirements(function_names: List[str], module: Optiona
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.detect_polling_requirements, function_names, module, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "detect_polling_requirements")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2107,7 +2372,7 @@ async def find_requirement_traces(
           "coverage": {"has_code": bool, "has_tests": bool, "has_results": bool}
         }
     """
-    denied = _authorize("find_requirement_traces")
+    denied = _authorize("find_requirement_traces", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -2130,7 +2395,7 @@ async def find_requirement_traces(
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.find_requirement_traces, requirement_id, include_tests, include_results, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "find_requirement_traces")
 
 @mcp.tool()
 @with_session_routing("build_traceability_matrix")
@@ -2159,7 +2424,7 @@ async def build_traceability_matrix(module_name: str, output_format: str = "json
           "summary": {"total": int, "fully_covered": int, "gaps": int}
         }
     """
-    denied = _authorize("build_traceability_matrix")
+    denied = _authorize("build_traceability_matrix", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -2190,7 +2455,7 @@ async def build_traceability_matrix(module_name: str, output_format: str = "json
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.build_traceability_matrix, module_name, output_format, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "build_traceability_matrix")
 
 @mcp.tool()
 @with_session_routing("find_coverage_gaps")
@@ -2222,7 +2487,7 @@ async def find_coverage_gaps(module_name: str, gap_type: str = "all", severity: 
           "summary": {"total_gaps": int, "by_type": {...}, "by_severity": {...}}
         }
     """
-    denied = _authorize("find_coverage_gaps")
+    denied = _authorize("find_coverage_gaps", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -2259,7 +2524,7 @@ async def find_coverage_gaps(module_name: str, gap_type: str = "all", severity: 
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.find_coverage_gaps, module_name, gap_type, severity, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "find_coverage_gaps")
 
 @mcp.tool()
 @with_session_routing("analyze_hw_sw_links")
@@ -2295,7 +2560,7 @@ async def analyze_hw_sw_links(
           "summary": {"total_accesses": int, "documented": int, "undocumented": int}
         }
     """
-    denied = _authorize("analyze_hw_sw_links")
+    denied = _authorize("analyze_hw_sw_links", workspace_id=workspace_id)
     if denied: return denied
     try:
         query_mode = query_mode
@@ -2324,7 +2589,7 @@ async def analyze_hw_sw_links(
         ki = _get_ki_service(workspace_id)
         if not ki: return _err("INTERNAL_ERROR", "KnowledgeIntelligenceService unavailable")
         return _ok(await asyncio.to_thread(ki.analyze_hw_sw_links, module_name, include_undocumented, include_peripheral_map, ws=workspace_id))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "analyze_hw_sw_links")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2369,7 +2634,7 @@ async def _ingest_file(file_path: str, module_name: str, overwrite: bool = False
     except ValueError as e:
         return _err("INVALID_INPUT", str(e))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "_ingest_file")
 
 # @mcp.tool()  # Removed: Plan 2 Phase 2
 async def _ingest_module_from_repo(repo_root: str, module_name: str, workspace_id: str = "illd") -> str:
@@ -2404,7 +2669,7 @@ async def _ingest_module_from_repo(repo_root: str, module_name: str, workspace_i
     except FileNotFoundError as e:
         return _err("INVALID_INPUT", str(e))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "_ingest_module_from_repo")
 
 # @mcp.tool()  # Removed: Plan 2 Phase 2
 async def _batch_ingest_modules(
@@ -2446,7 +2711,7 @@ async def _batch_ingest_modules(
     except FileNotFoundError as e:
         return _err("INVALID_INPUT", str(e))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "_batch_ingest_modules")
 
 # @mcp.tool()  # Removed: Plan 2 Phase 2
 async def _ingest_repository(
@@ -2488,7 +2753,7 @@ async def _ingest_repository(
     except FileNotFoundError as e:
         return _err("INVALID_INPUT", str(e))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "_ingest_repository")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2498,7 +2763,8 @@ async def _ingest_repository(
 @mcp.tool()
 async def session_start(
     session_id: str, assistant_name: Optional[str] = None,
-    module_context: Optional[str] = None,
+    module_context: Optional[str] = None, task_type: str = "adhoc",
+    workspace_id: Optional[str] = None,
 ) -> str:
     """Start a working-memory session for context accumulation.
 
@@ -2514,6 +2780,11 @@ async def session_start(
         assistant_name (str | None): Name of the calling assistant/agent.
         module_context (str | None): Module scope for this session (e.g. "Adc").
             Run `list_available_modules` to get valid module names.
+        task_type (str): Task classification for per-DA productivity metrics
+            (e.g. "code_generation", "test_generation"). Default "adhoc" (F-P5-M02).
+        workspace_id (str | None): Target workspace — "illd" or "mcal". When
+            omitted, the caller's own granted workspace is used so the session is
+            recorded under the same workspace it is authorized against.
 
     Returns (JSON):
         {
@@ -2522,23 +2793,43 @@ async def session_start(
           "ttl_seconds": 3600
         }
     """
-    denied = _authorize("session_start")
+    # C2: resolve the workspace once so the session is authorized AND recorded
+    # under the same workspace (key-aware for MCAL-only assistants). Previously
+    # the session was always created under the manager's default ("illd").
+    workspace_id = _effective_workspace(workspace_id)
+    denied = _authorize("session_start", workspace_id=workspace_id, session_id=session_id)
     if denied:
         return denied
+    # F-CB-09: reject unsafe session ids at the entry point so a crafted id never
+    # enters the system (it is later interpolated into sandbox/tmp paths).
+    from src._common.path_safety import validate_session_id
+    try:
+        validate_session_id(session_id)
+    except ValueError:
+        return _err("INVALID_INPUT", "Invalid session_id format.")
     try:
         mgr = _get_session_manager()
         if not mgr:
             return _err("INTERNAL_ERROR", "SessionManager not initialized")
         session = mgr.create(session_id=session_id, assistant_name=assistant_name or "",
-                              module_context=module_context or "", ttl_seconds=_SESSION_TTL_SECONDS)
+                              module_context=module_context or "", ttl_seconds=_SESSION_TTL_SECONDS,
+                              workspace_id=workspace_id)
+        # F-P5-M02: capture task_type at the session boundary (default "adhoc") so
+        # per-DA productivity metrics are never labelled "unknown".
+        try:
+            mgr.store(session_id, "_task_type", task_type or "adhoc")
+            mgr.store(session_id, "_started_at", time.time())
+        except Exception:
+            pass
         ACTIVE_SESSIONS.inc()
         return _ok({"session_id": session.session_id, "created": True,
+                     "task_type": task_type or "adhoc",
                      "store_type": type(mgr._backend).__name__,
                      "ttl_seconds": _SESSION_TTL_SECONDS})
     except ValueError as ve:
         return _err("INVALID_INPUT", str(ve))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "session_start")
 
 @mcp.tool()
 async def session_store(session_id: str, key: str, value: Any) -> str:
@@ -2557,7 +2848,7 @@ async def session_store(session_id: str, key: str, value: Any) -> str:
     Returns (JSON):
         {"stored": true, "session_id": str, "key": str}
     """
-    denied = _authorize("session_store")
+    denied = _authorize("session_store", session_id=session_id)
     if denied:
         return denied
     try:
@@ -2569,7 +2860,7 @@ async def session_store(session_id: str, key: str, value: Any) -> str:
     except ValueError as ve:
         return _err("INVALID_INPUT", str(ve))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "session_store")
 
 @mcp.tool()
 async def session_retrieve(session_id: str, key: str) -> str:
@@ -2585,7 +2876,7 @@ async def session_retrieve(session_id: str, key: str) -> str:
     Returns (JSON):
         {"found": bool, "value": Any | null, "session_id": str, "key": str}
     """
-    denied = _authorize("session_retrieve")
+    denied = _authorize("session_retrieve", session_id=session_id)
     if denied:
         return denied
     try:
@@ -2597,7 +2888,7 @@ async def session_retrieve(session_id: str, key: str) -> str:
     except ValueError as ve:
         return _err("INVALID_INPUT", str(ve))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "session_retrieve")
 
 @mcp.tool()
 async def build_context(
@@ -2627,7 +2918,7 @@ async def build_context(
           "budget_remaining": int
         }
     """
-    denied = _authorize("build_context")
+    denied = _authorize("build_context", session_id=session_id)
     if denied:
         return denied
     try:
@@ -2651,10 +2942,15 @@ async def build_context(
         if mgr and mgr.get(session_id):
             mgr.store(session_id, "_last_context_tokens", result.get("total_tokens"))
             mgr.store(session_id, "_last_context_items", result.get("items_included"))
+        # F-P5-M01: per-DA context-assembly token metric
+        DA_CONTEXT_TOKENS.labels(
+            da_name=_current_da_name.get("unknown"),
+            task_type=_session_task_type(session_id),
+        ).observe(float(result.get("total_tokens", 0) or 0))
         return _ok(result)
     except Exception as exc:
         logger.exception("build_context failed")
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "build_context")
 
 @mcp.tool()
 async def session_end(session_id: str, persist_audit: bool = True) -> str:
@@ -2676,15 +2972,26 @@ async def session_end(session_id: str, persist_audit: bool = True) -> str:
                     "total_context_entries": int, ...}
         }
     """
-    denied = _authorize("session_end")
+    denied = _authorize("session_end", session_id=session_id)
     if denied:
         return denied
     try:
         mgr = _get_session_manager()
         if not mgr:
             return _err("INTERNAL_ERROR", "SessionManager not initialized")
+        # F-P5-M01: capture per-DA session duration before the session is closed.
+        _da_task_type = _session_task_type(session_id)
+        _da_started_at = None
+        try:
+            _da_started_at = mgr.retrieve(session_id, "_started_at")
+        except Exception:
+            pass
         summary = mgr.close(session_id, persist_audit=persist_audit)
         ACTIVE_SESSIONS.dec()
+        if _da_started_at:
+            DA_SESSION_DURATION.labels(
+                da_name=_current_da_name.get("unknown"), task_type=_da_task_type,
+            ).observe(max(0.0, time.time() - float(_da_started_at)))
 
         # Plan 2 Phase 3: cleanup sandbox and temp dirs on session end
         sm = _get_sandbox_manager()
@@ -2692,13 +2999,21 @@ async def session_end(session_id: str, persist_audit: bool = True) -> str:
         if sm:
             sandbox_stats = sm.destroy_sandbox(session_id)
         import shutil
-        tmp_dir = Path(f"/tmp/sandbox_{session_id}")
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        # F-CB-09: only touch the filesystem when session_id is a safe path
+        # component, so a crafted id cannot redirect the rmtree.
+        from src._common.path_safety import validate_session_id
+        try:
+            safe_sid = validate_session_id(session_id)
+        except ValueError:
+            logger.warning("session_end: skipping tmp cleanup for invalid session_id %r", session_id)
+        else:
+            tmp_dir = Path(f"/tmp/sandbox_{safe_sid}")
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return _ok({"closed": True, "stats": summary, "sandbox_cleanup": sandbox_stats})
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "session_end")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2759,6 +3074,13 @@ async def sandbox_upload(
         return _err("INVALID_INPUT", "Provide either 'documents' (list of {filename, content}) or 'file_paths'.")
     if trace_depth < 0 or trace_depth > 2:
         return _err("INVALID_INPUT", "trace_depth must be 0, 1, or 2.")
+    # F-CB-09: session_id is interpolated into the sandbox temp path; reject
+    # anything that is not a safe path component before touching the filesystem.
+    from src._common.path_safety import validate_session_id
+    try:
+        validate_session_id(session_id)
+    except ValueError:
+        return _err("INVALID_INPUT", "Invalid session_id format.")
     try:
         sm = _get_sandbox_manager()
         if not sm:
@@ -2859,8 +3181,13 @@ async def sandbox_upload(
                     all_node_names.extend(extracted_names)
                     parsed_files.append((parsed, p.name))
 
-            # ── Resolve module name (uppercase to match Neo4j convention) ──
-            detected_module = module or _detect_module_from_names(all_node_names)
+            # ── Resolve canonical module name for the upload batch ──
+            detected_module = _detect_upload_module(
+                all_node_names,
+                parsed_files,
+                module,
+                workspace_id,
+            )
 
             # F-CB-10: refuse to pull traceability when module could not be
             # detected — otherwise the prod-overlay Cypher matches against
@@ -2993,6 +3320,25 @@ async def sandbox_upload(
                             resolution = sandbox.graph.resolve_boundary(name_to_canonical)
                             boundary_stats["boundary_resolved"] = resolution.get("boundary_resolved", 0)
 
+            # ── Sandbox diagnostics for EDA consumption ──
+            sandbox_diag = {}
+            try:
+                type_counts = {}
+                for _nid, data in sandbox.graph._graph.nodes(data=True):
+                    ntype = data.get("_node_type", "unknown")
+                    type_counts[ntype] = type_counts.get(ntype, 0) + 1
+                sandbox_diag["node_type_counts"] = type_counts
+                # Count HAS_FIELD edges specifically
+                has_field_count = sum(
+                    1 for _src, _tgt, edata in sandbox.graph._graph.edges(data=True)
+                    if edata.get("_rel_type") == "HAS_FIELD"
+                )
+                sandbox_diag["has_field_edges"] = has_field_count
+                sandbox_diag["hw_register_count"] = type_counts.get("HardwareRegister", 0)
+                sandbox_diag["register_field_count"] = type_counts.get("RegisterField", 0)
+            except Exception:
+                pass
+
             response = {
                 "session_id": session_id,
                 "files_ingested": len(parsed_results),
@@ -3004,6 +3350,16 @@ async def sandbox_upload(
                 "parsed_files": parsed_results,
                 "sandbox_status": sandbox.status(),
             }
+            if sandbox_diag:
+                logger.info(
+                    "sandbox_upload diagnostics: session=%s module=%s hw_registers=%s register_fields=%s has_field_edges=%s",
+                    session_id,
+                    detected_module,
+                    sandbox_diag.get("hw_register_count", 0),
+                    sandbox_diag.get("register_field_count", 0),
+                    sandbox_diag.get("has_field_edges", 0),
+                )
+                response["sandbox_diagnostics"] = sandbox_diag
             if parser_diagnostics:
                 response["parser_diagnostics"] = parser_diagnostics
             return _ok(response)
@@ -3012,7 +3368,7 @@ async def sandbox_upload(
 
     except Exception as exc:
         logger.exception("sandbox_upload failed")
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "sandbox_upload")
 
 
 def _auto_discover_module_include_paths(module: str) -> List[str]:
@@ -3085,6 +3441,11 @@ def _auto_discover_module_include_paths(module: str) -> List[str]:
     deps = base / "rc1_deps"
     if deps.is_dir():
         include_paths.append(str(deps))
+
+    # 4b. Infrastructure integration headers (McalLib.h, Mcal_SafetyError.h, Det.h)
+    infra_common = base / "aurix3g_sw_mcal_tc4xx_infra_integration" / "00_Common"
+    if infra_common.is_dir():
+        include_paths.append(str(infra_common))
 
     # 5. Platform headers (Std_Types.h, Mcal_ErrorTypes.h, etc.)
     for platform_name in ("aurix3g_sw_mcal_tc4xx_platform",
@@ -3159,6 +3520,85 @@ def _auto_discover_module_include_paths(module: str) -> List[str]:
     return include_paths
 
 
+_ILLD_MODULE_ALIAS_CACHE: Optional[Dict[str, str]] = None
+
+
+def _get_illd_module_aliases() -> Dict[str, str]:
+    """Build alias → canonical-module map for iLLD uploads."""
+    global _ILLD_MODULE_ALIAS_CACHE
+    if _ILLD_MODULE_ALIAS_CACHE is not None:
+        return _ILLD_MODULE_ALIAS_CACHE
+
+    aliases: Dict[str, str] = {
+        "LPBTM": "BTM",
+        "LPCAN": "CAN",
+    }
+    try:
+        import yaml
+
+        cfg_path = _REPO_ROOT / "src" / "HybridRAG" / "config" / "illd_module_map.yaml"
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        modules = raw.get("modules", raw) if isinstance(raw, dict) else {}
+        for module_name, info in modules.items():
+            if not isinstance(info, dict):
+                continue
+            canonical = str(module_name).upper()
+            aliases[canonical] = canonical
+            for sfr_name in info.get("sfr") or []:
+                if not isinstance(sfr_name, str):
+                    continue
+                stem = Path(sfr_name).stem
+                aliases[stem.lower()] = canonical
+                match = re.search(r"Ifx(\w+)_regdef", stem, re.IGNORECASE)
+                if match:
+                    aliases[match.group(1).upper()] = canonical
+    except Exception:
+        pass
+
+    _ILLD_MODULE_ALIAS_CACHE = aliases
+    return aliases
+
+
+def _canonicalize_illd_module(module: Optional[str] = None,
+                              filename: Optional[str] = None) -> str:
+    """Resolve iLLD upload module names to the canonical KG module name."""
+    aliases = _get_illd_module_aliases()
+    if module:
+        token = str(module).strip()
+        if token:
+            return aliases.get(token.upper(), token.upper())
+
+    if filename:
+        stem = Path(filename).stem
+        if stem.lower() in aliases:
+            return aliases[stem.lower()]
+        match = re.search(r"Ifx(\w+)_regdef", stem, re.IGNORECASE)
+        if match:
+            token = match.group(1).upper()
+            return aliases.get(token, token)
+
+    return "unknown"
+
+
+def _detect_upload_module(node_names: List[str], parsed_files: List[Any],
+                          explicit_module: Optional[str], workspace_id: str) -> str:
+    """Determine the canonical module for a sandbox upload batch."""
+    if explicit_module:
+        return _canonicalize_illd_module(explicit_module) if workspace_id == "illd" else explicit_module
+
+    detected = _detect_module_from_names(node_names)
+    if detected != "unknown":
+        return _canonicalize_illd_module(detected) if workspace_id == "illd" else detected
+
+    if workspace_id == "illd":
+        for parsed, filename in parsed_files:
+            canonical = _canonicalize_illd_module(parsed.get("module"), filename)
+            if canonical != "unknown":
+                return canonical
+
+    return "unknown"
+
+
 def _detect_module_from_names(node_names: List[str]) -> str:
     """Heuristic: extract module name from function names.
 
@@ -3224,7 +3664,7 @@ async def _sandbox_query(session_id: str, query: str, top_k: int = 10) -> str:
                                   "origin": r.origin, "node_type": r.node_type} for r in results],
                      "total_count": len(results)})
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "_sandbox_query")
 
 @mcp.tool()
 async def sandbox_status(session_id: str) -> str:
@@ -3251,7 +3691,7 @@ async def sandbox_status(session_id: str) -> str:
             return _err("INTERNAL_ERROR", "SandboxManager not available")
         return _ok(sm.get_status(session_id))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "sandbox_status")
 
 @mcp.tool()
 async def sandbox_clear(session_id: str) -> str:
@@ -3275,7 +3715,7 @@ async def sandbox_clear(session_id: str) -> str:
             return _err("INTERNAL_ERROR", "SandboxManager not available")
         return _ok(sm.destroy_sandbox(session_id))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "sandbox_clear")
 
 @mcp.tool()
 async def sandbox_diff(session_id: str) -> str:
@@ -3307,6 +3747,8 @@ async def sandbox_diff(session_id: str) -> str:
         sandbox = sm.get_sandbox(session_id)
         if not sandbox:
             return _err("INVALID_INPUT", f"No active sandbox for session '{session_id}'.")
+        # Properties that only exist in sandbox (not in prod) — exclude from comparison
+        _SANDBOX_ONLY_PROPS = {"source_file", "function_name"}
         diff = {
             "nodes_added": [],
             "nodes_modified": [],
@@ -3317,11 +3759,22 @@ async def sandbox_diff(session_id: str) -> str:
         for node_id, data in sandbox.graph.get_all_nodes():
             if data.get("_origin") == "sandbox":
                 if data.get("_shadows"):
-                    diff["nodes_modified"].append({
-                        "node_id": node_id,
-                        "original": data.get("_original_prod_properties", {}),
-                        "current": {k: v for k, v in data.items() if not k.startswith("_")},
-                    })
+                    original = data.get("_original_prod_properties", {})
+                    current = {k: v for k, v in data.items() if not k.startswith("_")}
+                    # Check if properties actually differ (ignoring sandbox-only metadata)
+                    orig_compare = {k: v for k, v in original.items() if k not in _SANDBOX_ONLY_PROPS}
+                    curr_compare = {k: v for k, v in current.items() if k not in _SANDBOX_ONLY_PROPS}
+                    # Only report as modified if shared properties actually differ
+                    shared_keys = set(orig_compare.keys()) & set(curr_compare.keys())
+                    has_real_diff = any(orig_compare[k] != curr_compare[k] for k in shared_keys)
+                    if has_real_diff:
+                        diff["nodes_modified"].append({
+                            "node_id": node_id,
+                            "original": original,
+                            "current": current,
+                        })
+                    else:
+                        diff["nodes_unchanged"] += 1
                 else:
                     diff["nodes_added"].append(node_id)
             else:
@@ -3332,7 +3785,7 @@ async def sandbox_diff(session_id: str) -> str:
                 diff["edges_added"] += 1
         return _ok(diff)
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "sandbox_diff")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -3368,7 +3821,7 @@ async def get_function_hsi(
           "summary_text": str  // Markdown-formatted SWUD HSI section
         }
     """
-    denied = _authorize("get_function_hsi")
+    denied = _authorize("get_function_hsi", profile=profile)
     if denied:
         return denied
     try:
@@ -3384,7 +3837,7 @@ async def get_function_hsi(
         return _ok(result)
     except Exception as exc:
         logger.exception("get_function_hsi failed")
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "get_function_hsi")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -3424,7 +3877,7 @@ async def rlm_orchestrate(
           "total_sub_queries": int, "total_tokens": int
         }
     """
-    denied = _authorize("rlm_orchestrate")
+    denied = _authorize("rlm_orchestrate", profile=profile)
     if denied:
         return denied
     try:
@@ -3460,12 +3913,20 @@ async def rlm_orchestrate(
         sub_q_count = len(result.steps) if hasattr(result, "steps") else 0
         RLM_SUBQUERIES.labels(task_type=task_type).observe(sub_q_count)
         result_dict = result.to_dict() if hasattr(result, "to_dict") else result
+        # F-P5-M01: per-DA LLM token consumption
+        if isinstance(result_dict, dict):
+            _tokens = int(result_dict.get("total_tokens", 0) or 0)
+            _current_tokens.set(_tokens)  # surfaced in the completion-time audit row (W-14)
+            DA_LLM_TOKENS.labels(
+                da_name=_current_da_name.get("unknown"), task_type=task_type,
+                llm_call_type="orchestrate",
+            ).inc(float(_tokens))
         if query_mode == "sandbox":
             result_dict["_origin"] = "hybrid"
         return _ok(result_dict)
     except Exception as exc:
         logger.exception("rlm_orchestrate failed")
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "rlm_orchestrate")
 
 @mcp.tool()
 @with_session_routing("rlm_plan_preview")
@@ -3496,7 +3957,7 @@ async def rlm_plan_preview(
           "total_steps": int, "task_type": str
         }
     """
-    denied = _authorize("rlm_plan_preview")
+    denied = _authorize("rlm_plan_preview", profile=profile)
     if denied:
         return denied
     try:
@@ -3514,7 +3975,7 @@ async def rlm_plan_preview(
             result_dict["_origin"] = "hybrid"
         return _ok(result_dict)
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "rlm_plan_preview")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -3542,7 +4003,7 @@ async def cache_get(query: str, session_id: Optional[str] = None) -> str:
     try:
         cs = _get_cache_service()
         return _ok(cs.get(query)) if cs else _err("INTERNAL_ERROR", "CacheService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "cache_get")
 
 @mcp.tool()
 @with_session_routing("cache_stats")
@@ -3568,7 +4029,7 @@ async def cache_stats(session_id: Optional[str] = None) -> str:
     try:
         cs = _get_cache_service()
         return _ok(cs.stats()) if cs else _err("INTERNAL_ERROR", "CacheService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "cache_stats")
 
 @mcp.tool()
 @with_session_routing("cache_invalidate_module")
@@ -3591,7 +4052,7 @@ async def cache_invalidate_module(module_name: str, session_id: Optional[str] = 
     try:
         cs = _get_cache_service()
         return _ok(cs.invalidate_module(module_name)) if cs else _err("INTERNAL_ERROR", "CacheService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "cache_invalidate_module")
 
 @mcp.tool()
 @with_session_routing("cache_clear")
@@ -3613,7 +4074,7 @@ async def cache_clear(tiers: Optional[List[str]] = None, session_id: Optional[st
     try:
         cs = _get_cache_service()
         return _ok(cs.clear(tiers)) if cs else _err("INTERNAL_ERROR", "CacheService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "cache_clear")
 
 
 @mcp.tool()
@@ -3643,7 +4104,7 @@ async def cache_refresh_config(session_id: Optional[str] = None) -> str:
     try:
         cs = _get_cache_service()
         return _ok(cs.refresh_config()) if cs else _err("INTERNAL_ERROR", "CacheService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "cache_refresh_config")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -3685,7 +4146,7 @@ async def submit_human_feedback(
           "pattern_stored": bool, "learning_updated": bool
         }
     """
-    denied = _authorize("submit_human_feedback")
+    denied = _authorize("submit_human_feedback", workspace_id=workspace_id)
     if denied:
         return denied
     try:
@@ -3709,11 +4170,17 @@ async def submit_human_feedback(
             response_context=response_context,
             profile=workspace_id,
         )
+        # F-P5-M01: per-DA review-outcome metric
+        DA_SESSION_OUTCOMES.labels(
+            da_name=_current_da_name.get("unknown"),
+            task_type=(task_type or _session_task_type(session_id)),
+            outcome=decision,
+        ).inc()
         return _ok(result)
     except ValueError as ve:
         return _err("INVALID_INPUT", str(ve))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "submit_human_feedback")
 
 @mcp.tool()
 @with_session_routing("get_learning_metrics")
@@ -3744,7 +4211,7 @@ async def get_learning_metrics(include_pattern_details: bool = False, session_id
             return _err("INTERNAL_ERROR", "FeedbackSink not available")
         return _ok(await asyncio.to_thread(sink.get_learning_metrics, include_pattern_details=include_pattern_details))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "get_learning_metrics")
 
 @mcp.tool()
 @with_session_routing("get_failure_patterns")
@@ -3775,9 +4242,15 @@ async def get_failure_patterns(module: Optional[str] = None, category: Optional[
         sink = _get_feedback_sink()
         if not sink:
             return _err("INTERNAL_ERROR", "FeedbackSink not available")
-        return _ok({"patterns": await asyncio.to_thread(sink.get_failure_patterns, module=module, category=category)})
+        _patterns = await asyncio.to_thread(sink.get_failure_patterns, module=module, category=category)
+        # F-P5-M01: count learned patterns surfaced to this DA
+        DA_PATTERN_HITS.labels(
+            da_name=_current_da_name.get("unknown"),
+            task_type=_session_task_type(session_id),
+        ).inc(len(_patterns) if hasattr(_patterns, "__len__") else 0)
+        return _ok({"patterns": _patterns})
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "get_failure_patterns")
 
 _result_processor = None
 
@@ -3858,7 +4331,7 @@ async def process_results(
         return _err("INVALID_INPUT", str(e))
     except Exception as exc:
         logger.exception("process_results failed")
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "process_results")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -3900,9 +4373,28 @@ async def evaluate_confidence(signals: Dict[str, Any], response_id: Optional[str
         result = calc.evaluate(signals=signals, response_id=response_id)
         route = result.get("review_type", "FULL") if isinstance(result, dict) else "FULL"
         REVIEW_ROUTING_TOTAL.labels(route=route).inc()
+        # W-14: archive the evaluated response so the da_productivity view's
+        # response / auto-rate columns reflect real activity (response_archive
+        # was previously never populated). Best-effort — never blocks the tool.
+        try:
+            pg = _get_postgres_client()
+            if pg and pg.available and isinstance(result, dict):
+                rid = result.get("response_id") or response_id
+                if rid:
+                    pg.archive_response(
+                        response_id=rid,
+                        session_id=session_id,
+                        tool_name="evaluate_confidence",
+                        review_type=route,
+                        confidence_score=int(result.get("confidence_score", 0) or 0),
+                    )
+        except Exception:
+            pass
+        # F-P5-M01: time-to-first-result per DA (first evaluate_confidence per session)
+        _emit_first_result_latency(session_id, signals)
         return _ok(result)
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "evaluate_confidence")
 
 @mcp.tool()
 @with_session_routing("complete_review")
@@ -3951,11 +4443,18 @@ async def complete_review(
         result = sink.complete_review(response_id=response_id, decision=decision,
                                        reviewer_id=reviewer_id, issues_found=issues_found,
                                        rationale=rationale)
+        # F-P5-M01: per-DA review-outcome metric — mirror submit_human_feedback so
+        # review-gate completions also appear in the productivity catalog.
+        DA_SESSION_OUTCOMES.labels(
+            da_name=_current_da_name.get("unknown"),
+            task_type=_session_task_type(session_id),
+            outcome=decision,
+        ).inc()
         return _ok(result)
     except ValueError as ve:
         return _err("INVALID_INPUT", str(ve))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "complete_review")
 
 @mcp.tool()
 @with_session_routing("override_review_routing")
@@ -4002,7 +4501,7 @@ async def override_review_routing(response_id: str, new_review_type: str, reason
     except ValueError as ve:
         return _err("INVALID_INPUT", str(ve))
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "override_review_routing")
 
 @mcp.tool()
 @with_session_routing("get_review_analytics")
@@ -4031,7 +4530,7 @@ async def get_review_analytics(session_id: Optional[str] = None) -> str:
             return _err("INTERNAL_ERROR", "FeedbackSink not available")
         return _ok(sink.get_review_analytics())
     except Exception as exc:
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "get_review_analytics")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -4056,7 +4555,7 @@ async def list_ontology_profiles(session_id: Optional[str] = None) -> str:
     try:
         os_svc = _get_ontology_service("illd")
         return _ok({"profiles": os_svc.list_profiles()}) if os_svc else _err("INTERNAL_ERROR", "OntologyService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "list_ontology_profiles")
 
 @mcp.tool()
 @with_session_routing("get_ontology_schema")
@@ -4095,7 +4594,7 @@ async def get_ontology_schema(
         if not os_svc: return _err("INTERNAL_ERROR", "OntologyService unavailable")
         return _ok(os_svc.get_schema(workspace_id, include_live_stats, node_type))
     except ValueError as ve: return _err("INVALID_INPUT", str(ve))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "get_ontology_schema")
 
 @mcp.tool()
 @with_session_routing("validate_entity")
@@ -4130,7 +4629,7 @@ async def validate_entity(entity_type: str, data: Dict[str, Any], context: str =
     try:
         os_svc = _get_ontology_service(context)
         return _ok(os_svc.validate_entity(entity_type, data, context)) if os_svc else _err("INTERNAL_ERROR", "OntologyService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "validate_entity")
 
 @mcp.tool()
 @with_session_routing("get_ontology_compliance")
@@ -4173,7 +4672,7 @@ async def get_ontology_compliance(module_name: str, ontology_profile: str = "ill
             result["_origin"] = "production"
             result["_note"] = "Compliance checked against production DB"
         return _ok(result)
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "get_ontology_compliance")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -4204,7 +4703,7 @@ async def get_graph_statistics(workspace_id: str = "illd", session_id: Optional[
     try:
         obs = _get_observability_service(workspace_id)
         return _ok(await asyncio.to_thread(obs.get_graph_statistics, workspace_id)) if obs else _err("INTERNAL_ERROR", "ObservabilityService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "get_graph_statistics")
 
 @mcp.tool()
 @with_session_routing("list_available_modules")
@@ -4244,7 +4743,7 @@ async def list_available_modules(include_stats: bool = False,
             return await _list_mcal_modules(include_stats)
         else:
             return _err("INVALID_INPUT", f"Unknown workspace_id '{workspace_id}'. Use 'illd' or 'mcal'.")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "list_available_modules")
 
 
 async def _list_illd_modules(include_stats: bool) -> str:
@@ -4348,7 +4847,7 @@ async def get_distribution(dimension: str, workspace_id: str = "illd", label: Op
         if not obs: return _err("INTERNAL_ERROR", "ObservabilityService unavailable")
         return _ok(await asyncio.to_thread(obs.get_distribution, dimension, workspace_id, label))
     except ValueError as ve: return _err("INVALID_INPUT", str(ve))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "get_distribution")
 
 @mcp.tool()
 @with_session_routing("get_coverage_report")
@@ -4377,7 +4876,7 @@ async def get_coverage_report(workspace_id: str = "illd", session_id: Optional[s
     try:
         obs = _get_observability_service(workspace_id)
         return _ok(await asyncio.to_thread(obs.get_coverage_report, workspace_id)) if obs else _err("INTERNAL_ERROR", "ObservabilityService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "get_coverage_report")
 
 @mcp.tool()
 @with_session_routing("detect_communities")
@@ -4417,7 +4916,7 @@ async def detect_communities(
     try:
         obs = _get_observability_service(workspace_id)
         return _ok(obs.detect_communities(workspace_id, node_types, min_community_size, store_in_graph)) if obs else _err("INTERNAL_ERROR", "ObservabilityService unavailable")
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "detect_communities")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -4461,7 +4960,7 @@ async def visualize_subgraph(
         from src.Configuration.services import VisualizationService
         viz = VisualizationService(neo4j_driver=_get_neo4j(workspace_id))
         return _ok(viz.visualize_subgraph(workspace_id, seed_nodes, filters, max_nodes, output_format))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "visualize_subgraph")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -4499,7 +4998,7 @@ async def get_token_info(token: str, session_id: Optional[str] = None) -> str:
                 return _err("INVALID_INPUT", "No cached token available. Call ensure_valid_token first.")
         from src.Configuration.services import AuthService
         return _ok(AuthService.get_token_info(token))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "get_token_info")
 
 @mcp.tool()
 @with_session_routing("ensure_valid_token")
@@ -4524,7 +5023,7 @@ async def ensure_valid_token(force_refresh: bool = False, session_id: Optional[s
     try:
         from src.Configuration.services import AuthService
         return _ok(AuthService.ensure_valid_token(force_refresh))
-    except Exception as e: return _err("INTERNAL_ERROR", str(e))
+    except Exception as e: return _err_from_exc(e, "ensure_valid_token")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -4574,7 +5073,7 @@ async def query_enhance(query: str, include_synonyms: bool = False, session_id: 
         return _ok(output)
     except Exception as exc:
         logger.exception("query_enhance failed")
-        return _err("INTERNAL_ERROR", str(exc))
+        return _err_from_exc(exc, "query_enhance")
 
 
 # ═════════════════════════════════════════════════════════════════════════

@@ -96,9 +96,18 @@ $ALL_MODULES = @(
 
 $moduleList = $ALL_MODULES -join ","
 
+# Resolve paths from script location
+$REPO_ROOT = (Resolve-Path "$PSScriptRoot\..\..\..").Path
+$HW_PIPELINE_SCRIPT = Join-Path $REPO_ROOT "src\HybridRAG\code\run_hw_um_pipeline.py"
+
+if (-not (Test-Path $HW_PIPELINE_SCRIPT)) {
+    Write-Host "  ERROR: run_hw_um_pipeline.py not found at: $HW_PIPELINE_SCRIPT" -ForegroundColor Red
+    exit 1
+}
+
 # Build command args
 $cmdArgs = @(
-    "src/HybridRAG/code/run_hw_um_pipeline.py",
+    $HW_PIPELINE_SCRIPT,
     "--module", $moduleList,
     "--device", "ALL",
     "--profile", $Profile,
@@ -116,13 +125,13 @@ if ($Only)         { $cmdArgs += "--only"; $cmdArgs += $Only }
 $cmdArgs += "--skip-token"
 
 Write-Host ""
-Write-Host "=" * 64
+Write-Host ("=" * 64)
 Write-Host "  HW UM Full Ingestion — All 18 Modules × All Devices"
 Write-Host "  Profile: $Profile  |  Project: $Project"
 Write-Host "  Modules: $moduleList"
 Write-Host "  Flags: DryRun=$DryRun NoImages=$NoImages Clear=$Clear SkipFetch=$SkipFetch AutoFetchVal=$AutoFetchVal"
 if ($Only) { Write-Host "  Only steps: $Only" }
-Write-Host "=" * 64
+Write-Host ("=" * 64)
 Write-Host ""
 
 $env:PYTHONIOENCODING = "utf-8"

@@ -36,6 +36,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from .context_builder import (
     AssembledContext, ContextBuilder, ContextBudget, ContextItem, ContextSlot,
+    estimate_tokens,
 )
 from .kg_node_utils import Source, classify_source
 
@@ -43,6 +44,22 @@ logger = logging.getLogger(__name__)
 
 MAX_STEPS = 6
 SUB_BUDGET = 8000
+
+# Sentinel returned by the default LLM when all retries fail. The planner treats
+# it as an unparseable plan (and falls back to the full query); synthesis treats
+# it as a degraded result and surfaces a `degraded` flag (F-CC-R02).
+_LLM_UNAVAILABLE_SENTINEL = "[LLM unavailable]"
+
+# ── Synthesis token budgeting (F-CC-R04) ─────────────────────────────
+# Tokens reserved for the synthesis response, and per-model context windows.
+_SYNTH_RESPONSE_TOKENS = 8000
+_DEFAULT_MODEL_CONTEXT_TOKENS = 32000
+_MODEL_CONTEXT_TOKENS = {
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4": 128000,
+    "gpt-5.2": 128000,
+}
 
 # ── Config-driven default alpha (MEG_SW-308) ─────────────────────────
 _DEFAULT_ALPHA: Optional[float] = None
@@ -59,6 +76,58 @@ def _get_default_alpha() -> float:
     except Exception:
         _DEFAULT_ALPHA = 0.6
     return _DEFAULT_ALPHA
+
+
+def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
+    """Extract the first complete JSON object from *raw* LLM output.
+
+    F-CC-R03: A greedy regex (``\\{[\\s\\S]*\\}``) matches from the first ``{`` to
+    the *last* ``}`` in the string, which breaks when the model emits trailing
+    prose, markdown fences, or multiple JSON-looking fragments. This brace-counting
+    scanner respects string literals and escape sequences, returning the first
+    *valid* JSON object and skipping malformed or non-dict brace fragments.
+
+    Returns the parsed ``dict`` or ``None`` when no valid object is present.
+    """
+    search_from = 0
+    n = len(raw)
+    while True:
+        start = raw.find("{", search_from)
+        if start == -1:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        end = None
+        for i in range(start, n):
+            c = raw[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+        if end is not None:
+            try:
+                parsed = json.loads(raw[start:end + 1])
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+        # Malformed, unbalanced, or non-dict block — resume at the next '{'.
+        search_from = start + 1
+
 
 # ── Shared httpx + OpenAI client (connection pooling) ─────────────────
 import threading as _threading
@@ -103,7 +172,7 @@ def _get_shared_openai_client():
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  Task Types — 24 types covering all 21 DAs
+#  Task Types — catalog covering the AI Domain Assistants
 # ═════════════════════════════════════════════════════════════════════════
 
 class RLMTaskType(str, Enum):
@@ -143,18 +212,20 @@ class RLMTaskType(str, Enum):
     GENERIC = "generic"
 
 
+# DA codes are the canonical AI Domain Assistant names from the Confluence
+# "AI Assistants" space (MCSWAI). Reference table only (not subscripted at runtime).
 DA_TASK_MAPPING: Dict[str, List[str]] = {
-    "GEST": ["test_generation"], "ACRA": ["code_review", "misra_review"],
-    "CIA": ["code_generation", "bugfix_analysis"], "CTA": ["code_transformation"],
-    "SAGA": ["architecture_analysis"], "PAGE": ["page_generation"],
-    "TripleA": ["traceability"], "KW": ["knowledge_ingestion"],
-    "SAVA": ["safety_validation"], "SASA": ["safety_analysis"],
-    "DaFaA": ["data_flow_analysis"], "HazopA": ["hazop_analysis"],
-    "GECA": ["config_generation"], "GEVT": ["test_verification"],
+    # ── Canonical AI Domain Assistants (Confluence MCSWAI) ──
+    "GEST": ["test_generation"], "GECA": ["config_generation"],
+    "GEVT": ["test_verification"], "ACRA": ["code_review", "misra_review"],
     "ATRA": ["architecture_traceability"], "ATQA": ["test_quality_analysis"],
-    "VoltAI": ["debug_analysis"], "REVA": ["requirement_review"],
-    "StopTyping": ["stop_typing"], "PRQ_Drafter": ["requirement_drafting"],
-    "RMA": ["requirement_management"],
+    "TripleA": ["traceability"], "REVA": ["requirement_review"],
+    "SAVA": ["safety_validation"], "SASA": ["safety_analysis"],
+    "DaFaA": ["data_flow_analysis"], "HAZOPA": ["hazop_analysis"],
+    "PRQGEN": ["requirement_drafting"], "SWQMA": ["quality_management"],
+    "J-WIZ": ["java_code_generation"], "Zephyr": ["zephyr_soc_generation"],
+    # ── Embedded Driver Assistant (iLLD workspace) ──
+    "EDA": ["code_generation"],
 }
 
 
@@ -185,6 +256,7 @@ class RLMContext:
     module: str = ""
     profile: str = ""
     task_type: str = "generic"
+    degraded: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -196,6 +268,7 @@ class RLMContext:
             "module": self.module,
             "profile": self.profile,
             "task_type": self.task_type,
+            "degraded": self.degraded,
             "sub_query_trace": [
                 {"step": s.step_id, "intent": s.intent, "query": s.query,
                  "alpha": s.alpha, "sources": s.sources_n, "tokens": s.tokens}
@@ -227,7 +300,7 @@ _PLAN_CONTEXT = {
         "Use alpha=0.8 for structural tracing, alpha=0.4 for semantic similarity."
     ),
     "requirement_drafting": (
-        "Requirement drafting for AUTOSAR MCAL PRQ (Domain Assistant: PRQ Drafter). "
+        "Requirement drafting for AUTOSAR MCAL PRQ (Domain Assistant: PRQGEN). "
         "Gather: existing requirements for style reference, SHRQ parent chain, "
         "HW register specs for technical accuracy, AUTOSAR SWS references, "
         "naming conventions and ID patterns, ASIL inheritance rules, "
@@ -235,14 +308,14 @@ _PLAN_CONTEXT = {
         "Use alpha=0.6 balanced. Include HW register sub-query."
     ),
     "requirement_management": (
-        "Requirement management (Domain Assistant: RMA). "
+        "Requirement management. "
         "Gather: full traceability chains (Req→Arch→Code→Test→Result), "
         "coverage gaps (missing_code, missing_test), orphan artifacts, "
         "status distribution, ASIL distribution, impact analysis, cross-module deps. "
         "Use alpha=0.8 for structural traversal."
     ),
     "architecture_analysis": (
-        "SW architecture analysis (Domain Assistant: SAGA). "
+        "SW architecture analysis. "
         "Gather: SWA architectural decisions (§3.1), call sequences (§3.2), "
         "safety views and trusted boundaries (§3.3/§3.4), HW peripheral deps, "
         "SW dependencies, config container hierarchy, source file organisation, "
@@ -257,7 +330,7 @@ _PLAN_CONTEXT = {
         "Use alpha=0.8 throughout — structural graph traversal."
     ),
     "code_generation": (
-        "AUTOSAR MCAL code generation on Infineon AURIX TC3xx (Domain Assistant: CIA). "
+        "AUTOSAR MCAL code generation on Infineon AURIX TC3xx (Domain Assistant: EDA). "
         "Gather: API function signatures, struct/enum definitions, dependency chains, "
         "HW register specs, MISRA C:2012 rules, existing approved patterns, "
         "AUTOSAR SWS API contracts, SWUD function-level design. "
@@ -265,14 +338,14 @@ _PLAN_CONTEXT = {
         "Use exact TC3xx register names."
     ),
     "code_transformation": (
-        "Code transformation (Domain Assistant: CTA). "
+        "Code transformation. "
         "Gather: source code to transform, target API contracts/patterns, "
         "MISRA rules for transformation, dependency graphs, register-level diffs "
         "(TC3xx→TC4xx), AUTOSAR migration patterns, config parameter changes. "
         "Use alpha=0.5 balanced."
     ),
     "bugfix_analysis": (
-        "Bugfix analysis for AUTOSAR MCAL on Infineon AURIX TC3xx (Domain Assistant: CIA). "
+        "Bugfix analysis for AUTOSAR MCAL on Infineon AURIX TC3xx. "
         "This task handles targeted fixing of compiler warnings, Polyspace findings (Bugfinder + CodeProver), "
         "and MISRA C:2012 violations in existing driver source code. "
         "Gather: warning/error details (full text, severity, file, line), "
@@ -302,7 +375,7 @@ _PLAN_CONTEXT = {
         "Use alpha=0.8 for hierarchy, alpha=0.4 for semantic."
     ),
     "page_generation": (
-        "Documentation generation (Domain Assistant: PAGE). "
+        "Documentation generation. "
         "Gather: API signatures/params/returns, module overview, "
         "init/usage sequences, config parameters, error codes, "
         "HW peripheral overview, cross-references, safety classification, "
@@ -356,7 +429,7 @@ _PLAN_CONTEXT = {
         "Use alpha=0.7 mostly structural."
     ),
     "hazop_analysis": (
-        "HAZOP analysis (Domain Assistant: HazopA). "
+        "HAZOP analysis (Domain Assistant: HAZOPA). "
         "Gather: interface definitions (params, types, ranges), guide word analysis "
         "(no output, wrong output, late, early, stuck, oscillating), "
         "HW register failure modes, existing safety measures, threat analysis, "
@@ -379,21 +452,21 @@ _PLAN_CONTEXT = {
         "Use alpha=0.8 throughout — structural graph traversal."
     ),
     "debug_analysis": (
-        "Embedded SW debug analysis on AURIX TC3xx (Domain Assistant: VoltAI). "
+        "Embedded SW debug analysis on AURIX TC3xx. "
         "Gather: HW register specs, known errata, similar bug patterns, "
         "driver source code + callers, DMA/interrupt interactions, "
         "timing-sensitive paths (WCET, polling), affecting config params, VP test results. "
         "Use alpha=0.6 balanced."
     ),
     "knowledge_ingestion": (
-        "Knowledge ingestion planning (Domain Assistant: KW). "
+        "Knowledge ingestion planning. "
         "Gather: current graph statistics, ontology profiles, parser capabilities, "
         "existing ingestion status, schema compliance, missing knowledge areas, "
         "cross-module dependency map. "
         "Use alpha=0.8 for structural graph metadata."
     ),
     "stop_typing": (
-        "Quick lookup (Domain Assistant: StopTyping). "
+        "Quick lookup. "
         "Keep plan SHORT (2-3 sub-queries max): primary entity lookup, "
         "immediate context (params, return type, parent), one level of relationships. "
         "Do NOT over-decompose. Speed over comprehensiveness. "
@@ -646,9 +719,10 @@ class RLMOrchestrator:
             return _call()
         except Exception as e:
             logger.error("[RLM] LLM call failed after retries: %s", e)
-            return json.dumps({"reasoning": "LLM unavailable", "steps": [
-                {"step_id": 1, "intent": "fallback single query", "query": user[:200], "alpha": _get_default_alpha()}
-            ]})
+            # F-CC-R02/R03: return a non-JSON sentinel so the planner falls back
+            # using the full original query (see _plan) instead of a truncated
+            # slice of the wrapped prompt, and synthesis surfaces a clear marker.
+            return _LLM_UNAVAILABLE_SENTINEL
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -689,7 +763,7 @@ class RLMOrchestrator:
                 on_progress(i + 2, total_steps, f"Sub-query {i+1}/{len(steps)} done")
 
         # Step 3: Synthesize
-        final, synth_tokens = self._synthesize(query, tt, accumulated, session_context)
+        final, synth_tokens, degraded = self._synthesize(query, tt, accumulated, session_context)
         total_tokens += synth_tokens
         if on_progress:
             on_progress(total_steps, total_steps, "Synthesis complete")
@@ -706,6 +780,7 @@ class RLMOrchestrator:
             module=self.module,
             profile=self.profile,
             task_type=tt,
+            degraded=degraded,
         )
 
     def plan_preview(self, query: str, task_type: str = "generic") -> Dict[str, Any]:
@@ -721,20 +796,17 @@ class RLMOrchestrator:
         user = f"Module: {self.module} | Profile: {self.profile}\n\nTask: {query}"
 
         raw = self._llm_fn(system, user, max_tokens=1200)
-        tokens = len(raw) // 4
+        tokens = estimate_tokens(raw)
 
-        try:
-            # Extract JSON from response
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                plan = json.loads(json_match.group())
-            else:
-                plan = {"reasoning": "No JSON in response", "steps": [
-                    {"step_id": 1, "intent": "direct query", "query": query[:200], "alpha": _get_default_alpha()}
-                ]}
-        except json.JSONDecodeError:
-            plan = {"reasoning": "JSON parse failed", "steps": [
-                {"step_id": 1, "intent": "direct query", "query": query[:200], "alpha": _get_default_alpha()}
+        # F-CC-R03: brace-counting extraction tolerates trailing prose / fences.
+        plan = _extract_json_object(raw)
+        if not isinstance(plan, dict) or "steps" not in plan:
+            logger.warning(
+                "[RLM] Planner returned no parseable plan; falling back. Raw: %r",
+                raw[:300],
+            )
+            plan = {"reasoning": "fallback", "steps": [
+                {"step_id": 1, "intent": "direct query", "query": query, "alpha": _get_default_alpha()}
             ]}
 
         return plan, tokens
@@ -811,7 +883,7 @@ class RLMOrchestrator:
         else:
             answer = f"[No search function — step {step_id}: {intent}]"
 
-        tokens = len(answer) // 4
+        tokens = estimate_tokens(answer)
         elapsed = time.time() - t0
 
         return SubQueryStep(
@@ -826,16 +898,53 @@ class RLMOrchestrator:
                     session_context: Optional[List]) -> tuple:
         instruction = _SYNTH_INSTRUCTIONS.get(task_type, _SYNTH_INSTRUCTIONS["generic"])
 
-        # Build synthesis prompt
-        parts = [f"Original task: {query}\n"]
-        if session_context:
-            parts.append(f"Session context: {json.dumps(session_context[:5], default=str)[:500]}\n")
-        for step_id, answer in sorted(accumulated.items()):
-            parts.append(f"--- Sub-query {step_id} ---\n{answer[:6000]}\n")
-
+        # F-CC-R04: model-aware token budget instead of a hard-coded per-answer
+        # char cap. Sub-query answers are admitted until the model context window
+        # (minus reserved response + scaffolding headroom) is exhausted.
+        model = os.environ.get("RLM_ROOT_MODEL", "gpt-4o")
+        max_ctx = _MODEL_CONTEXT_TOKENS.get(model, _DEFAULT_MODEL_CONTEXT_TOKENS)
         system = f"You are a synthesis engine. {instruction}"
+
+        header = f"Original task: {query}\n"
+        parts = [header]
+        used = estimate_tokens(system) + estimate_tokens(header)
+        if session_context:
+            ctx_str = f"Session context: {json.dumps(session_context[:5], default=str)[:500]}\n"
+            parts.append(ctx_str)
+            used += estimate_tokens(ctx_str)
+
+        # Reserve headroom for the response and prompt scaffolding.
+        budget = max_ctx - _SYNTH_RESPONSE_TOKENS - 1000
+        for step_id, answer in sorted(accumulated.items()):
+            block = f"--- Sub-query {step_id} ---\n{answer}\n"
+            block_tokens = estimate_tokens(block)
+            if used + block_tokens > budget:
+                remaining = budget - used
+                if remaining > 200:
+                    approx_chars = max(0, remaining * 4)
+                    parts.append(
+                        f"--- Sub-query {step_id} (truncated) ---\n{answer[:approx_chars]}\n"
+                    )
+                logger.info(
+                    "[RLM] Synthesis token budget (%d) reached at sub-query %d",
+                    budget, step_id,
+                )
+                break
+            parts.append(block)
+            used += block_tokens
+
         user = "\n".join(parts)
 
-        final = self._llm_fn(system, user, max_tokens=8000)
-        tokens = len(final) // 4
-        return final, tokens
+        # F-CC-R02: surface synthesis degradation instead of passing the LLM
+        # failure sentinel off as real content. Handles both the default LLM
+        # sentinel and arbitrary llm_fn exceptions; callers see degraded=True.
+        try:
+            final = self._llm_fn(system, user, max_tokens=_SYNTH_RESPONSE_TOKENS)
+        except Exception as exc:
+            logger.error("[RLM] Synthesis LLM call failed: %s", exc)
+            return "[LLM synthesis unavailable]", 0, True
+        if not final or final.strip() == _LLM_UNAVAILABLE_SENTINEL:
+            logger.warning("[RLM] Synthesis degraded: LLM unavailable")
+            return "[LLM synthesis unavailable]", 0, True
+        tokens = estimate_tokens(final)
+        return final, tokens, False

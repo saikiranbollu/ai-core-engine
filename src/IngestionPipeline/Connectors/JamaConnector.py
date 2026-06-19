@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import ssl
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
@@ -19,6 +20,8 @@ from urllib import parse as urlparse
 import httpx
 
 from ..config import get_max_workers
+from src._common.path_safety import allowed_roots_from_env, safe_path_under
+from src._common.tls_config import enforce_tls_policy
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,8 @@ class JamaItem:
     sequence: str = ""
     locked: bool = False
     status: int = -1
+    status_text: str = ""
+    importance: str = ""
     # Raw fields dict preserved for extensibility
     raw_fields: Dict[str, Any] = field(default_factory=dict)
 
@@ -199,6 +204,7 @@ class JamaConnector:
         verify_ssl: bool = True,
         sync_state_dir: Optional[Union[str, Path]] = None,
     ) -> None:
+        verify_ssl = enforce_tls_policy(verify_ssl)
         # Normalise URL: strip trailing slash
         self._base_url = base_url.rstrip("/")
         self._api_root = api_root.rstrip("/")
@@ -220,15 +226,25 @@ class JamaConnector:
             headers={"Accept": "application/json"},
         )
 
-        # Sync-state persistence
-        self._sync_state_dir: Optional[Path] = (
-            Path(sync_state_dir) if sync_state_dir else None
-        )
-        if self._sync_state_dir is not None:
+        # Sync-state persistence (F-CF-X04: contain under an allowed root before
+        # creating it; AICE_SYNC_STATE_ROOTS overrides the defaults).
+        if sync_state_dir is not None:
+            sync_roots = allowed_roots_from_env(
+                "AICE_SYNC_STATE_ROOTS",
+                ["/data/aice/sync_state", tempfile.gettempdir()],
+            )
+            self._sync_state_dir: Optional[Path] = safe_path_under(
+                sync_state_dir, sync_roots
+            )
             self._sync_state_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._sync_state_dir = None
 
         # In-memory sync state cache  {project_id: SyncState}
         self._sync_states: Dict[int, SyncState] = {}
+
+        # Picklist resolution cache  {picklist_id: {option_id: name}}
+        self._picklist_cache: Dict[int, Dict[int, str]] = {}
 
         self._connected: bool = False
         self._max_workers = get_max_workers("connectors.jama")
@@ -251,6 +267,57 @@ class JamaConnector:
         """Close the underlying HTTP client."""
         self._client.close()
         logger.debug("HTTP client closed.")
+
+    # ------------------------------------------------------------------
+    # Picklist resolution  (resolve integer IDs → human-readable labels)
+    # ------------------------------------------------------------------
+
+    # Well-known picklist IDs for Requirement (itemType 83) fields
+    _STATUS_PICKLIST_ID = 63
+    _IMPORTANCE_PICKLIST_ID = 2811
+
+    def _resolve_picklist(self, picklist_id: int) -> Dict[int, str]:
+        """Fetch and cache picklist options {option_id: name}."""
+        if picklist_id in self._picklist_cache:
+            return self._picklist_cache[picklist_id]
+
+        try:
+            resp = self._request("GET", f"/picklists/{picklist_id}/options")
+            options = resp.get("data", [])
+            mapping = {int(opt["id"]): opt["name"] for opt in options}
+        except Exception as exc:
+            logger.warning("Failed to resolve picklist %d: %s", picklist_id, exc)
+            mapping = {}
+
+        self._picklist_cache[picklist_id] = mapping
+        return mapping
+
+    def resolve_status(self, status_id: int) -> str:
+        """Resolve a status integer ID to its label (e.g. 293 → 'Approved')."""
+        if status_id < 0:
+            return ""
+        mapping = self._resolve_picklist(self._STATUS_PICKLIST_ID)
+        return mapping.get(status_id, str(status_id))
+
+    def resolve_importance(self, importance_id: int) -> str:
+        """Resolve an importance integer ID to its label (e.g. 1524 → 'Mandatory')."""
+        if importance_id < 0:
+            return ""
+        mapping = self._resolve_picklist(self._IMPORTANCE_PICKLIST_ID)
+        return mapping.get(importance_id, str(importance_id))
+
+    def enrich_items(self, items: List["JamaItem"]) -> List["JamaItem"]:
+        """Resolve picklist IDs on items to human-readable text.
+
+        Populates ``status_text`` and ``importance`` fields.
+        """
+        for item in items:
+            item.status_text = self.resolve_status(item.status)
+            # importance field uses itemType-qualified key
+            imp_raw = item.raw_fields.get(f"importance${item.item_type}", -1)
+            if isinstance(imp_raw, int) and imp_raw > 0:
+                item.importance = self.resolve_importance(imp_raw)
+        return items
 
     # ------------------------------------------------------------------
     # Connection validation  (AICE-ING-003 – authentication working)

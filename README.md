@@ -10,7 +10,7 @@ Multiple access points:
 
 - VS Code Extension (e.g., CARL The Coder)
 - CLI tools (technology supported but not available in IFX)
-- MCP server (available for IFX users from Jan 2026)
+- MCP server — 55 tools across 14 categories (available for IFX users from Jan 2026)
 - GitHub Copilot prompt
 - GPT4IFX API
 

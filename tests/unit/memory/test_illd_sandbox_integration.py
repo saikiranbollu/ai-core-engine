@@ -114,7 +114,7 @@ class TestParserRouting:
         c_file = tmp_path / "IfxAdc_init.c"
         c_file.write_text("void IfxAdc_initModule(void) { }")
 
-        with patch('src.IngestionPipeline.Parsers.c_parser.parse',
+        with patch('src.IngestionPipeline.parsers.c_parser.parse',
                    return_value={"type": "c_source", "functions": [], "file": str(c_file)}):
             result = dispatcher.parse(c_file)
             assert result["type"] == "c_source"
@@ -124,7 +124,7 @@ class TestParserRouting:
         h_file = tmp_path / "IfxAdc.h"
         h_file.write_text("void IfxAdc_doSomething(void);")
 
-        with patch('src.IngestionPipeline.Parsers.c_parser.parse',
+        with patch('src.IngestionPipeline.parsers.c_parser.parse',
                    return_value={"type": "c_header", "functions": [], "file": str(h_file)}):
             result = dispatcher.parse(h_file)
             assert result["type"] == "c_header"
@@ -135,7 +135,7 @@ class TestParserRouting:
         swa_file = tmp_path / "Adc_swa.h"
         swa_file.write_text("/* MCAL swa header */")
 
-        with patch('src.IngestionPipeline.Parsers.c_parser.parse',
+        with patch('src.IngestionPipeline.parsers.c_parser.parse',
                    return_value={"type": "c_header", "functions": [], "file": str(swa_file)}):
             result = dispatcher.parse(swa_file)
             assert result["type"] == "c_header"

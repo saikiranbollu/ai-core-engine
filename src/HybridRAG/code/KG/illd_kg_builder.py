@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError, TransientError
 
-from src.HybridRAG.code.KG._kg_safety import sanitize_label, sanitize_property
+from _kg_safety import sanitize_label, sanitize_property
 
 logger = logging.getLogger("illd_kg_builder")
 
@@ -181,9 +181,15 @@ class ILLDKGBuilder:
         return []
 
     def _clear_database(self):
-        logger.warning("Clearing ALL data in database '%s' …", self.neo4j_cfg["database"])
-        self._write("MATCH (n) DETACH DELETE n")
-        logger.info("Database cleared.")
+        logger.warning(
+            "Clearing module '%s' data from database '%s' …",
+            self.module, self.neo4j_cfg["database"],
+        )
+        self._write(
+            "MATCH (n {module: $module}) DETACH DELETE n",
+            {"module": self.module},
+        )
+        logger.info("Module '%s' data cleared.", self.module)
 
     # -- Batch helpers ------------------------------------------------------
 
@@ -691,7 +697,7 @@ class ILLDKGBuilder:
     # 2. SFR ingestion (sfr_parser output)
     # =====================================================================
 
-    def ingest_sfr(self, sfr_data: dict):
+    def ingest_sfr(self, sfr_data: dict, source_file: str = None):
         """
         Ingest SFR parser output → HardwareRegister + RegisterField nodes.
 

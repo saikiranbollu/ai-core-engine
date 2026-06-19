@@ -6,7 +6,7 @@ Extracts requirement blocks (uid, title, description) from Doxygen-annotated
 files.
 
 Usage:
-    from IngestionPipeline.Parsers import doxygen_parser
+    from IngestionPipeline.parsers import doxygen_parser
 
     requirements = doxygen_parser.parse("path/to/doxygen_file.h")
     # returns a list of dicts with uid, title, description

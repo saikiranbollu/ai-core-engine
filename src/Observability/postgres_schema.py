@@ -44,14 +44,18 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     workspace_id    VARCHAR(50) DEFAULT 'illd',
     session_id      VARCHAR(200),
     caller_api_key  VARCHAR(100),
+    correlation_id  VARCHAR(64),
     parameters      JSONB,
     response_code   VARCHAR(50),
     duration_ms     INTEGER,
     token_count     INTEGER
 );
+-- Migration for pre-existing audit_logs tables (W-13 / F-CB-04):
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS correlation_id VARCHAR(64);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_tool ON audit_logs(tool_name);
 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_logs(session_id);
+CREATE INDEX IF NOT EXISTS idx_audit_correlation ON audit_logs(correlation_id);
 
 -- ASPICE Observability: Response Archive
 CREATE TABLE IF NOT EXISTS response_archive (
@@ -141,6 +145,63 @@ CREATE TABLE IF NOT EXISTS sessions_meta (
     store_keys      JSONB DEFAULT '[]',
     context_count   INTEGER DEFAULT 0
 );
+
+-- W-14: Per-DA productivity rollup (Pass 5 §4.3).
+-- Aggregates each Digital Assistant's sessions, tool calls, tokens, and
+-- review/feedback outcomes. Each source table is aggregated in its own CTE so
+-- join fan-out cannot inflate the counts/sums.
+CREATE OR REPLACE VIEW da_productivity AS
+WITH sess AS (
+    SELECT assistant_name AS da_name,
+           COUNT(*) AS sessions,
+           COALESCE(AVG(EXTRACT(EPOCH FROM (closed_at - created_at)))
+                    FILTER (WHERE closed_at IS NOT NULL), 0)::numeric(12,2)
+                                                          AS avg_session_seconds
+    FROM sessions_meta
+    GROUP BY assistant_name
+),
+calls AS (
+    SELECT s.assistant_name AS da_name,
+           COUNT(a.id) AS tool_calls,
+           COALESCE(SUM(a.token_count), 0) AS total_tokens
+    FROM sessions_meta s
+    JOIN audit_logs a ON a.session_id = s.session_id
+    GROUP BY s.assistant_name
+),
+resp AS (
+    SELECT s.assistant_name AS da_name,
+           COUNT(r.response_id) AS responses,
+           COUNT(*) FILTER (WHERE r.review_type = 'AUTO') AS auto_responses
+    FROM sessions_meta s
+    JOIN response_archive r ON r.session_id = s.session_id
+    GROUP BY s.assistant_name
+),
+fb AS (
+    SELECT s.assistant_name AS da_name,
+           COUNT(*) FILTER (WHERE f.decision = 'APPROVE') AS approvals,
+           COUNT(*) FILTER (WHERE f.decision = 'REJECT')  AS rejections
+    FROM sessions_meta s
+    JOIN response_archive r ON r.session_id = s.session_id
+    JOIN feedback_records f ON f.response_id = r.response_id
+    GROUP BY s.assistant_name
+)
+SELECT
+    sess.da_name,
+    sess.sessions,
+    sess.avg_session_seconds,
+    COALESCE(calls.tool_calls, 0)    AS tool_calls,
+    COALESCE(calls.total_tokens, 0)  AS total_tokens,
+    COALESCE(resp.responses, 0)      AS responses,
+    COALESCE(resp.auto_responses, 0) AS auto_responses,
+    CASE WHEN COALESCE(resp.responses, 0) > 0
+         THEN ROUND(resp.auto_responses::numeric / resp.responses, 3)
+         ELSE 0 END                  AS auto_rate,
+    COALESCE(fb.approvals, 0)        AS approvals,
+    COALESCE(fb.rejections, 0)       AS rejections
+FROM sess
+LEFT JOIN calls ON calls.da_name = sess.da_name
+LEFT JOIN resp  ON resp.da_name  = sess.da_name
+LEFT JOIN fb    ON fb.da_name    = sess.da_name;
 """
 
 
@@ -193,7 +254,9 @@ class PostgresClient:
 
     def log_audit(self, tool_name: str, workspace_id: str = "illd",
                   session_id: Optional[str] = None, parameters: Optional[Dict] = None,
-                  response_code: str = "ok", duration_ms: int = 0, token_count: int = 0):
+                  response_code: str = "ok", duration_ms: int = 0, token_count: int = 0,
+                  caller_api_key: Optional[str] = None,
+                  correlation_id: Optional[str] = None):
         """Log an MCP tool invocation for ASPICE compliance."""
         if not self._available:
             return
@@ -201,9 +264,11 @@ class PostgresClient:
             with self._conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO audit_logs (tool_name, workspace_id, session_id, "
-                    "parameters, response_code, duration_ms, token_count) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    "caller_api_key, correlation_id, parameters, response_code, "
+                    "duration_ms, token_count) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (tool_name, workspace_id, session_id,
+                     caller_api_key, correlation_id,
                      json.dumps(parameters or {}), response_code, duration_ms, token_count)
                 )
         except Exception as e:

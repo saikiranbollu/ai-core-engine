@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -441,6 +442,69 @@ def _is_connection_error(exc: Exception) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Post-processing — deterministic fixes applied after LLM output
+# ---------------------------------------------------------------------------
+
+_SECTION_HEADING_RE = re.compile(
+    r"^(#{1,6})\s+(\d+(?:\.\d+)*)\s+(.*)$", re.MULTILINE
+)
+
+_PAGE_MARKER_RE = re.compile(
+    r"^## Pages?\s+\d+(?:\s*[–\-]\s*\d+)?\s*\n?", re.MULTILINE
+)
+
+
+def _fix_numbered_heading_levels(text: str) -> str:
+    """Fix heading levels based on section numbers (deterministic)."""
+    def _replace(m: re.Match) -> str:
+        number = m.group(2)
+        title = m.group(3)
+        level = max(1, min(6, len(number.split("."))))
+        return f"{'#' * level} {number} {title}"
+
+    return _SECTION_HEADING_RE.sub(_replace, text)
+
+
+def _remove_repeated_page_titles(text: str) -> str:
+    """Remove chapter-level headings that repeat across pages (PDF headers)."""
+    chapter_re = re.compile(r"^(# \d+\s+.+)$", re.MULTILINE)
+    matches = chapter_re.findall(text)
+    if not matches:
+        return text
+
+    counts = Counter(matches)
+    duplicates = {h for h, c in counts.items() if c > 2}
+    if not duplicates:
+        return text
+
+    seen: set[str] = set()
+
+    def _dedup(m: re.Match) -> str:
+        heading = m.group(1)
+        if heading in duplicates:
+            if heading in seen:
+                return ""
+            seen.add(heading)
+        return heading
+
+    result = chapter_re.sub(_dedup, text)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result
+
+
+def postprocess_markdown(text: str) -> str:
+    """Apply all deterministic post-processing to joined LLM markdown output.
+
+    Removes page markers, fixes heading levels, and deduplicates page titles.
+    """
+    text = _PAGE_MARKER_RE.sub("", text)
+    text = _fix_numbered_heading_levels(text)
+    text = _remove_repeated_page_titles(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() + "\n"
+
+
 def convert_pdf_to_md(
     pdf_path: Path,
     output_path: Path,
@@ -615,6 +679,9 @@ def convert_pdf_to_md(
 
     if pbar:
         pbar.close()
+
+    # Apply deterministic post-processing (heading fix + dedup page titles)
+    full_md = postprocess_markdown(full_md)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(full_md, encoding="utf-8")

@@ -20,7 +20,7 @@ treated as an EA model file / connection string.
 
 Usage::
 
-    from IngestionPipeline.Parsers import ea_parser
+    from IngestionPipeline.parsers import ea_parser
 
     # From a pre-exported pyDump directory (no EA required)
     result = ea_parser.parse(

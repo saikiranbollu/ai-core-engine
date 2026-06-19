@@ -142,8 +142,8 @@ class TestPipelineOrdering:
         # Patch _graph_search to return canned results, skip actual Neo4j
         svc._graph_search = MagicMock(return_value=canned)
 
-        # Patch _merge_results_rrf to pass through
-        svc._merge_results_rrf = MagicMock(return_value=list(canned))
+        # Patch _merge_results_weighted to pass through
+        svc._merge_results_weighted = MagicMock(return_value=list(canned))
 
         # Patch _entity_targeted_lookup and _aggregation_search
         svc._entity_targeted_lookup = MagicMock(return_value=[])

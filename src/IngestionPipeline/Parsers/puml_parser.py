@@ -14,7 +14,7 @@ Accepts a single ``.puml`` file **or** a directory containing multiple
 
 Usage::
 
-    from IngestionPipeline.Parsers import puml_parser
+    from IngestionPipeline.parsers import puml_parser
 
     # Single file
     result = puml_parser.parse("diagram.puml")

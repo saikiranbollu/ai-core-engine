@@ -15,7 +15,7 @@ Features:
 
 Usage::
 
-    from IngestionPipeline.Parsers import illd_swa_parser
+    from IngestionPipeline.parsers import illd_swa_parser
 
     # Pure parsing — no LLM, no network
     result = illd_swa_parser.parse("IfxCxpi_swa.h")
@@ -67,7 +67,18 @@ class _SWAExtractor:
 
     # ── section extraction ───────────────────────────────────────────
 
+    # Maps the logical section name used by extract_* methods to the
+    # keyword suffixes found in Doxygen \addtogroup tags.
+    _ADDTOGROUP_KEYWORDS: Dict[str, List[str]] = {
+        "macros":                     ["_Macro", "_Macros"],
+        "type definitions":           ["_Typedef", "_TypeDefinitions"],
+        "enumerations":               ["_Enum", "_Enumerations"],
+        "data structures":            ["_Data_Structures", "_DataStructures"],
+        "global function prototypes": ["_Functions", "_APIs"],
+    }
+
     def _section(self, name: str) -> str:
+        # 1. Old-style section markers: /*--- Name ---*/
         pat = r'/\*[-]+([\w\s]+)[-]+\*/'
         matches = list(re.finditer(pat, self._content))
         for i, m in enumerate(matches):
@@ -75,6 +86,42 @@ class _SWAExtractor:
                 start = m.end()
                 end = len(self._content) if i + 1 >= len(matches) else matches[i + 1].start()
                 return self._content[start:end]
+
+        # 2. Doxygen \addtogroup style
+        #    Handles both:  /** \addtogroup Name   (single-line, e.g. Cxpi)
+        #    and:  /**\n* \addtogroup Name          (multi-line, e.g. Ramc)
+        keywords = self._ADDTOGROUP_KEYWORDS.get(name.strip().lower(), [])
+        if not keywords:
+            return ""
+
+        # Match \addtogroup anywhere (inside /** ... */ blocks of any style)
+        addtogroup_matches = list(
+            re.finditer(r'\\addtogroup\s+(\S+)', self._content)
+        )
+        for i, m in enumerate(addtogroup_matches):
+            group_name = m.group(1)
+            if any(kw.lower() in group_name.lower() for kw in keywords):
+                start = m.end()
+                # Skip \{ opener (handles "* \{" or "\{ */")
+                open_brace = re.search(r'\\{', self._content[start:start + 200])
+                if open_brace:
+                    # Advance past the closing */ of the opener comment block
+                    after_brace = start + open_brace.end()
+                    close_comment = re.search(r'\*/', self._content[after_brace:after_brace + 50])
+                    if close_comment:
+                        start = after_brace + close_comment.end()
+                # Section ends at next \addtogroup marker
+                end = (
+                    addtogroup_matches[i + 1].start()
+                    if i + 1 < len(addtogroup_matches)
+                    else len(self._content)
+                )
+                # Or at closing \} marker — whichever comes first
+                close = re.search(r'\\}', self._content[start:end])
+                if close:
+                    end = start + close.start()
+                return self._content[start:end]
+
         return ""
 
     # ── macros ───────────────────────────────────────────────────────
@@ -152,14 +199,14 @@ class _SWAExtractor:
 
     # ── functions ────────────────────────────────────────────────────
 
-    def extract_functions(self) -> List[Dict[str, Any]]:
-        section = self._section('Global Function Prototypes') or self._content
+    def _parse_function_declarations(self, text: str) -> List[Dict[str, Any]]:
+        """Run the function-prototype regex over *text* and return parsed dicts."""
         out: List[Dict[str, Any]] = []
-        for m in re.finditer(r'([\w\s\*]+)\s+(\w+)\s*\(([^)]*)\)\s*;', section):
+        for m in re.finditer(r'([\w\s\*]+)\s+(\w+)\s*\(([^)]*)\)\s*;', text):
             ret = m.group(1).strip()
             name = m.group(2).strip()
             params_str = m.group(3).strip()
-            dox = self._preceding_doxygen(section[:m.start()])
+            dox = self._preceding_doxygen(text[:m.start()])
             params = self._parse_params(params_str)
             out.append({
                 'name': name, 'return_type': ret,
@@ -173,6 +220,18 @@ class _SWAExtractor:
                 'retval_details': self._retval_details(dox),
             })
         return out
+
+    def extract_functions(self) -> List[Dict[str, Any]]:
+        # Try the dedicated section first
+        section = self._section('Global Function Prototypes')
+        if section:
+            out = self._parse_function_declarations(section)
+            if out:
+                return out
+        # Section missing, empty, or contained no declarations (e.g. Resetsc/Nvmr
+        # where the actual IFX_EXTERN lines live outside the \{ \} block or in
+        # multiple sub-API groups) — fall back to full file content.
+        return self._parse_function_declarations(self._content)
 
     # ── internal helpers ─────────────────────────────────────────────
 

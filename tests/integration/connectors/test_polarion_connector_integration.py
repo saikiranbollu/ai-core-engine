@@ -44,6 +44,11 @@ from src.IngestionPipeline.Connectors.PolarionConnector import (
 _ENV_PATH = Path(__file__).resolve().parent.parent / "env" / ".env"
 load_dotenv(_ENV_PATH)
 
+# This live server uses a self-signed cert, so the fixture below builds the
+# connector with verify_ssl=False. Opt into the insecure-TLS dev override
+# (W-06 / F-CF-X01) so the connector does not refuse to construct.
+os.environ.setdefault("AICE_ALLOW_INSECURE_TLS", "1")
+
 POLARION_BASE_URL = "https://plr-web-api-polarion.eu-de-5.icp.infineon.com"
 POLARION_TOKEN = os.environ.get("PolarionAccessToken", "")
 

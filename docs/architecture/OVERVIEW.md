@@ -1,6 +1,6 @@
 # AI Core Engine — System Architecture Overview
 
-> This document describes the implemented architecture of the AI Core Engine (AICE). For tool-level API details see [DETAILED_DOCUMENTATION.md](../DETAILED_DOCUMENTATION.md). For setup instructions see [MCP_QUICKSTART.md](../MCP_QUICKSTART.md).
+> This document describes the implemented architecture of the AI Core Engine (AICE). For tool-level API details see [DOCUMENTATION.md](../DOCUMENTATION.md). For setup instructions see [MCP_QUICKSTART.md](../MCP_QUICKSTART.md).
 
 ---
 
@@ -67,8 +67,7 @@ AICE is a **knowledge-graph-backed MCP (Model Context Protocol) server** purpose
 │  │  Cat 4: Traceability (4)        Cat 11: Observability (6)   │   │
 │  │  Cat 5: Ingestion (0 — library) Cat 12: Visualization (1)   │   │
 │  │  Cat 6: Memory (5+4+2+1=12)     Cat 13: Authentication (2)  │   │
-│  │  Cat 7: Cache (5)               Cat 14: Validation (2)      │   │
-│  │                                 Cat 16: Knowledge Mgmt (1)  │   │
+│  │  Cat 7: Cache (5)               Cat 14: Validation & KM (3) │   │
 │  │                                                              │   │
 │  │  Total = 55 (Cat 5 ingestion is library-only; process_results│   │
 │  │  is categorized under Cat 8 alongside the feedback tools.)   │   │
@@ -382,8 +381,7 @@ ai-core-engine/
 ├── Dockerfile                        # Multi-stage build (Cerbos + Python 3.12)
 ├── requirements.txt                  # Python dependencies
 └── docs/                             # Documentation
-    ├── DETAILED_DOCUMENTATION.md     # Complete reference (tools, config, API)
-    ├── DOCUMENTATION.md              # Legacy full documentation (retained for reference)
+    ├── DOCUMENTATION.md              # Complete reference (tools, config, API)
     ├── MCP_QUICKSTART.md             # Setup and connection guide
     ├── NODE_SETS_ARCHITECTURE.md     # NodeSet design
     └── architecture/                 # ← You are here
@@ -406,7 +404,6 @@ ai-core-engine/
 | [Auth & Security](auth-and-security.md) | Cerbos RBAC, API keys, tier model |
 | [Observability](observability.md) | PostgreSQL audit, Prometheus metrics, Grafana dashboards, health checks |
 | [Deployment](deployment.md) | Docker Compose, Kubernetes, Dockerfile |
-| [DETAILED_DOCUMENTATION.md](../DETAILED_DOCUMENTATION.md) | Full MCP tool reference (canonical) |
-| [DOCUMENTATION.md](../DOCUMENTATION.md) | Legacy full documentation, retained for reference |
+| [DOCUMENTATION.md](../DOCUMENTATION.md) | Full MCP tool reference |
 | [MCP_QUICKSTART.md](../MCP_QUICKSTART.md) | Client setup and usage guide |
 | [NODE_SETS_ARCHITECTURE.md](../NODE_SETS_ARCHITECTURE.md) | NodeSet module isolation design |

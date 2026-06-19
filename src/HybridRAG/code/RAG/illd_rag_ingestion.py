@@ -51,6 +51,10 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("illd_rag_ingestion")
 
+# Matches TOC dot-leader lines: "1.4.1 Functional overview ..... 42"
+# Used to guard _chunk_leaf_sections() against treating TOC entries as headings.
+_TOC_LINE_RE = re.compile(r"^\d+(?:\.\d+)*\s+.+\.{4,}")
+
 
 class ILLDRAGIngestor:
     """
@@ -67,6 +71,7 @@ class ILLDRAGIngestor:
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         instance: str = "illd",
         dry_run: bool = False,
+        clear: bool = False,
     ):
         self.module = module.upper()
         self.module_lower = module.strip().lower()
@@ -76,6 +81,8 @@ class ILLDRAGIngestor:
         if not dry_run:
             self._model = self._load_model(model_name)
             self._client = self._get_client(instance)
+            if clear:
+                self._clear_collection()
         else:
             self._model = None
             self._client = None
@@ -102,6 +109,15 @@ class ILLDRAGIngestor:
 
     # -- Helpers ------------------------------------------------------------
 
+    def _clear_collection(self):
+        """Delete and recreate the module's Qdrant collection."""
+        logger.warning("Clearing Qdrant collection '%s' …", self.module_lower)
+        try:
+            self._client.delete_collection(self.module_lower)
+            logger.info("Collection '%s' deleted.", self.module_lower)
+        except Exception:
+            logger.info("Collection '%s' did not exist — nothing to clear.", self.module_lower)
+
     def _collection(self, content_type: str):
         """Get or create a single Qdrant collection per module."""
         return self._client.get_or_create_collection(self.module_lower)
@@ -112,6 +128,12 @@ class ILLDRAGIngestor:
         Each chunk must have ``id``, ``text``, and optionally ``metadata``.
         """
         if not chunks:
+            return 0
+
+        # Validate: every chunk must have a non-empty string ID
+        chunks = [c for c in chunks if c.get("id") and isinstance(c["id"], str)]
+        if not chunks:
+            logger.warning("  No valid chunks for %s (all missing 'id')", content_type)
             return 0
 
         if self.dry_run:
@@ -296,12 +318,13 @@ class ILLDRAGIngestor:
     # 2. SFR ingestion
     # =====================================================================
 
-    def ingest_sfr(self, sfr_data: dict):
+    def ingest_sfr(self, sfr_data: dict, source_file: str = None):
         """Ingest SFR parser output → registers collection."""
         if not sfr_data:
             return
 
-        logger.info("Ingesting SFR data into Qdrant …")
+        logger.info("Ingesting SFR data into Qdrant (file=%s) …",
+                     source_file or "default")
         chunks = []
         registers = sfr_data.get("registers", {})
 
@@ -310,24 +333,40 @@ class ILLDRAGIngestor:
                 continue
 
             bf_lines = []
+            bitfield_access = {}
             for bf in bitfields:
                 if isinstance(bf, dict):
-                    label = bf.get("label", "") or ""
+                    label  = bf.get("label", "") or ""
                     bfdesc = bf.get("description", "") or ""
                     bf_lines.append(f"  - {label}: {bfdesc}")
+                    # Collect per-bitfield access info for payload (skip Reserved entries)
+                    bfname = bf.get("name", "")
+                    aq = bf.get("access_qualifier")
+                    at = bf.get("access_type")
+                    if bfname and not bfname.startswith("Reserved") and aq:
+                        entry = {"access_qualifier": aq}
+                        if at:
+                            entry["access_type"] = at
+                        bitfield_access[bfname] = entry
 
             bf_text = "\n".join(bf_lines) if bf_lines else "No bitfields"
             text = (f"Register: {reg_name}\n"
                     f"Bitfields:\n{bf_text}")
 
-            chunks.append({
-                "id": f"reg_{reg_name}",
-                "text": text,
-                "metadata": {
+            metadata = {
                     "type": "register_def",
                     "register": str(reg_name),
                     "num_bitfields": len([bf for bf in bitfields if isinstance(bf, dict)]),
-                },
+                }
+            if source_file:
+                metadata["source_file"] = source_file
+            if bitfield_access:
+                metadata["bitfield_access"] = bitfield_access
+
+            chunks.append({
+                "id": f"reg_{reg_name}",
+                "text": text,
+                "metadata": metadata,
             })
 
         self._embed_and_upsert("registers", chunks)
@@ -437,11 +476,15 @@ class ILLDRAGIngestor:
                 name = req.name or "Unknown"
                 desc = req.description or ""
                 item_type = getattr(req, "item_type", "") or "Requirement"
+                status_text = getattr(req, "status_text", "") or ""
+                status_id = getattr(req, "status", None)
             elif isinstance(req, dict):
                 req_id = req.get("document_key") or req.get("requirement_id") or f"req_{req.get('id', '')}"
                 name = req.get("name", "Unknown")
                 desc = req.get("description", "")
                 item_type = req.get("item_type", "") or req.get("Item Type", "") or "Requirement"
+                status_text = req.get("status_text", "") or ""
+                status_id = req.get("status", None)
             else:
                 continue
 
@@ -449,11 +492,16 @@ class ILLDRAGIngestor:
                 continue
 
             text = f"{item_type}: {name}\n{desc}"
+            metadata = {"type": "requirement", "name": str(name),
+                        "item_type": str(item_type)}
+            if status_text:
+                metadata["status"] = str(status_text)
+            if status_id is not None and status_id != -1:
+                metadata["status_id"] = int(status_id)
             chunks.append({
                 "id": req_id,
                 "text": text,
-                "metadata": {"type": "requirement", "name": str(name),
-                             "item_type": str(item_type)},
+                "metadata": metadata,
             })
 
         self._embed_and_upsert("requirements", chunks)
@@ -616,6 +664,8 @@ class ILLDRAGIngestor:
             m = section_re.match(line.strip())
             if not m:
                 continue
+            if _TOC_LINE_RE.match(line.strip()):  # skip dot-leader TOC entries
+                continue
             sec_num = m.group(1)
             sec_title = m.group(2).strip()
             parts = sec_num.split(".")
@@ -649,7 +699,7 @@ class ILLDRAGIngestor:
 
         for line in lines:
             m = section_re.match(line.strip())
-            if m:
+            if m and not _TOC_LINE_RE.match(line.strip()):  # skip dot-leader TOC entries
                 sec_num = m.group(1)
                 sec_title = m.group(2).strip()
                 capped = ".".join(sec_num.split(".")[:3])
@@ -658,18 +708,19 @@ class ILLDRAGIngestor:
                 if current_section and current_section in chunkable:
                     chunk_id = f"hw_spec_{current_section.replace('.', '_')}"
                     if chunk_id not in seen:
-                        text = (f"Section {current_section} {current_title}\n\n" +
-                                "\n".join(current_content))
-                        chunks.append({
-                            "id": chunk_id,
-                            "text": text,
-                            "metadata": {
-                                "type": "hardware_spec",
-                                "section": f"{current_section} {current_title}",
-                                "section_number": current_section,
-                            },
-                        })
-                        seen.add(chunk_id)
+                        body = "\n".join(current_content).strip()
+                        if body:  # never emit empty-body chunks
+                            text = f"Section {current_section} {current_title}\n\n{body}"
+                            chunks.append({
+                                "id": chunk_id,
+                                "text": text,
+                                "metadata": {
+                                    "type": "hardware_spec",
+                                    "section": f"{current_section} {current_title}",
+                                    "section_number": current_section,
+                                },
+                            })
+                            seen.add(chunk_id)
 
                 current_section = capped
                 current_title = sec_title
@@ -681,17 +732,18 @@ class ILLDRAGIngestor:
         if current_section and current_section in chunkable:
             chunk_id = f"hw_spec_{current_section.replace('.', '_')}"
             if chunk_id not in seen:
-                text = (f"Section {current_section} {current_title}\n\n" +
-                        "\n".join(current_content))
-                chunks.append({
-                    "id": chunk_id,
-                    "text": text,
-                    "metadata": {
-                        "type": "hardware_spec",
-                        "section": f"{current_section} {current_title}",
-                        "section_number": current_section,
-                    },
-                })
+                body = "\n".join(current_content).strip()
+                if body:  # never emit empty-body chunks
+                    text = f"Section {current_section} {current_title}\n\n{body}"
+                    chunks.append({
+                        "id": chunk_id,
+                        "text": text,
+                        "metadata": {
+                            "type": "hardware_spec",
+                            "section": f"{current_section} {current_title}",
+                            "section_number": current_section,
+                        },
+                    })
 
         return chunks
 

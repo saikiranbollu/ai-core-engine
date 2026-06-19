@@ -16,43 +16,95 @@
 # backed store. Rotate keys regularly.
 
 keys:
-  # ── Domain Assistants (Public tier) ──
+  # ── Embedded Driver Assistant (iLLD workspace) ──
+  # EDA is the only assistant with iLLD access; every other DA is MCAL-only.
+  "key-eda-001":
+    principal_id: "eda_assistant"        # EDA — Embedded Driver Assistant
+    roles:
+      illd: ["public", "developer"]
+
+  # ── Domain Assistants (canonical AI Assistants — Confluence MCSWAI) ──
+  # MCAL workspace only (iLLD access reserved for EDA).
   "key-gest-001":
     principal_id: "gest_assistant"
     roles:
-      illd: ["public"]
-      mcal: ["public"]
-
-  "key-cia-001":
-    principal_id: "cia_assistant"
-    roles:
-      illd: ["public"]
       mcal: ["public"]
 
   "key-reva-001":
     principal_id: "reva_assistant"
     roles:
-      illd: ["public"]
       mcal: ["public"]
 
   "key-acra-001":
     principal_id: "acra_assistant"
     roles:
-      illd: ["public"]
-      mcal: ["public"]
-
-  # ── Advanced Assistants (Developer tier) ──
-  "key-saga-001":
-    principal_id: "saga_assistant"
-    roles:
-      illd: ["developer"]
       mcal: ["public"]
 
   "key-triplea-001":
     principal_id: "triplea_assistant"
     roles:
-      illd: ["developer"]
       mcal: ["developer"]
+
+  "key-prqgen-001":
+    principal_id: "prqgen_assistant"     # PRQGEN — PRQ generator (SHRQ/AA -> Polarion)
+    roles:
+      mcal: ["public"]
+
+  "key-atra-001":
+    principal_id: "atra_assistant"       # ATRA — architecture traceability
+    roles:
+      mcal: ["public"]
+
+  "key-geca-001":
+    principal_id: "geca_assistant"       # GECA — config generation
+    roles:
+      mcal: ["public"]
+
+  "key-gevt-001":
+    principal_id: "gevt_assistant"       # GEVT — test verification
+    roles:
+      mcal: ["public"]
+
+  "key-atqa-001":
+    principal_id: "atqa_assistant"       # ATQA — test quality analysis
+    roles:
+      mcal: ["public"]
+
+  # Safety DAs
+  "key-sava-001":
+    principal_id: "sava_assistant"       # SAVA — safety validation
+    roles:
+      mcal: ["public"]
+
+  "key-sasa-001":
+    principal_id: "sasa_assistant"       # SASA — safety analysis
+    roles:
+      mcal: ["public"]
+
+  "key-hazopa-001":
+    principal_id: "hazopa_assistant"     # HAZOPA — HAZOP analysis
+    roles:
+      mcal: ["public"]
+
+  "key-dafaa-001":
+    principal_id: "dafaa_assistant"      # DaFaA — data flow analysis
+    roles:
+      mcal: ["public"]
+
+  "key-swqma-001":
+    principal_id: "swqma_assistant"      # SWQMA — SW quality / process-compliance
+    roles:
+      mcal: ["public"]
+
+  "key-jwiz-001":
+    principal_id: "jwiz_assistant"       # J-WIZ — Java business-logic generation
+    roles:
+      mcal: ["public"]
+
+  "key-zephyr-001":
+    principal_id: "zephyr_assistant"     # Zephyr (ZA) — Zephyr SoC port generation
+    roles:
+      mcal: ["public"]
 
   # ── Admin / Infrastructure ──
   "key-admin-pipeline":

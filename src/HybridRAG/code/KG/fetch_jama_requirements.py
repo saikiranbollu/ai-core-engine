@@ -52,16 +52,90 @@ logger = logging.getLogger("fetch_jama_requirements")
 # ---------------------------------------------------------------------------
 # Jama project constants
 # ---------------------------------------------------------------------------
-PROJECT_ID = 1074                       # AURIX 3G MCAL
-SHRQ_CONTAINER_ID = 7458908            # Stakeholder Requirements
-SHRQ_AUTOSAR_R20_11_ID = 7463354       # SHRQ → AUTOSAR CP R20-11
-PRQ_CONTAINER_ID = 7463476             # Product Requirements
+# Project 1986 = AURIX_RC1_iLLD (previously 1074 = AURIX 3G MCAL which is no longer accessible)
+PROJECT_ID = 1986                       # AURIX_RC1_iLLD
 FOLDER_TYPE = 32                        # Jama item-type for folders
+
+# Container IDs are discovered dynamically at runtime via _discover_container_ids().
+# The constants below are kept as documentation only and are NOT used directly.
+# SHRQ_CONTAINER_ID   = discovered by finding folder with 'SHRQ' / 'STAKEHOLDER' in name
+# PRQ_CONTAINER_ID    = discovered by finding folder with 'PRQ' / 'PRODUCT' in name
 
 
 # ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
+
+def _discover_container_ids(
+    connector: JamaConnector,
+    project_id: int,
+) -> tuple[int | None, int | None]:
+    """Dynamically discover SHRQ and PRQ container IDs for a Jama project.
+
+    Fetches all folders in the project, identifies the SHRQ and PRQ roots
+    by name pattern, then descends one level inside SHRQ to find the
+    module-level parent (e.g. an AUTOSAR sub-folder).
+
+    Returns
+    -------
+    (shrq_module_parent_id, prq_parent_id)
+        Either may be None if not found.
+    """
+    logger.info("Discovering SHRQ/PRQ container IDs in project %d ...", project_id)
+    try:
+        folders = connector.get_items_by_type(project_id, FOLDER_TYPE)
+    except Exception as exc:
+        logger.warning("Could not list folders in project %d: %s", project_id, exc)
+        return None, None
+
+    logger.info("  Found %d folder items in project %d", len(folders), project_id)
+    for f in folders:
+        logger.debug("    [%d] %s", f.id, f.name)
+
+    def _find(pattern_words: list[str]) -> JamaItem | None:
+        for f in folders:
+            fu = f.name.upper()
+            if any(w in fu for w in pattern_words):
+                return f
+        return None
+
+    # Find SHRQ root
+    shrq_root = _find(["SHRQ", "STAKEHOLDER"])
+    prq_root  = _find(["PRQ", "PRODUCT REQ"])
+
+    if shrq_root:
+        logger.info("  SHRQ root: [%d] '%s'", shrq_root.id, shrq_root.name)
+    else:
+        logger.warning("  No SHRQ root folder found")
+
+    if prq_root:
+        logger.info("  PRQ root:  [%d] '%s'", prq_root.id, prq_root.name)
+    else:
+        logger.warning("  No PRQ root folder found")
+
+    # Inside SHRQ: try to find an AUTOSAR or module-level sub-folder
+    shrq_module_parent: int | None = None
+    if shrq_root:
+        try:
+            children = connector.get_children_items(shrq_root.id)
+            autosar_sub = next(
+                (c for c in children
+                 if any(kw in c.name.upper() for kw in ["AUTOSAR", "R20", "MODULE"])),
+                None,
+            )
+            if autosar_sub:
+                logger.info("  SHRQ AUTOSAR sub: [%d] '%s'", autosar_sub.id, autosar_sub.name)
+                shrq_module_parent = autosar_sub.id
+            else:
+                # No sub-folder found; use SHRQ root directly
+                shrq_module_parent = shrq_root.id
+        except Exception as exc:
+            logger.warning("  Could not list SHRQ children: %s", exc)
+            shrq_module_parent = shrq_root.id
+
+    prq_parent = prq_root.id if prq_root else None
+    return shrq_module_parent, prq_parent
+
 
 def _create_connector() -> JamaConnector:
     """Create and validate a JamaConnector from environment variables."""
@@ -154,14 +228,21 @@ def fetch_module_requirements(
     connector = _create_connector()
 
     try:
+        # Discover container IDs dynamically for this project
+        shrq_module_parent, prq_parent = _discover_container_ids(connector, PROJECT_ID)
+
         # Discover folders
-        shrq_folder = _find_module_folder(
-            connector, SHRQ_AUTOSAR_R20_11_ID, module,
-            "SHRQ (AUTOSAR CP R20-11)",
-        )
-        prq_folder = _find_module_folder(
-            connector, PRQ_CONTAINER_ID, module, "PRQ",
-        )
+        shrq_folder = None
+        if shrq_module_parent:
+            shrq_folder = _find_module_folder(
+                connector, shrq_module_parent, module,
+                "SHRQ (auto-discovered)",
+            )
+        prq_folder = None
+        if prq_parent:
+            prq_folder = _find_module_folder(
+                connector, prq_parent, module, "PRQ (auto-discovered)",
+            )
 
         if not shrq_folder and not prq_folder:
             logger.error("Module '%s' not found in either SHRQ or PRQ containers.", module)

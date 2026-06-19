@@ -41,7 +41,7 @@ and do not need clean register sections):
 
 Usage::
 
-    from IngestionPipeline.Parsers import hw_spec_parser
+    from IngestionPipeline.parsers import hw_spec_parser
 
     # LLM extraction (default) — uses GPT4IFX token_manager:
     result = hw_spec_parser.parse("CXPI_FBcontent_INTERNAL_2025-11-05.md")
@@ -471,7 +471,7 @@ def _llm_build_client(token: str, model: str = _DEFAULT_MODEL):
 # "## CXPI\_RST\_CTRLB") and optional " — long name" suffix.
 _FB_NAME_HEADING_RE = re.compile(
     r"^(?P<hashes>#{1,6})\s+"
-    r"(?P<name>[A-Z][A-Za-z0-9_\\]{2,}(?:\s*\([^)]*\))?)"
+    r"(?P<name>[A-Z][A-Za-z0-9_\\]{1,}(?:\s*\([^)]*\))?)"
     r"(?:\s*[—–-]\s*(?P<desc>.+))?\s*$"
 )
 # Any markdown heading
@@ -545,11 +545,39 @@ def _unescape_md_name(raw: str) -> str:
 #
 # Indexed names like "**CXPI_CHx_CTL0 (x=0-3)**" are also accepted.
 _BOLD_NAME_RE = re.compile(
-    r"^\s*\*\*\s*"
-    r"(?P<name>[A-Z][A-Za-z0-9_]{2,}(?:\s*\([^)]*\))?)"
+    r"^\s*(?:[-*]\s+)?"                        # optional list marker (- or *)
+    r"\*\*\s*"
+    r"(?P<name>[A-Z][A-Za-z0-9_]{1,}(?:\s*\([^)]*\))?)"
+    r"(?:\s*:\s*[^*]*)?"                       # optional ": desc" inside bold
     r"\s*\*\*"
-    r"(?:\s*[\u2014\u2013\-]\s*(?P<desc>.+?))?"
-    r"\s*$"
+    r"(?:"
+    r"\s*[\u2014\u2013\-]\s*(?P<desc>.+)"     # " — description"
+    r"|\s*\\n\s*(?P<desc2>.+)"                 # "  \nDescription" (LLM line-break artifact)
+    r"|\s*$"                                    # bare end of line
+    r")"
+)
+
+# Descriptive bold marker (flavour 3). Some FBcontent manuals (e.g. SENT,
+# WCAN) use the full register description as a bold paragraph instead of
+# the short register name:
+#
+#     **Interrupt overview register**
+#
+#     - **Offset address:** 1004_H
+#
+# These are multi-word, may start with uppercase or title-case, and always
+# have "offset address" in the near vicinity. We use them as section markers
+# when the short-name pattern does not fire.
+_BOLD_DESCRIPTIVE_RE = re.compile(
+    r"^\s*\*\*\s*(?P<desc>[A-Z][A-Za-z0-9 _/\-]+(?:\s*[a-zx]\s*)?(?:\s*\([^)]*\))?)\s*\*\*\s*$"
+)
+
+# Reject descriptive bold markers that are clearly NOT register names but
+# common prose/structural elements.
+_DESCRIPTIVE_REJECT = re.compile(
+    r"(?i)^(?:contents?|note|warning|caution|important|reserved|"
+    r"figure|table|diagram|example|summary|overview|glossary|"
+    r"register bit layout|field description|what )",
 )
 
 
@@ -600,17 +628,48 @@ def _split_fbcontent_sections(content: str) -> List[Dict[str, str]]:
         nm = _unescape_md_name(bm.group("name"))
         if not re.match(r"^[A-Z][A-Za-z0-9_]+$", nm):
             continue
-        # Real HW register names (in this manual family) always contain an
-        # underscore — e.g. ``CXPI_CLC``, ``CXPI_CHx_CTL0``. Reject single-
-        # word bold tokens like ``**Contents**``, ``**Note**`` that would
-        # otherwise sneak through if an ``offset address`` happens to occur
-        # within 12 lines below them.
-        if "_" not in nm:
+        # Reject English words (contain 2+ consecutive lowercase letters).
+        # Register names are abbreviations: all-caps with optional single
+        # lowercase index placeholder (e.g. "CLC", "OCS", "INPx", "CPDRx").
+        # English words like "Contents", "Reserved", "Figure" have runs of
+        # lowercase letters and should be rejected.
+        if re.search(r"[a-z]{2}", nm):
             continue
         lookahead = "\n".join(lines[i + 1 : i + 13])
         if "offset address" not in lookahead.lower():
             continue
-        bold_markers.append((i, nm, (bm.group("desc") or "").strip()))
+        bold_markers.append((i, nm, (bm.group("desc") or bm.group("desc2") or "").strip()))
+
+    # ── Bold-descriptive register markers (flavour 3) ─────────────────────
+    # Some FBcontent manuals use the full register description as the bold
+    # marker instead of the short name, e.g.:
+    #     **Interrupt overview register**
+    #     - **Offset address:** 1004_H
+    # Detect these and use the descriptive text as a placeholder name; the
+    # LLM will extract the correct short name from the section content.
+    desc_bold_markers: List[Tuple[int, str, str]] = []
+    bold_lines_already = {b[0] for b in bold_markers}
+    for i, raw in enumerate(lines):
+        if i in bold_lines_already:
+            continue
+        dm = _BOLD_DESCRIPTIVE_RE.match(raw)
+        if not dm:
+            continue
+        desc_text = dm.group("desc").strip()
+        # Must be multi-word (single uppercase words handled by flavour 2)
+        if " " not in desc_text:
+            continue
+        # Reject structural/prose bold markers
+        if _DESCRIPTIVE_REJECT.match(desc_text):
+            continue
+        # Must have "offset address" nearby
+        lookahead = "\n".join(lines[i + 1 : i + 13])
+        if "offset address" not in lookahead.lower():
+            continue
+        # Build a placeholder name from the descriptive text (uppercase, no
+        # spaces). The LLM will override this with the real short name.
+        placeholder = re.sub(r"[^A-Za-z0-9]", "_", desc_text).upper()[:40]
+        desc_bold_markers.append((i, placeholder, desc_text))
 
     # ── Combined section slicer ───────────────────────────────────────────
     # The "boundary" for any section body is the line index of either the
@@ -633,8 +692,9 @@ def _split_fbcontent_sections(content: str) -> List[Dict[str, str]]:
         r"|figure\s*[:\.]"               # "Figure: ..."
         r"|diagram\s+explanation"
         r"|register\s+bit[-\s]?field\s+diagram"
-        r"|register\s+bit\s+layout"
-        r"|field\s+description\s+table"
+        r"|register\s+(?:bit\s+)?layout" # "Register layout", "Register bit layout"
+        r"|field\s+description(?:\s+table)?" # "Field description", "Field description table"
+        r"|divider\s+factor"             # "Divider Factor of Pre Divider ..."
         r")",
         re.IGNORECASE,
     )
@@ -643,7 +703,8 @@ def _split_fbcontent_sections(content: str) -> List[Dict[str, str]]:
         if h[1] <= 3 and not _NON_REGISTER_HEADING_RE.match(h[2])
     }
     bold_line_set    = {b[0] for b in bold_markers}
-    boundary_lines   = sorted(heading_line_set | bold_line_set)
+    desc_bold_set    = {b[0] for b in desc_bold_markers}
+    boundary_lines   = sorted(heading_line_set | bold_line_set | desc_bold_set)
 
     def _slice_end(start: int) -> int:
         for ln in boundary_lines:
@@ -665,7 +726,9 @@ def _split_fbcontent_sections(content: str) -> List[Dict[str, str]]:
         # index placeholders (e.g. ``CXPI_CHx_CTL1`` where ``x=0-3``).
         if not re.match(r"^[A-Z][A-Za-z0-9_]+$", name):
             continue
-        if "_" not in name and len(name) < 3:
+        # Reject English words (2+ consecutive lowercase letters) — true
+        # register names are ALL-CAPS or have single lowercase placeholders.
+        if re.search(r"[a-z]{2}", name):
             continue
         # Body slice: until the next register-start marker or H1-H3 heading.
         end = _slice_end(i)
@@ -745,6 +808,40 @@ def _split_fbcontent_sections(content: str) -> List[Dict[str, str]]:
             "name": name,
             "text": body,
             "long_name": long_name,
+            "index": index_info,
+        })
+
+    # ── Pass 3 — descriptive-bold markers (flavour 3, e.g. SENT) ─────────
+    # These use the full register description in bold instead of the short
+    # name. The LLM will extract the short name from the section content.
+    seen_desc_lines = {s.get("_line") for s in sections if "_line" in s}
+    for idx, (i, placeholder, desc_text) in enumerate(desc_bold_markers):
+        if (placeholder, i) in seen_names_at:
+            continue
+        # Skip if a regular bold marker already claimed this line
+        if i in bold_lines_already:
+            continue
+        end = _slice_end(i)
+        body = "\n".join(lines[i:end])
+        if not _has_register_metadata(body):
+            continue
+        # Detect index-range annotation in the descriptive text
+        index_info: Optional[Dict[str, Any]] = None
+        for src_text in (desc_text, lines[i]):
+            im = _INDEX_RANGE_RE.search(src_text or "")
+            if im:
+                lo, hi = int(im.group("lo")), int(im.group("hi"))
+                if 0 <= lo <= hi <= 31:
+                    index_info = {
+                        "letter": im.group("letter"),
+                        "lo": lo,
+                        "hi": hi,
+                    }
+                    break
+        sections.append({
+            "name": placeholder,
+            "text": body,
+            "long_name": desc_text,
             "index": index_info,
         })
 

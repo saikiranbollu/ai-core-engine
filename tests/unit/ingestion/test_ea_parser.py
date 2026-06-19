@@ -18,8 +18,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src"))
 
-from IngestionPipeline.Parsers import ea_parser
-from IngestionPipeline.Parsers.ea_parser import _EAModelFlattener, _safe_str, _safe_attr
+from IngestionPipeline.parsers import ea_parser
+from IngestionPipeline.parsers.ea_parser import _EAModelFlattener, _safe_str, _safe_attr
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +486,7 @@ class TestParseAPI:
         mock_parse_obj.ParsedModelList = [comp]
 
         with patch(
-            "IngestionPipeline.Parsers.ea_parser._EAModelExtractor.extract",
+            "IngestionPipeline.parsers.ea_parser._EAModelExtractor.extract",
             return_value=[comp],
         ):
             result = ea_parser.parse(
@@ -518,7 +518,7 @@ class TestParseAPI:
         pydump_dir.mkdir()
 
         with patch(
-            "IngestionPipeline.Parsers.ea_parser._EAModelExtractor.extract",
+            "IngestionPipeline.parsers.ea_parser._EAModelExtractor.extract",
             return_value=[comp, common],
         ):
             result = ea_parser.parse(
@@ -536,7 +536,7 @@ class TestParseAPI:
         pydump_dir.mkdir()
 
         with patch(
-            "IngestionPipeline.Parsers.ea_parser._EAModelExtractor.extract",
+            "IngestionPipeline.parsers.ea_parser._EAModelExtractor.extract",
             return_value=[_make_component()],
         ):
             result = ea_parser.parse(
@@ -557,7 +557,7 @@ class TestExtractor:
     def test_is_pydump_dir_detection(self, tmp_path):
         pydump = tmp_path / "pydump"
         pydump.mkdir()
-        from IngestionPipeline.Parsers.ea_parser import _EAModelExtractor
+        from IngestionPipeline.parsers.ea_parser import _EAModelExtractor
         ext = _EAModelExtractor(str(pydump), "mcal", ["Adc"])
         assert ext._is_pydump_dir is True
         assert ext._is_ea_file is False
@@ -565,13 +565,13 @@ class TestExtractor:
     def test_is_ea_file_detection(self, tmp_path):
         eap_file = tmp_path / "model.eap"
         eap_file.touch()
-        from IngestionPipeline.Parsers.ea_parser import _EAModelExtractor
+        from IngestionPipeline.parsers.ea_parser import _EAModelExtractor
         ext = _EAModelExtractor(str(eap_file), "mcal", ["Adc"])
         assert ext._is_ea_file is True
         assert ext._is_pydump_dir is False
 
     def test_extract_raises_file_not_found(self):
-        from IngestionPipeline.Parsers.ea_parser import _EAModelExtractor
+        from IngestionPipeline.parsers.ea_parser import _EAModelExtractor
         ext = _EAModelExtractor("C:/nonexistent", "mcal", ["Adc"])
         with pytest.raises(FileNotFoundError):
             ext.extract()

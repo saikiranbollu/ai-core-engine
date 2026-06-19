@@ -19,7 +19,7 @@ same KG builder and RAG ingestion code can consume the results.
 
 Usage::
 
-    from IngestionPipeline.Parsers import hw_um_parser
+    from IngestionPipeline.parsers import hw_um_parser
 
     result = hw_um_parser.parse("hw_um_gpt12_tc44x.md")
 """

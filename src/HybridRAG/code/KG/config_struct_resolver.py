@@ -85,19 +85,22 @@ _RE_VAR_DECL = re.compile(
 )
 
 # Struct initializer:  static [const] <Type> <Name> [=\n{ ... };]
-# We capture the type, name, and the braced initialiser list.
+# We capture the type, name, pointer modifier, array bracket, and init body.
 _RE_STRUCT_INIT = re.compile(
     r"^(?:static\s+)?"
     r"(?:const\s+)?"
     r"(\w+)"                                 # type name  (group 1)
-    r"(?:\s*\*+\s*(?:const\s*)?)?\s+"
-    r"(\w+)"                                 # var name   (group 2)
-    r"(?:\s*\[[^\]]*\])?"
+    r"(\s*\*+\s*(?:const\s*)?)?\s+"          # pointer mod (group 2, optional)
+    r"(\w+)"                                 # var name   (group 3)
+    r"(\s*\[[^\]]*\])?"                      # array bracket (group 4, optional)
     r"\s*=\s*\n\{"                           # = \n {
-    r"(.*?)"                                 # init body  (group 3)
+    r"(.*?)"                                 # init body  (group 5)
     r"\};",
     re.DOTALL | re.MULTILINE,
 )
+
+# Tresos-generated field comment annotation: /* .fieldName = */ or /* fieldName */
+_RE_FIELD_COMMENT = re.compile(r"/\*\s*\.?(\w+)\s*(?:=\s*)?\*/")
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +260,88 @@ class ConfigStructResolver:
     # Step 2 — regex: var declarations & initializers from config files
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _align_by_comments(
+        init_vals: List[str], fields: List[str]
+    ) -> Optional[List[Tuple[str, str]]]:
+        """Try comment-based alignment for Tresos-generated initialisers.
+
+        Tresos inserts ``/* .fieldName = */`` annotations before each
+        value.  When present, use these to align fields by NAME rather
+        than by POSITION — this avoids misalignment caused by conditional
+        compilation (``#ifdef``) in struct definitions.
+
+        Returns:
+            List of (field_name, val) pairs if comment alignment succeeds
+            for the majority of values, else None (fallback to positional).
+        """
+        field_set = set(fields)
+        pairs: List[Tuple[str, str]] = []
+        matched = 0
+        for val in init_vals:
+            m = _RE_FIELD_COMMENT.search(val)
+            if m:
+                comment_field = m.group(1)
+                if comment_field in field_set:
+                    pairs.append((comment_field, val))
+                    matched += 1
+                    continue
+            # No comment or unrecognized field — skip this value
+            # (it might be a conditionally-compiled field not in our struct)
+            pairs.append(("", val))
+
+        # Use comment alignment only if we matched at least half the values
+        if matched >= len(init_vals) // 2 and matched > 0:
+            return [(f, v) for f, v in pairs if f]
+        return None
+
+    @staticmethod
+    def _is_ref_misaligned(
+        fields: List[str], field_name: str, ref: str
+    ) -> bool:
+        """Detect if a reference belongs to a different field (misalignment).
+
+        For pointer fields (ending in ``Ptr``, ``Map``, ``Mask``), check
+        if the reference global name contains a different struct field's
+        base name rather than the current field's.  This catches positional
+        misalignment caused by conditional compilation in struct types.
+        """
+        # Only validate fields with distinctive naming patterns
+        for suffix in ("Ptr", "Map", "Mask", "SV"):
+            if field_name.endswith(suffix):
+                current_base = field_name[:-len(suffix)]
+                break
+        else:
+            return False  # Can't validate non-suffixed fields
+
+        # Strip common prefix 'Active' for matching
+        current_core = current_base.replace("Active", "")
+        if len(current_core) < 3:
+            return False  # Core too short for reliable matching
+
+        ref_lower = ref.lower()
+        current_core_lower = current_core.lower()
+
+        # If the reference contains the current field's core, it's fine
+        if current_core_lower in ref_lower:
+            return False
+
+        # Check if the reference matches another field's core
+        for other_field in fields:
+            if other_field == field_name:
+                continue
+            for sfx in ("Ptr", "Map", "Mask", "SV"):
+                if other_field.endswith(sfx):
+                    other_base = other_field[:-len(sfx)]
+                    break
+            else:
+                continue
+            other_core = other_base.replace("Active", "")
+            if len(other_core) >= 3 and other_core.lower() in ref_lower:
+                return True  # ref matches another field better
+
+        return False
+
     def _regex_parse_config(self, fpath: Path) -> None:
         """Regex-extract variable declarations and struct initializers."""
         text = fpath.read_text(encoding="utf-8", errors="replace")
@@ -270,8 +355,21 @@ class ConfigStructResolver:
         # Pass 2: struct initialisers
         #   e.g.  static const Adc_HwTrigDataType Adc_k... = \n{ ... };
         for m in _RE_STRUCT_INIT.finditer(text):
-            type_name, var_name = m.group(1), m.group(2)
-            init_body = m.group(3)
+            type_name = m.group(1)
+            ptr_mod = m.group(2)        # e.g. " * const" or None
+            var_name = m.group(3)
+            array_bracket = m.group(4)  # e.g. "[COUNT]" or None
+            init_body = m.group(5)
+
+            # Skip pointer-array variables: e.g.
+            #   const Adc_PartitionDataType * const Adc_kData[N] = { &p0, ... };
+            # These are arrays of pointers, NOT struct initialisers.
+            # Treating them as structs maps array elements to field names.
+            # Do NOT register them as typed globals (they aren't struct instances).
+            if ptr_mod and array_bracket:
+                self._record_global(var_name, type_name + "_ptr_array")
+                self._extract_array_elements(var_name, init_body)
+                continue
 
             self._record_global(var_name, type_name)
 
@@ -302,9 +400,21 @@ class ConfigStructResolver:
                     if inner.startswith("{") and inner.endswith("}"):
                         inner = inner[1:-1]
                     inner_vals = self._split_init_list(inner)
-                    for field_name, val in zip(fields, inner_vals):
+                    # Prefer comment-based alignment over positional
+                    aligned = self._align_by_comments(inner_vals, fields)
+                    pairs = aligned if aligned else list(zip(fields, inner_vals))
+                    for field_name, val in pairs:
                         ref = self._extract_identifier(val)
                         if ref and ref not in ("NULL_PTR", "0"):
+                            # Validate alignment (skip if ref clearly
+                            # belongs to a different field)
+                            if self._is_ref_misaligned(
+                                    fields, field_name, ref):
+                                logger.debug(
+                                    "    %s.%s → %s SKIPPED (misaligned)",
+                                    var_name, field_name, ref,
+                                )
+                                continue
                             bucket = self._field_map.setdefault(
                                 (var_name, field_name), [],
                             )
@@ -315,9 +425,21 @@ class ConfigStructResolver:
                                 var_name, field_name, ref,
                             )
             else:
-                for field_name, val in zip(fields, init_vals):
+                # Prefer comment-based alignment over positional
+                aligned = self._align_by_comments(init_vals, fields)
+                pairs = aligned if aligned else list(zip(fields, init_vals))
+                for field_name, val in pairs:
                     ref = self._extract_identifier(val)
                     if ref and ref not in ("NULL_PTR", "0"):
+                        # Validate alignment (skip if ref clearly
+                        # belongs to a different field)
+                        if self._is_ref_misaligned(
+                                fields, field_name, ref):
+                            logger.debug(
+                                "    %s.%s → %s SKIPPED (misaligned)",
+                                var_name, field_name, ref,
+                            )
+                            continue
                         bucket = self._field_map.setdefault(
                             (var_name, field_name), [],
                         )

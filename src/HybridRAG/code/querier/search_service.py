@@ -59,6 +59,17 @@ _LOW_VALUE_LABELS = frozenset({
     "Folder", "EA_Diagram", "EA_ActivityNode",
 })
 
+# ── LP-variant alias resolution for Neo4j hardware queries ──────────────
+# LPBTM and LPCAN are low-power variants of BTM/CAN that share the same
+# register map.  All HardwareRegister / RegisterField / etc. nodes are
+# stored under module='BTM' or module='CAN'.  Any query that references
+# LPBTM or LPCAN must be redirected to the parent module for Neo4j lookups.
+# Qdrant collections (lpbtm / lpcan) are intentionally kept separate.
+_NEO4J_MODULE_ALIASES: Dict[str, str] = {
+    "LPBTM": "BTM",
+    "LPCAN": "CAN",
+}
+
 # ── Regex patterns for extracting citation metadata from Cypher queries ──
 _CYPHER_LABEL_RE = re.compile(r'\([\w]*:([\w]+)\)', re.IGNORECASE)
 _CYPHER_REL_RE = re.compile(r'\[[\w]*:?([\w]+)?\]', re.IGNORECASE)
@@ -228,6 +239,19 @@ class SearchService:
             f"{alias}.requirement_id, 'unknown')"
         )
 
+    @staticmethod
+    def _neo4j_module(module: Optional[str]) -> Optional[str]:
+        """Resolve LP-variant aliases to their parent module for Neo4j queries.
+
+        LPBTM → BTM, LPCAN → CAN.  All hardware nodes (HardwareRegister,
+        RegisterField, etc.) are stored under the parent module.  Qdrant
+        collections for LP variants are intentionally separate and are NOT
+        affected by this resolution.
+        """
+        if module is None:
+            return None
+        return _NEO4J_MODULE_ALIASES.get(module.upper(), module.upper())
+
     # ─────────────────────────────────────────────────────────────────────
     # search_database — hybrid semantic + graph search
     # ─────────────────────────────────────────────────────────────────────
@@ -389,7 +413,7 @@ class SearchService:
         graph_results.sort(key=lambda r: r.get("score", 0), reverse=True)
 
         # ── Stage 3: RRF merge ────────────────────────────────────────
-        merged = self._merge_results_rrf(
+        merged = self._merge_results_weighted(
             graph_results, vector_results, alpha,
             workspace_id=workspace_id,
         )
@@ -672,7 +696,7 @@ class SearchService:
         # above keyword matches before RRF rank-based fusion.
         graph_results.sort(key=lambda r: r.get("score", 0), reverse=True)
 
-        merged = self._merge_results_rrf(
+        merged = self._merge_results_weighted(
             graph_results, vector_results, alpha,
             workspace_id=workspace_id,
         )
@@ -793,7 +817,7 @@ class SearchService:
             logger.debug("_graph_search: using enhanced labels=%s, keywords=%s", labels, keywords)
         else:
             labels = filter_by_node_type or infer_labels(query, profile=workspace_id)
-        module = (filter_by_module or self.module or "").upper() or None
+        module = self._neo4j_module(filter_by_module or self.module) or None
 
         results: List[Dict[str, Any]] = []
         seen_ids: Set[str] = set()
@@ -959,7 +983,7 @@ class SearchService:
         return rels
 
     def _merge_results(self, graph: List, vector: List, alpha: float) -> List[Dict]:
-        """Legacy merge — kept for backward compatibility. Use _merge_results_rrf instead."""
+        """Legacy merge — kept for backward compatibility. Use _merge_results_weighted instead."""
         seen = set()
         merged = []
         for r in graph:
@@ -2171,6 +2195,10 @@ class SearchService:
                 except Exception:
                     # Fallback: discover from Qdrant collections list
                     colls = self._discover_collections_for_module(mod)
+                # Also include the source code collection: mcal_{module}_sourcecode
+                src_coll = f"mcal_{mod}_sourcecode"
+                if src_coll not in colls:
+                    colls.append(src_coll)
                 return colls if colls else [mod]
             else:
                 # ILLD: collection = module name
@@ -2201,7 +2229,8 @@ class SearchService:
     def _discover_collections_for_module(self, module: str) -> List[str]:
         """List Qdrant collections matching a module prefix."""
         names = self._get_all_collection_names()
-        return [n for n in names if n.startswith(f"{module}_")]
+        # Match both {module}_* (e.g. adc_swa_architecture) and mcal_{module}_sourcecode
+        return [n for n in names if n.startswith(f"{module}_") or n == f"mcal_{module}_sourcecode"]
 
     def _discover_all_profile_collections(self, workspace_id: str) -> List[str]:
         """Discover all Qdrant collections belonging to a profile.
@@ -2215,8 +2244,11 @@ class SearchService:
 
         if workspace_id == "mcal":
             # MCAL pattern: {module}_{swa|swud|testspec|jama}_{category}
+            # Also includes mcal_{module}_sourcecode collections
             mcal_prefixes = ("_swa_", "_swud_", "_testspec_", "_jama_")
-            return [n for n in names if any(p in n for p in mcal_prefixes)]
+            doc_colls = [n for n in names if any(p in n for p in mcal_prefixes)]
+            src_colls = [n for n in names if n.startswith("mcal_") and n.endswith("_sourcecode")]
+            return doc_colls + src_colls
         else:
             # ILLD pattern: bare module names or rag_{module}_{type}
             illd = [n for n in names if n.startswith("rag_")]
@@ -2235,6 +2267,7 @@ class SearchService:
         "swud_design": "SWUD_UnitDesign",
         "testspec_verification": "TestSpecification",
         "jama_requirements": "Requirement",
+        "sourcecode": "SRC_Function",
     }
     _ILLD_COLLECTION_NODE_TYPE_MAP = {
         "functions": "Function",
@@ -2254,6 +2287,9 @@ class SearchService:
     @classmethod
     def _node_type_from_collection(cls, collection: str) -> Optional[str]:
         """Derive a meaningful node_type from the Qdrant collection name."""
+        # MCAL sourcecode: mcal_{module}_sourcecode e.g. "mcal_spi_sourcecode"
+        if collection.startswith("mcal_") and collection.endswith("_sourcecode"):
+            return cls._COLLECTION_NODE_TYPE_MAP.get("sourcecode", "SRC_Function")
         # MCAL: {module}_{source}_{category} e.g. "port_swa_architecture"
         parts = collection.split("_", 1)
         if len(parts) == 2:
@@ -2273,7 +2309,7 @@ class SearchService:
     # Reciprocal Rank Fusion (RRF)
     # ─────────────────────────────────────────────────────────────────────
 
-    def _merge_results_rrf(
+    def _merge_results_weighted(
         self, graph: List[Dict], vector: List[Dict], alpha: float,
         k: int = 60, workspace_id: str = "illd",
     ) -> List[Dict]:
@@ -2394,6 +2430,9 @@ class SearchService:
             for i, (k, v) in enumerate(filters.items()):
                 pname = f"f{i}"
                 where_parts.append(f"n.{k} = ${pname}")
+                # Resolve LP-variant aliases for module filter (LPBTM→BTM, LPCAN→CAN)
+                if k == "module" and isinstance(v, str):
+                    v = self._neo4j_module(v)
                 params[pname] = v
 
         where_str = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
@@ -2655,6 +2694,22 @@ class SearchService:
 
         db = self._db_for_workspace(workspace_id)
         params = parameters or {}
+
+        # Resolve LP-variant aliases in raw Cypher: rewrite literal module strings
+        # and any parameter value that equals an aliased module name.
+        # Handles both WHERE n.module = 'LPBTM' and {module: 'LPBTM'} forms.
+        _alias_pattern = re.compile(
+            r"(module\s*[:=]\s*['\"])(" + "|".join(_NEO4J_MODULE_ALIASES) + r")(['\"])",
+            re.IGNORECASE,
+        )
+        query = _alias_pattern.sub(
+            lambda m: m.group(1) + _NEO4J_MODULE_ALIASES[m.group(2).upper()] + m.group(3),
+            query,
+        )
+        params = {
+            k: _NEO4J_MODULE_ALIASES.get(v.upper(), v) if isinstance(v, str) else v
+            for k, v in params.items()
+        }
 
         rows = []
         try:

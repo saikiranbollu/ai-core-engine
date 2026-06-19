@@ -1,0 +1,823 @@
+# ============================================================================
+# ILLD Module Map — Source File Registry
+# ============================================================================
+# Reference mapping of every ILLD module to its input source files.
+# Used by the pipeline to locate and fetch the correct files from GitLab
+# and Bitbucket.
+#
+# Fields
+# ------
+#   gitlab_prefix   : "peripheral" | "base"  (subfolder under lld/)
+#   gitlab_path     : path relative to the GitLab repo root
+#   swa             : SWA header filename(s)
+#   swa_note        : naming quirk, if any
+#   sfr             : SFR regdef header filename(s)
+#   sfr_tokens      : search token(s) used in the shared SFR tree
+#   sfr_note        : naming quirk, if any
+#   src             : C source filename(s)
+#   puml            : PlantUML diagram filename(s)
+#   srs             : SRS .dox filename
+#   bb_source       : "Baselined_Versions" | "Deviation_Versions"
+#   bb_folder       : folder name inside bb_source
+#   pdf             : PDF filename
+#   submodules      : logical sub-blocks (where the module splits into named parts)
+#
+# Last updated: 2026-06-10
+# ============================================================================
+
+meta:
+  bb_base_path: "Alpha2_VP-EIR2_iLLD/"
+  gitlab_project: "ifx/atv-mc/atv-mc-sw-lld/aurix_rc1_illd/aurix_rc1_illd_platform"
+  gitlab_ref: "master"
+  sfr_shared_path: "lld/RC1S16A/sfr/inc"
+  jama_project_id: 1986
+  jama_project_name: "AURIX_RC1_iLLD"
+  jama_base_url: "https://rqmprod.intra.infineon.com"
+  jama_shrq_root_id: 29769880
+  jama_shrq_root_name: "Stakeholder Requirement"
+  jama_prq_root_id: null
+  jama_illd_root_id: 18995439
+  jama_illd_root_key: AURC1-FLD-3
+  jama_illd_root_name: "iLLD"
+  jama_note: "Module folders (type=32) are direct children of iLLD root AURC1-FLD-3 (id=18995439). jama_folder_id is the Jama API numeric item id, NOT the globalId (GID-xxxxxxx) shown in the UI. PRQ root not found."
+
+modules:
+
+  # ── Communication ─────────────────────────────────────────────────────────
+
+  BTM:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Btm
+    swa: null
+    sfr: [IfxBtm_regdef.h]
+    src: [IfxBtm_Block.c, IfxBtm_Counter.c, IfxBtm_Pwm.c, IfxBtm_Quaddec.c, IfxBtm_ShiftRegister.c]
+    srs: IfxBtm_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_BTM
+    pdf: BTM_FBcontent_INTERNAL_2026-03-25.pdf
+    jama_folder_id: 18995440
+    jama_folder_key: AURC1-FLD-4
+    jama_folder_name: Btm
+
+  CAN:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Can
+    swa: [IfxCan_swa.h]
+    sfr: [IfxCan_regdef.h]
+    src: [IfxCan.c]
+    srs: null
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_CAN
+    pdf: "CAN_HWA-FBcontainer_[platformFB]_RC1.pdf"
+    jama_folder_id: 18995441
+    jama_folder_key: AURC1-FLD-5
+    jama_folder_name: Can
+
+  CXPI:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Cxpi
+    swa: [IfxCxpi_swa.h]
+    sfr: [IfxCxpi_regdef.h]
+    src: [IfxCxpi.c]
+    srs: IfxCxpi_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_CXPI
+    pdf: CXPI_FBcontent_INTERNAL_2026-04-04.pdf
+    jama_folder_id: 21984994
+    jama_folder_key: AURC1-FLD-22
+    jama_folder_name: Cxpi
+
+  FRAY:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Fray
+    swa: [IfxFray_Fray_swa.h]
+    sfr: [IfxFray_regdef.h]
+    src: [IfxFray.c]
+    srs: IfxFray_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_FRAY
+    pdf: RC1_FRAY_HWA_Nom.pdf
+    jama_folder_id: 21993324
+    jama_folder_key: AURC1-FLD-23
+    jama_folder_name: Fray
+
+  ICN:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Icn
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    srs_note: "GitLab directory exists but is empty — content not yet contributed"
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_ICN
+    pdf: "ICN_HWA-FBcontainer_[platformFB]_RC1.pdf"
+    jama_folder_id: 25935086
+    jama_folder_key: AURC1-FLD-77
+    jama_folder_name: ICN
+
+  LIN:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Lin
+    swa: [IfxLin_swa.h]
+    sfr: [IfxLin_regdef.h]
+    src: [IfxLin.c]
+    srs: IfxLIN_srs.dox
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_LIN
+    pdf: LIN_FBcontent_INTERNAL_2026-05-19.pdf
+    jama_folder_id: 21238333
+    jama_folder_key: AURC1-FLD-21
+    jama_folder_name: Lin
+
+  PSI5:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Psi5
+    swa: [IfxPsi5_swa.h]
+    sfr: [IfxPsi5_regdef.h]
+    src: [IfxPsi5.c]
+    srs: IfxPsi5_Psi5.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_PSI5
+    pdf: "PSI5_HWA-FBcontainer_[platformFB]_RC1.pdf"
+    jama_folder_id: 21993326
+    jama_folder_key: AURC1-FLD-25
+    jama_folder_name: Psi5
+
+  PSI5S:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Psi5s
+    swa: [IfxPsi5s_Psi5s_swa.h]
+    sfr: [IfxPsi5s_regdef.h]
+    src: [IfxPsi5s.c]
+    srs: IfxPsi5s_Psi5s.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_PSI5S
+    pdf: RC1_PSI5S_HWA_Nom.pdf
+    jama_folder_id: 21993327
+    jama_folder_key: AURC1-FLD-26
+    jama_folder_name: Psi5s
+
+  SENT:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Sent
+    swa: [IfxSent_swa.h]
+    sfr: [IfxSent_regdef.h]
+    src: [IfxSent.c]
+    srs: null
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_SENT
+    pdf: SENT_FBcontent_INTERNAL_2026-05-19.pdf
+    jama_folder_id: 22810710
+    jama_folder_key: AURC1-FLD-52
+    jama_folder_name: Sent
+
+  WCAN:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Wcan
+    swa: [IfxWcan_swa.h]
+    sfr: [IfxWcan_regdef.h]
+    src: [IfxWcan.c]
+    srs: null
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_WCAN
+    pdf: WCAN_FBcontent_INTERNAL_2026-03-01.pdf
+    jama_folder_id: 26382306
+    jama_folder_key: AURC1-FLD-81
+    jama_folder_name: Wcan
+
+  # ── Memory & DMA ──────────────────────────────────────────────────────────
+
+  CMEM:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Cmem
+    swa: [IfxCmem_swa.h]
+    sfr: [IfxCmem_regdef.h]
+    src: [IfxCmem.c]
+    srs: null
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_CMEM
+    pdf: CMEM_FBcontent_INTERNAL_2026-03-27.pdf
+    jama_folder_id: 24308879
+    jama_folder_key: AURC1-FLD-64
+    jama_folder_name: Cmem
+
+  RAMC:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Ramc
+    swa: [IfxRamc_swa.h]
+    sfr: [IfxRamc_regdef.h]
+    src: [IfxRamc.c]
+    srs: null
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_RAMC
+    pdf: RAMC_FBcontent_INTERNAL_2026-05-25.pdf
+    jama_folder_id: 25936137
+    jama_folder_key: AURC1-FLD-78
+    jama_folder_name: RAMC
+
+  SCB:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Scb
+    submodules: [I2C, SPI, UART]
+    swa: [IfxScb_swa.h, IfxScb_I2c_swa.h, IfxScb_Spi_swa.h, IfxScb_Uart_swa.h]
+    sfr: [IfxScb_regdef.h]
+    src: [IfxScb.c, IfxScb_I2c.c, IfxScb_Spi.c, IfxScb_Uart.c]
+    srs: null
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_SCB
+    pdf: SCB_FBcontent_INTERNAL_2026-05-19.pdf
+    jama_folder_id: 21993330
+    jama_folder_key: AURC1-FLD-29
+    jama_folder_name: Scb
+
+  SDMMC:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Sdmmc
+    submodules: [COMMON, EMMC, SD]
+    swa: [IfxSdmmc_Common_swa.h, IfxSdmmc_Emmc_swa.h, IfxSdmmc_Sd_swa.h, IfxSdmmc_priv_swa.h]
+    sfr: [IfxSdmmc_regdef.h]
+    src: [IfxSdmmc_Common.c, IfxSdmmc_Emmc.c, IfxSdmmc_Sd.c, IfxSdmmc_priv.c]
+    srs: IfxSdmmc_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_SDMMC
+    pdf: SDMMC_HWA_nom.pdf
+    jama_folder_id: 25379323
+    jama_folder_key: AURC1-FLD-70
+    jama_folder_name: Sdmmc
+
+  XDMA:
+    gitlab_prefix: base
+    gitlab_path: lld/base/Xdma
+    swa: null
+    sfr: [IfxXdma_regdef.h]
+    src: [IfxXdma.c]
+    srs: null
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_XDMA
+    pdf: XDMA_FBcontent_INTERNAL_2025-10-13.pdf
+    jama_folder_id: 18995443
+    jama_folder_key: AURC1-FLD-7
+    jama_folder_name: Xdma
+
+  # ── Analog ────────────────────────────────────────────────────────────────
+
+  LPADC:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Lpadc
+    swa: [IfxLpadc_swa.h]
+    sfr: [IfxLpadc_regdef.h]
+    src: [IfxLpadc.c]
+    srs: null
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_LPADC
+    pdf: LPADC_FBcontent_INTERNAL_2026-02-27.pdf
+    jama_folder_id: 27086924
+    jama_folder_key: AURC1-FLD-87
+    jama_folder_name: Lpadc
+
+  # ── Power & Reset ─────────────────────────────────────────────────────────
+
+  CHIPMON:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Chipmon
+    swa: [IfxChipmon_Mon_swa.h]
+    sfr: null
+    sfr_note: "No dedicated SFR block — uses N28RRA sub-IP registers shared with CLOCKSC"
+    src: [IfxChipmon.c]
+    srs: IfxChipmon_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_N28RRA_DTS_HP
+    bb_folder_note: "N28RRA sub-IP naming. Same PDF in: RC1_IP_N28RRA_DVMON, RC1_IP_N28RRA_SMON_CRACK, RC1_IP_N28RRA_SMON_DG, RC1_IP_N28RRA_SMON_EXT, RC1_IP_N28RRA_SMON_SAT, RC1_IP_N28RRA_TPAM"
+    pdf: "CHIPMON_FBcontent_INTERNAL_2025-11-10_.pdf"
+    jama_folder_id: 26706571
+    jama_folder_key: AURC1-FLD-83
+    jama_folder_name: Chipmon
+
+  PMS:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Pms
+    submodules: [CORE, MON, TOP]
+    swa: [IfxPms_Core_swa.h]
+    sfr: [IfxPmscore_regdef.h, IfxPmsmon_regdef.h, IfxPmstop_regdef.h]
+    src: [IfxPms_Core.c, IfxPms_Mon.c, IfxPms_Top.c]
+    srs: IfxPms_Core_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_PMS_MON
+    bb_folder_note: "Folder suffix PMS_MON; found via bidirectional prefix match"
+    pdf: PMS_HWA.pdf
+    jama_folder_id: 26525876
+    jama_folder_key: AURC1-FLD-82
+    jama_folder_name: Pms
+
+  RESETSC:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Resetsc
+    submodules: [LRCU, MRCU]
+    swa: [IfxResetsc_swa.h]
+    sfr: [IfxMrcu_regdef.h, IfxLrcu_regdef.h]
+    src: [IfxResetsc_Lrcu.c, IfxResetsc_Mrcu.c]
+    srs: IfxResetsc_srs.dox
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    jama_folder_id: 24463845
+    jama_folder_key: AURC1-FLD-65
+    jama_folder_name: Resetsc
+
+  SMU:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Smu
+    submodules: [LPSM, MAIN, SAT]
+    swa: null
+    sfr: [IfxSmulpsm_regdef.h, IfxSmumain_regdef.h, IfxSmusat_regdef.h]
+    src: [IfxSmu_Lpsm.c, IfxSmu_Main.c, IfxSmu_Sat.c]
+    srs: IfxSmu_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_SMUSAT
+    bb_folder_note: "Folder suffix SMUSAT; found via bidirectional prefix match"
+    pdf: SMU_FBcontent_INTERNAL_2026-01-31.pdf
+    jama_folder_id: 20680993
+    jama_folder_key: AURC1-FLD-16
+    jama_folder_name: Smu
+
+  TINFRA:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Tinfra
+    swa: [IfxTinfra_Tinfra_swa.h]
+    sfr: [IfxTinfra_regdef.h]
+    src: [IfxTinfra.c]
+    srs: IfxTinfra_Tinfra_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_TINFRA
+    pdf: TINFRA_FBcontent_INTERNAL_2025-10-29.pdf
+    jama_folder_id: 21993325
+    jama_folder_key: AURC1-FLD-24
+    jama_folder_name: TInfra
+
+  # ── CPU & System ──────────────────────────────────────────────────────────
+
+  CLOCKSC:
+    gitlab_prefix: base
+    gitlab_path: lld/base/Clocksc
+    submodules: [LPCCU, LPPLL, MCCU, MPLL]
+    submodules_note: "Each sub-block has its own SFR file and .c source file"
+    swa: [IfxClocksc_swa.h]
+    sfr: [IfxLpccu_regdef.h, IfxLppll_regdef.h, IfxMccu_regdef.h, IfxMpll_regdef.h]
+    sfr_tokens: [LPCCU, LPPLL, MCCU, MPLL]
+    sfr_note: "SFR files are named after sub-blocks, not CLOCKSC"
+    src: [IfxClocksc_Lpccu.c, IfxClocksc_Lppll.c, IfxClocksc_Mccu.c, IfxClocksc_Mpll.c]
+    srs: IfxClocksc_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_N28RRA_CTROOT
+    bb_folder_note: "N28RRA sub-IP naming. Same PDF also in: RC1_IP_N28RRA_FLL, RC1_IP_N28RRA_LPPLL_TOP, RC1_IP_N28RRA_MHZ_OSC, RC1_IP_N28RRA_MPLL"
+    pdf: RC1_CLOCKSC_HWA_Nom_v20251107_01.pdf
+    jama_folder_id: 25017249
+    jama_folder_key: AURC1-FLD-67
+    jama_folder_name: ClockSc
+
+  CPUB:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Cpub
+    swa: null
+    sfr: [IfxCpub_regdef.h]
+    src: null
+    srs: null
+    srs_note: "GitLab directory exists but all content dirs are empty"
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    jama_folder_id: 21123967
+    jama_folder_key: AURC1-FLD-20
+    jama_folder_name: CPU-BASE
+
+  LCSS:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Lcss
+    submodules: [CRYPTO, SECURECRYPTO]
+    swa: [IfxLcss_Crypto_swa.h, IfxLcss_SecureCrypto_swa.h]
+    sfr: [IfxLcss_regdef.h]
+    src: [IfxLcss_Crypto.c, IfxLcss_SecureCrypto.c]
+    srs: null
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_LCSS
+    pdf: LCSS_FBcontent_INTERNAL_2026-05-25.pdf
+    jama_folder_id: 19385854
+    jama_folder_key: AURC1-FLD-14
+    jama_folder_name: Lcss
+
+  MXAES:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Mxaes
+    swa: [IfxMxaes_SecureCrypto_swa.h]
+    sfr: [IfxMxaes_regdef.h]
+    src: [IfxMxaes.c, IfxMxaes_priv.c]
+    srs: null
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_MXAES
+    pdf: MXAES_FBcontent_INTERNAL_2026-05-26.pdf
+    jama_folder_id: 26721071
+    jama_folder_key: AURC1-FLD-84
+    jama_folder_name: Mxaes
+
+  PORTS:
+    gitlab_prefix: base
+    gitlab_path: lld/base/Ports
+    swa: null
+    sfr: [IfxPortx_regdef.h]
+    sfr_note: "SFR file uses PORTX, not PORTS"
+    src: [IfxPorts.c]
+    srs: IfxPorts_srs.dox
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_PORTX
+    pdf: PORTS_FBcontent_INTERNAL_2026-04-14.pdf
+    jama_folder_id: 25017534
+    jama_folder_key: AURC1-FLD-68
+    jama_folder_name: PORTS
+
+  PSAR:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Psar
+    swa: [IfxPsar_swa.h]
+    sfr: [IfxPsar_regdef.h]
+    src: [IfxPsar.c]
+    srs: IfxPsar_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_PSAR
+    pdf: PSAR_FBcontent_INTERNAL_2026-04-23.pdf
+    jama_folder_id: 24701533
+    jama_folder_key: AURC1-FLD-66
+    jama_folder_name: PSAR
+
+  RNG:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Rng
+    swa: [IfxRng_swa.h]
+    sfr: [IfxRng_regdef.h]
+    src: [IfxRng.c]
+    srs: IfxRng_srs.dox
+    bb_source: Deviation_Versions
+    bb_folder: RC1_IP_RNG
+    pdf: RNG_FBcontent_INTERNAL_2026-05-26.pdf
+    jama_folder_id: 25513029
+    jama_folder_key: AURC1-FLD-74
+    jama_folder_name: Rng
+
+  SCU:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Scu
+    submodules: [ERU, SCU]
+    swa: [IfxScu_Eru_swa.h, IfxScu_Scu_swa.h]
+    sfr: [IfxScu_regdef.h]
+    src: [IfxScu_Eru.c]
+    srs: IfxScu_srs.dox
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_SCU_RC1
+    bb_folder_note: "Folder suffix SCU_RC1; found via bidirectional prefix match"
+    pdf: SCU_FBcontent_INTERNAL_2026-03-19.pdf
+    jama_folder_id: 21993328
+    jama_folder_key: AURC1-FLD-27
+    jama_folder_name: Scu
+
+  XSPI:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Xspi
+    swa: [IfxXspi_swa.h]
+    sfr: [IfxXspi_regdef.h]
+    src: [IfxXspi.c, IfxXspi_HbFlash.c, IfxXspi_Memslot.c, IfxXspi_Sfdp.c]
+    srs: null
+    bb_source: Baselined_Versions
+    bb_folder: RC1_IP_XSPI
+    pdf: "XSPI_HWA-FBcontainer_[platformFB]_RC1.pdf"
+    jama_folder_id: 25976294
+    jama_folder_key: AURC1-FLD-79
+    jama_folder_name: Xspi
+
+  # ── Security ──────────────────────────────────────────────────────────────
+
+  NVMR:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Nvmr
+    submodules: [NVMR, CSRM]
+    swa: [IfxNvmr_swa.h, IfxNvmrCsrm_swa.h]
+    sfr: null
+    sfr_note: "No dedicated SFR block found in shared tree"
+    src: [IfxNvmr.c, IfxNvmrCsrm.c]
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    jama_folder_id: 19385823
+    jama_folder_key: AURC1-FLD-9
+    jama_folder_name: Nvmr
+
+  # ── LP-Variant Aliases ────────────────────────────────────────────────────
+  # Logical aliases — share the same HW registers as the parent module.
+  # Have their own GitLab folder for LP-specific variant files.
+
+  LPBTM:
+    alias_of: BTM
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Lpbtm
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    jama_folder_id: null
+    jama_folder_key: null
+    jama_folder_name: null
+
+  LPCAN:
+    alias_of: CAN
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Lpcan
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    jama_folder_id: null
+    jama_folder_key: null
+    jama_folder_name: null
+
+  # ── Jama-only (no GitLab source, not in current pipeline scope) ─────────────
+
+  AUDIO:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Audio
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 26379556
+    jama_folder_key: AURC1-FLD-80
+    jama_folder_name: Audio
+
+  CPUP:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Cpup
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 25061141
+    jama_folder_key: AURC1-FLD-69
+    jama_folder_name: CPU-EB
+
+  GST:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Gst
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 19385829
+    jama_folder_key: AURC1-FLD-10
+    jama_folder_name: Gst
+
+  PHYIF:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Phyif
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 25902465
+    jama_folder_key: AURC1-FLD-76
+    jama_folder_name: PhyIf
+
+  SPU:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Spu
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 19385831
+    jama_folder_key: AURC1-FLD-11
+    jama_folder_name: Spu
+
+  # ── Next-batch modules (Jama-registered, source files TBD) ───────────────
+  # These exist in Jama but have not yet been ingested into the pipeline.
+  # GitLab paths are inferred; swa/sfr/src/srs files need verification.
+
+  DFXTOP:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Dfxtop
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 29203160
+    jama_folder_key: AURC1-FLD-101
+    jama_folder_name: Dfxtop
+
+  ES_ETH_HAL:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Es_Eth_Hal
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 28592597
+    jama_folder_key: AURC1-FLD-98
+    jama_folder_name: "ES/ETH_HAL"
+
+  ES_SWITCH_HAL:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Es_Switch_Hal
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 28592844
+    jama_folder_key: AURC1-FLD-99
+    jama_folder_name: "ES/SWITCH_HAL"
+
+  ETHSA_DEMO:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Ethsa_Demo
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 28593220
+    jama_folder_key: AURC1-FLD-100
+    jama_folder_name: ETHSA-Demo
+
+  ETHERNOVIA_HOST_HAL:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Ethernovia/Host_Hal
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 27323057
+    jama_folder_key: AURC1-FLD-89
+    jama_folder_name: "Ethernovia/Host_Hal"
+
+  ETHERNOVIA_SWIFT_HAL:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Ethernovia/Swift_Hal
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 27323258
+    jama_folder_key: AURC1-FLD-91
+    jama_folder_name: "Ethernovia/Swift_Hal"
+
+  IPC:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Ipc
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 20740046
+    jama_folder_key: AURC1-FLD-17
+    jama_folder_name: Ipc
+
+  IR:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Ir
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 21122925
+    jama_folder_key: AURC1-FLD-19
+    jama_folder_name: IR
+
+  LPKC:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Lpkc
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 27085619
+    jama_folder_key: AURC1-FLD-86
+    jama_folder_name: Lpkc
+
+  POWERC:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Powerc
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 27226248
+    jama_folder_key: AURC1-FLD-88
+    jama_folder_name: Powerc
+
+  RDMA:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Rdma
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 19385832
+    jama_folder_key: AURC1-FLD-12
+    jama_folder_name: Rdma
+
+  REFERENCE_SDK:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Reference_Sdk
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 27000039
+    jama_folder_key: AURC1-FLD-85
+    jama_folder_name: Reference SDK
+
+  RIF:
+    gitlab_prefix: peripheral
+    gitlab_path: lld/peripheral/Rif
+    swa: null
+    sfr: null
+    src: null
+    srs: null
+    bb_source: null
+    bb_folder: null
+    pdf: null
+    pipeline_scope: false
+    jama_folder_id: 19385857
+    jama_folder_key: AURC1-FLD-15
+    jama_folder_name: Rif
+

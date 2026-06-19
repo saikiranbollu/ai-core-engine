@@ -8,7 +8,7 @@ returns sheets as structured data (list of row-dicts).
 **Requires** ``pandas`` and ``openpyxl``.
 
 Usage:
-    from IngestionPipeline.Parsers import xlsx_parser
+    from IngestionPipeline.parsers import xlsx_parser
 
     result = xlsx_parser.parse("data.xlsx")
     # result is a dict mapping sheet names to lists of row-dicts

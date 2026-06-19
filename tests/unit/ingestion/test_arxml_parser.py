@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "sr
 
 import xml.etree.ElementTree as ET
 
-from IngestionPipeline.Parsers import arxml_parser
+from IngestionPipeline.parsers import arxml_parser
 
 # ---------------------------------------------------------------------------
 # Sample pure ARXML – mirrors EcuC_001.arxml structure (simplified)

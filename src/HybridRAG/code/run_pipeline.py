@@ -537,6 +537,38 @@ def step11_kg_sfr(module: str, dry_run: bool, profile: str = "test", force: bool
 
 
 # ---------------------------------------------------------------------------
+# Step 8: Qdrant Ingestion (Source Code → Qdrant)
+# ---------------------------------------------------------------------------
+
+def step_qdrant_sourcecode(module: str, dry_run: bool, clear: bool = False, **_kwargs) -> None:
+    """Ingest source code function snippets into Qdrant for semantic search.
+
+    Reads the intermediate JSON from step 6 (functions.json, call_edges.json)
+    and the original source files to extract full function bodies, then
+    embeds and upserts them into a Qdrant collection.
+
+    For multi-repo modules, runs once per sub-module.
+    """
+    sub_modules = _expand_sub_modules(module)
+    for sub in sub_modules:
+        label_suffix = f" [{sub}]" if len(sub_modules) > 1 else ""
+        cmd = [
+            PYTHON, "sourcecode_qdrant_ingest.py",
+            "--module", sub, "-v",
+        ]
+        if dry_run:
+            cmd.append("--dry-run")
+        if clear:
+            cmd.append("--clear")
+        _run(
+            cmd,
+            cwd=CODE_DIR / "KG",
+            label=f"Step 8: Qdrant ingestion (Source Code → Qdrant){label_suffix}",
+            dry_run=False,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 STEPS: dict[int, dict] = {
@@ -548,6 +580,7 @@ STEPS: dict[int, dict] = {
     5:  {"fn": step9_kg_testspec,    "label": "KG ingestion (Test Spec)",       "needs_module": True},
     6:  {"fn": step10_kg_source,     "label": "KG ingestion (Source Code)",     "needs_module": True},
     7:  {"fn": step11_kg_sfr,        "label": "KG ingestion (SFR → Neo4j)",     "needs_module": True},
+    8:  {"fn": step_qdrant_sourcecode, "label": "Qdrant ingestion (Source Code)", "needs_module": True},
 }
 
 

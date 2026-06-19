@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from src._common.path_safety import allowed_roots_from_env, safe_path_under
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +244,16 @@ class IngestionService:
     def ingest_file(self, file_path: str, module_name: str,
                     overwrite: bool = False, workspace_id: str = "illd") -> Dict[str, Any]:
         """Parse a single file and ingest into KG."""
-        p = Path(file_path)
+        # F-CA-I01: contain the input under an allowed root (symlink + traversal
+        # safe) BY DEFAULT. Operators/tests widen the roots via
+        # INGEST_ALLOWED_ROOTS; when unset, only /data and /repos are accepted so
+        # arbitrary absolute paths (e.g. /etc/passwd) cannot be ingested.
+        roots = allowed_roots_from_env("INGEST_ALLOWED_ROOTS", ["/data", "/repos"])
+        try:
+            p = safe_path_under(file_path, roots)
+        except ValueError as exc:
+            raise ValueError(f"Rejected file path: {exc}") from exc
+
         if not p.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 

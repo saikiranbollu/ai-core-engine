@@ -84,7 +84,7 @@ class TestToolTiers:
         from mcp.core.tool_tiers import get_tool_tier
         assert get_tool_tier("search_database") == "public"
         assert get_tool_tier("execute_cypher") == "developer"
-        assert get_tool_tier("ingest_file") == "admin"
+        assert get_tool_tier("cache_clear") == "admin"
         assert get_tool_tier("unknown_tool_xyz") is None  # unknown tools return None
 
     def test_role_may_invoke(self):
@@ -93,24 +93,24 @@ class TestToolTiers:
         assert role_may_invoke("public", "search_database") is True
         # public cannot invoke developer or admin tools
         assert role_may_invoke("public", "execute_cypher") is False
-        assert role_may_invoke("public", "ingest_file") is False
+        assert role_may_invoke("public", "cache_clear") is False
         # developer can invoke public + developer
         assert role_may_invoke("developer", "search_database") is True
         assert role_may_invoke("developer", "execute_cypher") is True
-        assert role_may_invoke("developer", "ingest_file") is False
+        assert role_may_invoke("developer", "cache_clear") is False
         # admin can invoke anything
-        assert role_may_invoke("admin", "ingest_file") is True
+        assert role_may_invoke("admin", "cache_clear") is True
         assert role_may_invoke("admin", "execute_cypher") is True
         assert role_may_invoke("admin", "search_database") is True
 
     def test_all_56_tools_covered(self):
         from mcp.core.tool_tiers import TOOL_TIERS
-        # 13 categories + 4 sandbox + 2 RLM + 1 GAP v2 tool = 58 tools
-        assert len(TOOL_TIERS) == 58
+        # 55 tools across 14 categories (Plan 2 Phase 2 removed 4 ingestion tools)
+        assert len(TOOL_TIERS) == 55
 
     def test_sandbox_and_rlm_tools_present(self):
         from mcp.core.tool_tiers import TOOL_TIERS
-        for t in ("sandbox_upload", "sandbox_query", "sandbox_status",
+        for t in ("sandbox_upload", "sandbox_status",
                    "sandbox_clear", "rlm_orchestrate", "rlm_plan_preview"):
             assert t in TOOL_TIERS
 
@@ -305,8 +305,9 @@ class TestLRUModuleInvalidation:
 class TestIngestionCompletionCallback:
     """IngestionService fires on_module_ingested callback on success (MEG_SW-112)."""
 
-    def test_callback_fires_on_ingest_file(self, tmp_path):
+    def test_callback_fires_on_ingest_file(self, tmp_path, monkeypatch):
         from src.IngestionPipeline.ingestion_service import IngestionService
+        monkeypatch.setenv("INGEST_ALLOWED_ROOTS", str(tmp_path))
         fired = []
         svc = IngestionService(on_module_ingested=lambda m, w: fired.append((m, w)))
         f = tmp_path / "test.json"
@@ -314,8 +315,9 @@ class TestIngestionCompletionCallback:
         svc.ingest_file(str(f), "TestMod", workspace_id="illd")
         assert ("TestMod", "illd") in fired
 
-    def test_callback_failure_does_not_break_ingestion(self, tmp_path):
+    def test_callback_failure_does_not_break_ingestion(self, tmp_path, monkeypatch):
         from src.IngestionPipeline.ingestion_service import IngestionService
+        monkeypatch.setenv("INGEST_ALLOWED_ROOTS", str(tmp_path))
         def bad_callback(m, w):
             raise RuntimeError("callback boom")
         svc = IngestionService(on_module_ingested=bad_callback)
@@ -324,13 +326,27 @@ class TestIngestionCompletionCallback:
         result = svc.ingest_file(str(f), "TestMod")
         assert result["status"] == "completed"
 
-    def test_no_callback_is_safe(self, tmp_path):
+    def test_no_callback_is_safe(self, tmp_path, monkeypatch):
         from src.IngestionPipeline.ingestion_service import IngestionService
+        monkeypatch.setenv("INGEST_ALLOWED_ROOTS", str(tmp_path))
         svc = IngestionService()
         f = tmp_path / "test.json"
         f.write_text('{"key": "val"}')
         result = svc.ingest_file(str(f), "TestMod")
         assert result["status"] == "completed"
+
+    def test_ingest_rejects_path_outside_allowed_roots(self, tmp_path, monkeypatch):
+        """F-CA-I01: with containment on by default, a supported file outside the
+        allowed roots is rejected (not silently ingested)."""
+        from src.IngestionPipeline.ingestion_service import IngestionService
+        # No INGEST_ALLOWED_ROOTS -> defaults to /data,/repos, which tmp_path is
+        # not under, so ingestion must be refused before any parsing.
+        monkeypatch.delenv("INGEST_ALLOWED_ROOTS", raising=False)
+        svc = IngestionService()
+        f = tmp_path / "outside.json"
+        f.write_text('{"key": "val"}')
+        with pytest.raises(ValueError, match="Rejected file path"):
+            svc.ingest_file(str(f), "TestMod")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -519,7 +535,7 @@ class TestParserDispatch:
         with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
             f.write(b"dummy")
             f.flush()
-            with patch.dict("sys.modules", {"src.IngestionPipeline.Parsers.xlsx_parser": None}):
+            with patch.dict("sys.modules", {"src.IngestionPipeline.parsers.xlsx_parser": None}):
                 result = svc._parse_file(Path(f.name), ".xlsx")
         assert result is not None
         assert result.get("type") in ("xlsx", "generic")

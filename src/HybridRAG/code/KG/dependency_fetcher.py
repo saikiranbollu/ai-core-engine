@@ -27,6 +27,8 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from src._common.tls_config import get_verify_setting
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -135,7 +137,7 @@ def _make_connector(repo: str):
         repo=repo,
         username=os.environ.get("IFX_USERNAME"),
         password=os.environ.get("IFX_PASSWORD"),
-        verify_ssl=os.environ.get("IFX_VERIFY_SSL", "true").lower() != "false",
+        verify_ssl=get_verify_setting(),
         ref="master",
     )
 

@@ -1233,6 +1233,460 @@ def parse_exported_interfaces(
 
 
 # ---------------------------------------------------------------------------
+# Heading ancestry utilities (for zone-based detection)
+# ---------------------------------------------------------------------------
+
+def _build_heading_ancestry(sections: List[dict]) -> Dict[int, List[str]]:
+    """
+    For each section index, compute the list of ancestor heading titles
+    (lowest-level first to current), using section number depth as hierarchy.
+
+    Uses section_number depth (e.g. "3.3.1" → depth 3) instead of markdown
+    heading level, because OCR-converted documents often flatten all headings
+    to the same ``##`` level.
+    """
+    ancestry: Dict[int, List[str]] = {}
+    stack: list = []  # [(depth, title_lower), ...]
+
+    for i, sec in enumerate(sections):
+        sec_num = sec.get("section_number", "")
+        depth = len(sec_num.split(".")) if sec_num else sec["level"]
+        title_lower = sec["title"].lower()
+
+        # Pop entries at same or deeper depth
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+
+        ancestry[i] = [t for _, t in stack] + [title_lower]
+        stack.append((depth, title_lower))
+
+    return ancestry
+
+
+# ---------------------------------------------------------------------------
+# Parser: Safety & Security nodes
+# ---------------------------------------------------------------------------
+
+def parse_safety_security_nodes(
+    content: str,
+    module: str,
+    source_document: str,
+) -> Tuple[List[dict], List[dict], List[dict], List[dict]]:
+    """
+    Extract SWA_SafetyMeasure, SWA_SafetyAoU, SWA_SecurityMeasure, and
+    SWA_SecurityAoU nodes from SWA markdown content.
+
+    Detection uses heading-hierarchy context: sections under "Safety measures"
+    become SafetyMeasure, sections under "AoU" within "Safety view" become
+    SafetyAoU, etc.  No section numbers are hardcoded.
+
+    Returns (safety_measures, safety_aous, security_measures, security_aous).
+    """
+    sections = _split_sections_by_headings(content)
+    ancestry = _build_heading_ancestry(sections)
+
+    safety_measures: List[dict] = []
+    safety_aous: List[dict] = []
+    security_measures: List[dict] = []
+    security_aous: List[dict] = []
+    seen_fids: set = set()
+
+    for i, sec in enumerate(sections):
+        anc = ancestry.get(i, [])
+
+        in_safety = any("safety" in a for a in anc)
+        in_security = any("security" in a or "trusted" in a for a in anc)
+        in_measures = any("measure" in a for a in anc)
+        in_aou = any(a.strip() == "aou" or a.strip().endswith(" aou") for a in anc)
+
+        if not (in_safety or in_security):
+            continue
+
+        # Must have a [req featureID=...] tag to be a concrete node
+        full_text = sec["heading_line"] + "\n" + sec["body"]
+        req_match = _REQ_TAG_RE.search(full_text)
+        if not req_match:
+            req_match = _REQ_TAG_ALT_RE.search(full_text)
+        if not req_match:
+            continue
+
+        fid = req_match.group("fid")
+        if fid in seen_fids:
+            continue
+        seen_fids.add(fid)
+
+        raw_pids = req_match.group("pids")
+        prqs, _ = _parse_parent_ids(raw_pids)
+
+        desc = _clean_text(sec["body"])
+        if len(desc) > 2000:
+            desc = desc[:2000] + "…"
+
+        rationale_match = _RATIONALE_RE.search(sec["body"])
+        rationale = _clean_text(rationale_match.group(1)) if rationale_match else None
+
+        node = {
+            "feature_id": fid,
+            "title": sec["title"],
+            "section_number": sec["section_number"],
+            "description": desc or None,
+            "rationale": rationale,
+            "prq_references": prqs if prqs else None,
+            "module": module.upper(),
+            "source_document": source_document,
+        }
+
+        if in_safety and in_aou:
+            safety_aous.append(node)
+        elif in_safety:
+            safety_measures.append(node)
+        elif in_security and in_aou:
+            security_aous.append(node)
+        else:
+            security_measures.append(node)
+
+    return safety_measures, safety_aous, security_measures, security_aous
+
+
+# ---------------------------------------------------------------------------
+# Parser: Error Codes
+# ---------------------------------------------------------------------------
+
+def parse_error_codes(
+    content: str,
+    module: str,
+    source_document: str,
+) -> List[dict]:
+    """
+    Extract SWA_ErrorCode nodes from SWA error handling sections.
+
+    Detects sections whose heading contains "error handling" and finds
+    ``[req]``-tagged error names (``MODULE_E_*`` pattern) within.
+    """
+    sections = _split_sections_by_headings(content)
+    error_codes: List[dict] = []
+    seen_names: set = set()
+
+    for sec in sections:
+        if "error handling" not in sec["title"].lower():
+            continue
+
+        body = sec["body"]
+        # Remove page markers and repeated table headers
+        body = re.sub(r"^##\s+Pages?\s+\d+.*$", "", body, flags=re.MULTILINE)
+        body = re.sub(
+            r"^\|\s*Error Name.*\|$", "", body,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+        body = re.sub(r"^\|[\s\-:|]+\|$", "", body, flags=re.MULTILINE)
+
+        # Find all [req featureID=...]ERROR_NAME[/req] blocks
+        for m in _REQ_TAG_RE.finditer(body):
+            title = m.group("title").strip()
+            name_match = re.search(r"([A-Z][A-Z0-9]*_E_[A-Z0-9_]+)", title)
+            if not name_match:
+                continue
+            name = name_match.group(1)
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+
+            fid = m.group("fid")
+            prqs, _ = _parse_parent_ids(m.group("pids"))
+
+            # Description: text after the error name in the same table row
+            after = body[m.end(): m.end() + 500]
+            desc = re.split(r"\[req|featureID=", after)[0]
+            desc = re.sub(r"\\?\[/?req\\?\]", "", desc)
+            desc = _clean_text(desc)
+            if desc.startswith(name):
+                desc = re.sub(r"^[A-Z_]+:\s*", "", desc)
+
+            # Try to extract Source / Type / Value from surrounding row
+            row_text = body[max(0, m.start() - 50): m.end() + 1000]
+            error_source = None
+            error_type = None
+            error_value = None
+
+            if re.search(r"\|\s*AUTOSAR\b", row_text):
+                error_source = "AUTOSAR"
+            elif re.search(r"\|\s*Infineon\b", row_text):
+                error_source = "Infineon"
+            for etype in ("DEVELOPMENT", "RUNTIME", "DEM"):
+                if re.search(rf"\|\s*{etype}\b", row_text):
+                    error_type = etype
+                    break
+            val_m = re.search(r"\b(0x[0-9A-Fa-f]+)\b", row_text)
+            if val_m:
+                error_value = val_m.group(1)
+
+            error_codes.append({
+                "error_name": name,
+                "feature_id": fid,
+                "description": desc[:500] if desc else None,
+                "error_source": error_source,
+                "error_type": error_type,
+                "error_value": error_value,
+                "prq_references": prqs if prqs else None,
+                "module": module.upper(),
+                "source_document": source_document,
+            })
+
+    return error_codes
+
+
+# ---------------------------------------------------------------------------
+# Parser: Memory Sections
+# ---------------------------------------------------------------------------
+
+def parse_memory_sections(
+    content: str,
+    module: str,
+    source_document: str,
+) -> List[dict]:
+    """
+    Extract SWA_MemorySection nodes from "Memory sections" tables.
+    """
+    sections = _split_sections_by_headings(content)
+    memory_sections: List[dict] = []
+    seen: set = set()
+
+    for sec in sections:
+        if "memory section" not in sec["title"].lower():
+            continue
+
+        body = sec["body"]
+        body = re.sub(r"^##\s+Pages?\s+\d+.*$", "", body, flags=re.MULTILINE)
+        body = re.sub(
+            r"^\|\s*Memory Section.*\|$", "", body,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+        body = re.sub(r"^\|[\s\-:|]+\|$", "", body, flags=re.MULTILINE)
+
+        for m in _REQ_TAG_RE.finditer(body):
+            title = m.group("title").strip()
+            name_match = re.search(r"([A-Z][A-Z0-9_]+_SEC_[A-Z0-9_]+)", title)
+            if not name_match:
+                name_match = re.search(r"([A-Z][A-Z0-9_]{3,})", title)
+            if not name_match:
+                continue
+            name = name_match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+
+            fid = m.group("fid")
+            prqs, _ = _parse_parent_ids(m.group("pids"))
+
+            # Description from next table cell
+            after = body[m.end(): m.end() + 500]
+            desc = ""
+            desc_match = re.search(r"\|\s*(.+?)\s*\|", after)
+            if desc_match:
+                desc = _clean_text(desc_match.group(1))
+
+            memory_sections.append({
+                "section_name": name,
+                "feature_id": fid,
+                "description": desc or None,
+                "prq_references": prqs if prqs else None,
+                "module": module.upper(),
+                "source_document": source_document,
+            })
+
+    return memory_sections
+
+
+# ---------------------------------------------------------------------------
+# Parser: Source Files
+# ---------------------------------------------------------------------------
+
+def parse_source_files(
+    content: str,
+    module: str,
+    source_document: str,
+) -> List[dict]:
+    """
+    Extract SWA_SourceFile nodes from "File structure" sections.
+    """
+    sections = _split_sections_by_headings(content)
+    ancestry = _build_heading_ancestry(sections)
+    source_files: List[dict] = []
+    seen: set = set()
+
+    for i, sec in enumerate(sections):
+        anc = ancestry.get(i, [])
+        if not any("file structure" in a or "file listing" in a for a in anc):
+            continue
+
+        body = sec["body"]
+        body = re.sub(r"^##\s+Pages?\s+\d+.*$", "", body, flags=re.MULTILINE)
+
+        for m in _REQ_TAG_RE.finditer(body):
+            title = m.group("title").strip()
+            name_match = re.search(r"([A-Za-z_]\w*\.\w+)", title)
+            if not name_match:
+                continue
+            fname = name_match.group(1)
+            if fname in seen:
+                continue
+            seen.add(fname)
+
+            fid = m.group("fid")
+            prqs, _ = _parse_parent_ids(m.group("pids"))
+
+            after = body[m.end(): m.end() + 500]
+            desc = ""
+            desc_match = re.search(r"\|\s*(.+?)\s*(?:\||\n)", after)
+            if desc_match:
+                desc = _clean_text(desc_match.group(1))
+
+            source_files.append({
+                "file_name": fname,
+                "feature_id": fid,
+                "description": desc or None,
+                "prq_references": prqs if prqs else None,
+                "module": module.upper(),
+                "source_document": source_document,
+            })
+
+    return source_files
+
+
+# ---------------------------------------------------------------------------
+# Parser: Property Variables
+# ---------------------------------------------------------------------------
+
+def parse_property_variables(
+    content: str,
+    module: str,
+    source_document: str,
+) -> List[dict]:
+    """
+    Extract SWA_PropertyVariable nodes from "Device property file variables"
+    sections.  Each variable appears as a spec table with Name, Type, File,
+    Description, Design Decisions, Range.
+    """
+    sections = _split_sections_by_headings(content)
+    ancestry = _build_heading_ancestry(sections)
+    variables: List[dict] = []
+    seen: set = set()
+
+    for i, sec in enumerate(sections):
+        anc = ancestry.get(i, [])
+        if not any("property" in a and "variable" in a for a in anc):
+            continue
+
+        body = sec["body"]
+        if not body.strip():
+            continue
+
+        # Parse spec table (Name/Type/File/Description/Range rows)
+        kv = _parse_spec_table_rows(body)
+        if not kv:
+            continue
+
+        # Get variable name from table Name cell or heading
+        name = None
+        name_cell = kv.get("name", "")
+        name_m = re.search(r"([A-Za-z_]\w+\.\w+)", name_cell)
+        if name_m:
+            name = name_m.group(1)
+        if not name:
+            name_m = re.search(r"([A-Za-z_]\w+\.\w+)", sec["title"])
+            if name_m:
+                name = name_m.group(1)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+
+        fid = _extract_feature_id_from_syntax(name_cell)
+        if not fid:
+            fid = _extract_feature_id_from_syntax(body)
+
+        prqs = _extract_prq_references(name_cell)
+        if not prqs:
+            prqs = _extract_prq_references(body)
+
+        variables.append({
+            "variable_name": name,
+            "feature_id": fid,
+            "section_number": sec["section_number"],
+            "variable_type": kv.get("type"),
+            "file": kv.get("file"),
+            "description": _clean_text(kv.get("description", "")) or None,
+            "design_decisions": kv.get("design decisions") or None,
+            "value_range": kv.get("range"),
+            "prq_references": prqs if prqs else None,
+            "module": module.upper(),
+            "source_document": source_document,
+        })
+
+    return variables
+
+
+# ---------------------------------------------------------------------------
+# Parser: Call Sequences (Dynamic View)
+# ---------------------------------------------------------------------------
+
+def parse_call_sequences(
+    content: str,
+    module: str,
+    source_document: str,
+) -> List[dict]:
+    """
+    Extract SWA_CallSequence nodes from "Dynamic view" sections.
+
+    Each subsection under the dynamic view heading (e.g. "Initialization",
+    "De-initialization", "SW triggered one-shot conversion") becomes a
+    CallSequence node.
+    """
+    sections = _split_sections_by_headings(content)
+    ancestry = _build_heading_ancestry(sections)
+    sequences: List[dict] = []
+    seen_fids: set = set()
+
+    for i, sec in enumerate(sections):
+        anc = ancestry.get(i, [])
+        if not any("dynamic view" in a for a in anc):
+            continue
+        # Skip the "Dynamic view" heading itself
+        if "dynamic view" in sec["title"].lower():
+            continue
+
+        full_text = sec["heading_line"] + "\n" + sec["body"]
+
+        # Call sequence [req] tags may lack parentID
+        fid_m = re.search(
+            r"featureID\s*=\s*\\?[\[{]?\s*"
+            r"(?P<fid>[0-9A-Fa-f]{6,}[\-0-9A-Fa-f]*)",
+            full_text,
+        )
+        if not fid_m:
+            continue
+        fid = fid_m.group("fid")
+        if fid in seen_fids:
+            continue
+        seen_fids.add(fid)
+
+        prqs = _extract_prq_references(full_text)
+
+        desc = _clean_text(sec["body"][:1500])
+
+        sequences.append({
+            "sequence_name": sec["title"],
+            "feature_id": fid,
+            "section_number": sec["section_number"],
+            "description": desc or None,
+            "prq_references": prqs if prqs else None,
+            "module": module.upper(),
+            "source_document": source_document,
+        })
+
+    return sequences
+
+
+# ---------------------------------------------------------------------------
 # High-level: parse an entire SWA directory
 # ---------------------------------------------------------------------------
 
@@ -1320,6 +1774,16 @@ def parse_swa_directory(
     all_functions: List[dict] = []
     all_datatypes: List[dict] = []
     all_macros: List[dict] = []
+    # New types
+    all_safety_measures: List[dict] = []
+    all_safety_aous: List[dict] = []
+    all_security_measures: List[dict] = []
+    all_security_aous: List[dict] = []
+    all_error_codes: List[dict] = []
+    all_memory_sections: List[dict] = []
+    all_source_files: List[dict] = []
+    all_property_variables: List[dict] = []
+    all_call_sequences: List[dict] = []
 
     for fpath in section_files:
         logger.info("  Parsing %s …", fpath.name)
@@ -1334,6 +1798,16 @@ def parse_swa_directory(
         functions, datatypes, macros_nodes = parse_exported_interfaces(
             content, module, source_document,
         )
+
+        # New parsers
+        sm, sa, scm, sca = parse_safety_security_nodes(
+            content, module, source_document,
+        )
+        errors = parse_error_codes(content, module, source_document)
+        mem_sects = parse_memory_sections(content, module, source_document)
+        src_files = parse_source_files(content, module, source_document)
+        prop_vars = parse_property_variables(content, module, source_document)
+        call_seqs = parse_call_sequences(content, module, source_document)
 
         if decisions:
             logger.info("    → %d architectural decisions", len(decisions))
@@ -1351,6 +1825,24 @@ def parse_swa_directory(
             logger.info("    → %d data types", len(datatypes))
         if macros_nodes:
             logger.info("    → %d macros", len(macros_nodes))
+        if sm:
+            logger.info("    → %d safety measures", len(sm))
+        if sa:
+            logger.info("    → %d safety AoUs", len(sa))
+        if scm:
+            logger.info("    → %d security measures", len(scm))
+        if sca:
+            logger.info("    → %d security AoUs", len(sca))
+        if errors:
+            logger.info("    → %d error codes", len(errors))
+        if mem_sects:
+            logger.info("    → %d memory sections", len(mem_sects))
+        if src_files:
+            logger.info("    → %d source files", len(src_files))
+        if prop_vars:
+            logger.info("    → %d property variables", len(prop_vars))
+        if call_seqs:
+            logger.info("    → %d call sequences", len(call_seqs))
 
         all_decisions.extend(decisions)
         all_peripherals.extend(peripherals)
@@ -1360,6 +1852,41 @@ def parse_swa_directory(
         all_functions.extend(functions)
         all_datatypes.extend(datatypes)
         all_macros.extend(macros_nodes)
+        all_safety_measures.extend(sm)
+        all_safety_aous.extend(sa)
+        all_security_measures.extend(scm)
+        all_security_aous.extend(sca)
+        all_error_codes.extend(errors)
+        all_memory_sections.extend(mem_sects)
+        all_source_files.extend(src_files)
+        all_property_variables.extend(prop_vars)
+        all_call_sequences.extend(call_seqs)
+
+    # Dedup: remove from ArchitecturalDecision any entries now classified
+    # as a more specific type (safety measure, AoU, error code, etc.)
+    classified_fids: set = set()
+    for node_list in (
+        all_safety_measures, all_safety_aous,
+        all_security_measures, all_security_aous,
+        all_error_codes, all_memory_sections,
+        all_source_files, all_property_variables,
+        all_call_sequences,
+    ):
+        for n in node_list:
+            fid = n.get("feature_id")
+            if fid:
+                classified_fids.add(fid)
+
+    if classified_fids:
+        before = len(all_decisions)
+        all_decisions = [
+            d for d in all_decisions if d["decision_id"] not in classified_fids
+        ]
+        removed = before - len(all_decisions)
+        if removed:
+            logger.info(
+                "Reclassified %d arch-decisions into specific node types", removed,
+            )
 
     # Build hierarchy edges for decisions
     decision_hierarchy = build_decision_hierarchy(all_decisions)
@@ -1381,6 +1908,24 @@ def parse_swa_directory(
         result["SWA_DataType"] = all_datatypes
     if all_macros:
         result["SWA_Macro"] = all_macros
+    if all_safety_measures:
+        result["SWA_SafetyMeasure"] = all_safety_measures
+    if all_safety_aous:
+        result["SWA_SafetyAoU"] = all_safety_aous
+    if all_security_measures:
+        result["SWA_SecurityMeasure"] = all_security_measures
+    if all_security_aous:
+        result["SWA_SecurityAoU"] = all_security_aous
+    if all_error_codes:
+        result["SWA_ErrorCode"] = all_error_codes
+    if all_memory_sections:
+        result["SWA_MemorySection"] = all_memory_sections
+    if all_source_files:
+        result["SWA_SourceFile"] = all_source_files
+    if all_property_variables:
+        result["SWA_PropertyVariable"] = all_property_variables
+    if all_call_sequences:
+        result["SWA_CallSequence"] = all_call_sequences
     if decision_hierarchy:
         result["_edges_SWA_ARCH_DECISION_PARENT"] = decision_hierarchy
 

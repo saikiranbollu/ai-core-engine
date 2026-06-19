@@ -18,7 +18,7 @@ import pytest
 # Allow running from the project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src"))
 
-from IngestionPipeline.Parsers import c_parser
+from IngestionPipeline.parsers import c_parser
 
 # ---------------------------------------------------------------------------
 # Sample C source used by all tests
@@ -752,3 +752,121 @@ class TestStructMemberWriteDetection:
         src_lines = ["    Adc_kData[PartitionId]->ConfigPtr = newConfig;\n"]
         result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ConfigPtr")
         assert result is True
+
+    # -- Issue 24/27/29: Local variable shadowing struct member name --
+
+    def test_local_shadow_ptr_assign_is_not_write(self):
+        """LocalVar = Struct->LocalVar — field on RHS is READ, not WRITE."""
+        src_lines = ["    HwTrigDataPtr = RuntimeInfoPtr->HwTrigDataPtr;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "HwTrigDataPtr")
+        assert result is False, "RHS struct member is read, not written"
+
+    def test_local_shadow_ptr_assign_is_read(self):
+        """LocalVar = Struct->LocalVar — field on RHS IS a read."""
+        src_lines = ["    HwTrigDataPtr = RuntimeInfoPtr->HwTrigDataPtr;\n"]
+        result = c_parser._ClangAnalyzer._is_read_on_line(src_lines, 1, "HwTrigDataPtr")
+        assert result is True
+
+    def test_local_shadow_config_ptr_is_not_write(self):
+        """ConfigPtr = Adc_kData->ConfigPtr — field on RHS is READ."""
+        src_lines = ["    ConfigPtr = Adc_kData[PartitionId]->ConfigPtr;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "ConfigPtr")
+        assert result is False
+
+    def test_local_shadow_group_map_ptr_is_not_write(self):
+        """HwUnitGroupMapPtr = Data->HwUnitGroupMapPtr — READ."""
+        src_lines = ["    HwUnitGroupMapPtr = PartitionData->HwUnitGroupMapPtr;\n"]
+        result = c_parser._ClangAnalyzer._is_write_on_line(src_lines, 1, "HwUnitGroupMapPtr")
+        assert result is False
+
+
+class TestDerefTargetAccess:
+    """Tests for _get_deref_target_access — detecting writes THROUGH pointers."""
+
+    def test_simple_assign_through_deref(self):
+        """*chain->PtrField = val → target is WRITE."""
+        src_lines = ["    *PartitionDataPtr->ActiveCdspCoreMapPtr = Group;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveCdspCoreMapPtr"
+        )
+        assert result == "WRITE"
+
+    def test_compound_or_assign_through_deref(self):
+        """*chain->PtrField |= val → target is READ_WRITE."""
+        src_lines = ["    *HwTrigDataPtr->ActiveEruErsChMaskPtr |= EruErsChMask;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveEruErsChMaskPtr"
+        )
+        assert result == "READ_WRITE"
+
+    def test_compound_and_assign_through_deref(self):
+        """*chain->PtrField &= ~val → target is READ_WRITE."""
+        src_lines = ["    *HwTrigDataPtr->ActiveEruErsChMaskPtr &= ~EruErsChMask;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveEruErsChMaskPtr"
+        )
+        assert result == "READ_WRITE"
+
+    def test_simple_assign_zero_through_deref(self):
+        """*chain->PtrField = (Type)0 → target is WRITE."""
+        src_lines = ["    *PartitionDataPtr->ActiveCdspCoreMapPtr = (Adc_GroupType)0;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveCdspCoreMapPtr"
+        )
+        assert result == "WRITE"
+
+    def test_read_through_deref_no_assign(self):
+        """Group = *chain->PtrField → no deref write (just a read)."""
+        src_lines = ["    Group = *PartitionDataPtr->ActiveCdspCoreMapPtr;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveCdspCoreMapPtr"
+        )
+        assert result == ""
+
+    def test_compare_through_deref(self):
+        """*chain->PtrField == 0U → no deref write."""
+        src_lines = ["    if (*PartitionDataPtr->ActiveCdspCoreMapPtr == 0U)\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveCdspCoreMapPtr"
+        )
+        assert result == ""
+
+    def test_ptr_subscript_assign(self):
+        """chain->PtrField[idx] = val → target is WRITE (Pattern B)."""
+        src_lines = ["    PartitionDataPtr->ActiveDmaChMapPtr[CoreId] = Group;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveDmaChMapPtr"
+        )
+        assert result == "WRITE"
+
+    def test_ptr_subscript_compound_assign(self):
+        """chain->PtrField[idx] |= val → target is READ_WRITE (Pattern B)."""
+        src_lines = ["    HwTrigDataPtr->ActiveTimerGCChMaskPtr[idx] |= mask;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveTimerGCChMaskPtr"
+        )
+        assert result == "READ_WRITE"
+
+    def test_non_ptr_subscript_not_detected(self):
+        """chain->ArrayField[idx] = val — non-Ptr suffix → empty (handled by _is_write)."""
+        src_lines = ["    GrpDataPtr->ActiveSRMap[CoreId] = Group;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveSRMap"
+        )
+        assert result == ""
+
+    def test_no_deref_plain_assign(self):
+        """chain->Field = val (no leading *, not Ptr suffix) → empty."""
+        src_lines = ["    GrpDataPtr->CurrSampCount = 0;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "CurrSampCount"
+        )
+        assert result == ""
+
+    def test_deref_with_dot_access(self):
+        """*chain.PtrField = val → target is WRITE."""
+        src_lines = ["    *ConfigData.ActiveBufferPtr = value;\n"]
+        result = c_parser._ClangAnalyzer._get_deref_target_access(
+            src_lines, 1, "ActiveBufferPtr"
+        )
+        assert result == "WRITE"

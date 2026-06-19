@@ -240,7 +240,11 @@ class PatternStore:
                     "[PatternStore] QDRANT_API_KEY is not set. "
                     "Set it in env/.env or pass qdrant_api_key to PatternStore()."
                 )
-            self._client = QdrantClient(url=url, api_key=api_key)
+            self._client = QdrantClient(
+                url=url, api_key=api_key,
+                https=url.startswith("https"), port=443, verify=False,
+                check_compatibility=False,
+            )
             logger.info(f"[PatternStore] Connected to Qdrant at {url}")
 
     # ── point ID convention ──────────────────────────────────────────────────

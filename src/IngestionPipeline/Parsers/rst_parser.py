@@ -6,7 +6,7 @@ Parses ``.rst`` files and returns a list of sections with their title,
 heading level, and body content.
 
 Usage:
-    from IngestionPipeline.Parsers import rst_parser
+    from IngestionPipeline.parsers import rst_parser
 
     sections = rst_parser.parse("documentation.rst")
     # returns a list of dicts with title, level, content

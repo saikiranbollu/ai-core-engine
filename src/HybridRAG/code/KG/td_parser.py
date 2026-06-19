@@ -268,7 +268,16 @@ def _parse_io_parameters(ws, module: str) -> list[dict]:
         for col, config_id in current_configs.items():
             val = ws.cell(row=r, column=col).value
             if val is not None:
-                config_values[config_id] = str(val).strip()
+                val_str = str(val).strip()
+                # Split comma-separated config IDs that share a column
+                # e.g. "AS460_TC4DX_C001_P01_BVEC,AS460_TC49X_C001_P01_BVEC"
+                if ',' in config_id:
+                    for single_id in config_id.split(','):
+                        single_id = single_id.strip()
+                        if single_id:
+                            config_values[single_id] = val_str
+                else:
+                    config_values[config_id] = val_str
 
         parameters.append({
             "test_case_id": tc_id,

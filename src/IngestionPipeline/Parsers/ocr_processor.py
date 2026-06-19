@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from src._common.path_safety import (
+    allowed_roots_from_env,
+    safe_path_under,
+    validate_extension,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,12 @@ OCR_LANGUAGE = os.getenv("OCR_LANGUAGE", "eng")
 OCR_MIN_TEXT_CHARS = int(os.getenv("OCR_MIN_TEXT_CHARS", "10"))
 OCR_DPI = int(os.getenv("OCR_DPI", "300"))
 OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "30"))
+
+# F-CE-O01: OCR language codes are passed directly to the tesseract subprocess;
+# restrict to ISO 639-2 style 3-letter codes joined by '+' to block argument
+# injection. Image inputs are restricted to known raster extensions.
+_OCR_LANG_RE = re.compile(r"^[a-z]{3}(\+[a-z]{3})*$")
+_OCR_IMAGE_EXT = {".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"}
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -150,11 +163,36 @@ class OCRProcessor:
                 error="Tesseract not available",
             )
 
+        # F-CE-O01: validate the language flag (subprocess arg) and image path
+        # before invoking the external OCR binary.
+        if not _OCR_LANG_RE.match(self._language):
+            return OCRResult(
+                page_number=0, text="", is_scanned=True, ocr_applied=False,
+                error=f"Invalid OCR language: {self._language!r}",
+            )
+        try:
+            # F-CE-O01: contain the image under an allowed root. The PDF→image
+            # stage writes pages into a TemporaryDirectory, so the system temp
+            # dir is allowed by default alongside the production OCR roots; both
+            # are overridable via OCR_ALLOWED_ROOTS. This blocks arbitrary paths
+            # (e.g. /etc/shadow) while keeping the real pipeline working.
+            ocr_roots = allowed_roots_from_env(
+                "OCR_ALLOWED_ROOTS",
+                [tempfile.gettempdir(), "/tmp", "/var/run/aice"],
+            )
+            safe_image = safe_path_under(image_path, ocr_roots)
+            validate_extension(safe_image, _OCR_IMAGE_EXT)
+        except ValueError as exc:
+            return OCRResult(
+                page_number=0, text="", is_scanned=True, ocr_applied=False,
+                error=f"Invalid image path: {exc}",
+            )
+
         try:
             result = subprocess.run(
                 [
                     self._tesseract_path,
-                    image_path,
+                    str(safe_image),
                     "stdout",
                     "-l", self._language,
                     "--oem", "1",  # LSTM engine

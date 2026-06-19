@@ -135,7 +135,6 @@ def _make_connector(
         api_secret="test-secret",
         max_retries=1,
         backoff_factor=0.0,
-        verify_ssl=False,
     )
     defaults.update(kwargs)
     connector = JamaConnector(**defaults)

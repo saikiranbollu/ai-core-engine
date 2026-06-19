@@ -90,7 +90,6 @@ def _make_connector(transport: MockTransport, **kwargs) -> PolarionConnector:
         token="test-jwt-token",
         max_retries=1,
         timeout=5.0,
-        verify_ssl=False,
     )
     defaults.update(kwargs)
     connector = PolarionConnector(**defaults)

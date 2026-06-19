@@ -91,10 +91,7 @@ class CompressionResult:
         }
 
 
-def _estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return max(1, len(text) // 4)  # M09 fix: ~4 chars/token standard
+from src.HybridRAG.code.querier.context_builder import estimate_tokens as _estimate_tokens
 
 
 # ═══════════════════════════════════════════════════════════════════════

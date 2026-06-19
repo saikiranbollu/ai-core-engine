@@ -1,5 +1,5 @@
 """
-IngestionPipeline.Parsers
+IngestionPipeline.parsers
 =========================
 
 A collection of file parsers for the ingestion pipeline.  Each parser
@@ -26,7 +26,7 @@ Module                Input type                      Return type
 
 Quick start::
 
-    from IngestionPipeline.Parsers import c_parser, rst_parser
+    from IngestionPipeline.parsers import c_parser, rst_parser
 
     analysis = c_parser.parse("driver.c")
     sections = rst_parser.parse("docs.rst")

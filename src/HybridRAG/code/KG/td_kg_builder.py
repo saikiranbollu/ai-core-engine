@@ -414,9 +414,10 @@ class TDKnowledgeGraphBuilder:
                 continue
             indices = set()
             for config_id in cv.keys():
-                m = _CONFIG_ID_RE.search(config_id)
-                if m:
-                    indices.add(m.group(1).zfill(3))
+                # Handle comma-separated config IDs stored as single keys
+                # (legacy data before parser fix)
+                for match in _CONFIG_ID_RE.finditer(config_id):
+                    indices.add(match.group(1).zfill(3))
             for idx in indices:
                 pairs.append({"td_uid": row["uid"], "cfg_idx": idx})
 

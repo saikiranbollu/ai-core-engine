@@ -37,7 +37,7 @@ import yaml
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError, TransientError
 
-from src.HybridRAG.code.KG._kg_safety import sanitize_label, sanitize_property
+from _kg_safety import sanitize_label, sanitize_property
 
 # Retry decorator for transient Neo4j failures
 try:
@@ -72,7 +72,7 @@ except ImportError:
 
 # SWA parser import (IngestionPipeline/Parsers)
 try:
-    from src.IngestionPipeline.Parsers.swa_parsers import parse_swa_directory
+    from src.IngestionPipeline.parsers.swa_parsers import parse_swa_directory
 except ImportError:
     parse_swa_directory = None
 
@@ -84,7 +84,7 @@ except ImportError:
 
 # SWUD parser import (IngestionPipeline/Parsers)
 try:
-    from src.IngestionPipeline.Parsers.swud_parsers import parse_swud_directory
+    from src.IngestionPipeline.parsers.swud_parsers import parse_swud_directory
 except ImportError:
     parse_swud_directory = None
 
@@ -95,7 +95,7 @@ except ImportError:
 
 # TestSpec parser import (IngestionPipeline/Parsers)
 try:
-    from src.IngestionPipeline.Parsers.testspec_parsers import parse_testspec_workbook
+    from src.IngestionPipeline.parsers.testspec_parsers import parse_testspec_workbook
 except ImportError:
     try:
         from testspec_parsers import parse_testspec_workbook
@@ -3531,7 +3531,7 @@ class SourceCodeKnowledgeGraphBuilder:
     _RE_FUNC_DEF = re.compile(
         r'(?:^|\n)'
         r'((?:static\s+)?(?:inline\s+)?(?:LOCAL_INLINE\s+)?)'
-        r'(?:FUNC\s*\(([^)]*)\)\s+|([\w\s\*]+?)\s+)'
+        r'(?:FUNC\s*\(([^)]*)\)\s+|([\w \t\*]+?)[ \t]+)'
         r'([A-Za-z_]\w*)\s*'
         r'\(([^)]*)\)\s*\{',
         re.MULTILINE
@@ -3667,6 +3667,9 @@ class SourceCodeKnowledgeGraphBuilder:
         self._register_accesses: list[dict] = []
         self._global_ref_edges: list[dict] = []
         self._clang_parsed_func_ids: set[str] = set()
+        # Branch-conditional propagation data
+        self._branch_maps: dict[str, list[dict]] = {}  # func_id → branch descriptors
+        self._call_constant_args: dict[str, dict[str, dict[str, str]]] = {}  # func_id → {callee → {idx → val}}
 
     @property
     def _uid_prefix(self) -> str:
@@ -4401,6 +4404,14 @@ class SourceCodeKnowledgeGraphBuilder:
             is_static = "static" in qualifiers
             is_inline = "inline" in qualifiers or "LOCAL_INLINE" in qualifiers
 
+            # Defensive: if 'static' leaked into return_type, fix both fields
+            if not is_static and return_type.startswith("static "):
+                is_static = True
+                return_type = return_type[len("static "):].strip()
+            if not is_inline and return_type.startswith("inline "):
+                is_inline = True
+                return_type = return_type[len("inline "):].strip()
+
             # Find line number
             char_pos = m.start()
             start_line = clean_content[:char_pos].count("\n") + 1
@@ -4485,6 +4496,8 @@ class SourceCodeKnowledgeGraphBuilder:
                         "field": sa.get("field", ""),
                         "access_type": sa.get("access_type", ""),
                         "line": sa.get("line", 0),
+                        "in_critical_section": sa.get("in_critical_section", False),
+                        "critical_section_name": sa.get("critical_section_name", ""),
                     })
                 # Fall back to legacy register_accesses if no sfr_accesses
                 if not sfr_accesses:
@@ -4496,6 +4509,8 @@ class SourceCodeKnowledgeGraphBuilder:
                             "field": ra.get("field", ""),
                             "access_type": ra.get("access_type", ""),
                             "line": ra.get("line", 0),
+                            "in_critical_section": ra.get("in_critical_section", False),
+                            "critical_section_name": ra.get("critical_section_name", ""),
                         })
 
                 # Global variable references (clang-extracted)
@@ -4513,7 +4528,27 @@ class SourceCodeKnowledgeGraphBuilder:
                         "accessed_member": gr.get("accessed_member", ""),
                         "in_critical_section": gr.get("in_critical_section", False),
                         "critical_section_name": gr.get("critical_section_name", ""),
+                        "data_type": gr.get("data_type", ""),
+                        "branch_id": gr.get("branch_id", "B0"),
                     })
+
+                # Branch map and call-site constant args (for path-sensitive propagation)
+                branch_map_data = func_data.get("branch_map", [])
+                if branch_map_data:
+                    # Merge: keep the richest branch map (most entries)
+                    existing = self._branch_maps.get(func_id, [])
+                    if len(branch_map_data) >= len(existing):
+                        self._branch_maps[func_id] = branch_map_data
+                call_const_args = func_data.get("call_constant_args", {})
+                if call_const_args:
+                    # Merge: union of all configs' constant args per callee
+                    existing = self._call_constant_args.get(func_id, {})
+                    for callee, args in call_const_args.items():
+                        if callee not in existing:
+                            existing[callee] = args
+                        else:
+                            existing[callee].update(args)
+                    self._call_constant_args[func_id] = existing
             else:
                 # ━━━━ Regex fallback for functions NOT covered by clang ━━━━
                 # Functions hidden behind #ifdef blocks that clang evaluates
@@ -4830,10 +4865,14 @@ class SourceCodeKnowledgeGraphBuilder:
             line_end = clean_content.find("\n", m.end())
             if line_end == -1:
                 line_end = len(clean_content)
-            # If there's a ( outside array bounds, it's a function decl
+            # If there's a ( outside array bounds in the DECLARATION part
+            # (before '='), it's a function decl. Don't check the initializer.
             match_text = clean_content[m.start():m.end()]
+            # Only check declaration part (before '=') for parentheses
+            eq_pos = match_text.find("=")
+            decl_part = match_text[:eq_pos] if eq_pos != -1 else match_text
             array_part = m.group(4) or ""
-            non_array = match_text.replace(array_part, "", 1)
+            non_array = decl_part.replace(array_part, "", 1)
             if "(" in non_array:
                 continue
 
@@ -4937,7 +4976,7 @@ class SourceCodeKnowledgeGraphBuilder:
 
         seen_regs: dict[tuple, dict] = {}
         for e in self._register_accesses:
-            k = (e["function_id"], e["register_name"], e.get("line", 0))
+            k = (e["function_id"], e["register_name"], e.get("line", 0), e.get("access_type", ""))
             seen_regs[k] = e
         self._register_accesses = list(seen_regs.values())
 
@@ -4971,17 +5010,61 @@ class SourceCodeKnowledgeGraphBuilder:
         """
         if not self._global_ref_edges:
             return
+
+        # C keywords and preprocessor directives that should never be globals
+        _SKIP_NAMES = frozenset({
+            "if", "else", "for", "while", "do", "switch", "case", "break",
+            "continue", "return", "goto", "sizeof", "typeof", "typedef",
+            "struct", "union", "enum", "void", "int", "char", "float",
+            "double", "long", "short", "unsigned", "signed", "const",
+            "volatile", "static", "extern", "register", "auto", "inline",
+            "define", "include", "ifdef", "ifndef", "endif", "undef",
+            "elif", "pragma", "error", "warning",
+            "TRUE", "FALSE", "NULL", "true", "false",
+            # Common non-variable words that leak from comments/macros
+            "add", "in", "num", "maps", "means", "execution",
+        })
+
+        # Build a map of best-known data_type per global name from ref edges
+        best_type: dict[str, str] = {}
+        for gre in self._global_ref_edges:
+            gname = gre["global_name"]
+            dt = gre.get("data_type", "")
+            if dt and gname not in best_type:
+                best_type[gname] = dt
+
         known = {gv["name"] for gv in self._global_variables}
+        # Also collect known function names to skip function pointers
+        known_funcs = {f["name"] for f in self._functions}
+
         added = 0
+        skipped = 0
         for gre in self._global_ref_edges:
             gname = gre["global_name"]
             if gname in known:
                 continue
+            # Skip C keywords, preprocessor directives, boolean literals
+            if gname in _SKIP_NAMES:
+                known.add(gname)
+                skipped += 1
+                continue
+            # Skip known function names (callback pointers in initializers)
+            if gname in known_funcs:
+                known.add(gname)
+                skipped += 1
+                continue
+            # Skip ALL_CAPS names with no known type — these are macros/constants
+            # (real all-caps globals would have a data_type from DIRECT refs)
+            if gname not in best_type and not any(c.islower() for c in gname):
+                known.add(gname)
+                skipped += 1
+                continue
             known.add(gname)
+            data_type = best_type.get(gname, "")
             self._global_variables.append({
                 "variable_id": f"{self._uid_prefix}CfgMcal::{gname}",
                 "name": gname,
-                "data_type": "",
+                "data_type": data_type,
                 "is_static": True,
                 "is_extern": False,
                 "is_const": True,
@@ -4999,8 +5082,9 @@ class SourceCodeKnowledgeGraphBuilder:
             added += 1
         if added:
             logger.info(
-                "  Injected %d resolver-discovered globals into SRC_GlobalVariable",
-                added,
+                "  Injected %d resolver-discovered globals into SRC_GlobalVariable"
+                " (skipped %d non-variables)",
+                added, skipped,
             )
 
     # ΓöÇΓöÇ Local variable extraction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -5141,12 +5225,29 @@ class SourceCodeKnowledgeGraphBuilder:
             "local_variables.json": self._local_variables,
             "call_edges.json": self._call_edges,
             "register_accesses.json": self._register_accesses,
+            "global_ref_edges.json": self._global_ref_edges,
         }
 
         for filename, data in datasets.items():
             path = self.temp_dir / filename
             path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
             logger.info("    Saved %s (%d items)", filename, len(data))
+
+        # Save branch-conditional propagation data
+        if self._branch_maps:
+            bm_path = self.temp_dir / "branch_maps.json"
+            bm_path.write_text(
+                json.dumps(self._branch_maps, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info("    Saved branch_maps.json (%d functions)", len(self._branch_maps))
+        if self._call_constant_args:
+            ca_path = self.temp_dir / "call_constant_args.json"
+            ca_path.write_text(
+                json.dumps(self._call_constant_args, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info("    Saved call_constant_args.json (%d functions)", len(self._call_constant_args))
 
         # Summary
         summary = {
@@ -5307,6 +5408,18 @@ class SourceCodeKnowledgeGraphBuilder:
 
     def _create_call_graph_rels(self):
         """SRC_Function -[SRC_CALLS]→ SRC_Function (by function name)."""
+        # Clean up existing SRC_CALLS edges for this module before re-creating
+        if self.project:
+            self._write_tx(
+                "MATCH (f:SRC_Function {module: $module, project: $project})-[r:SRC_CALLS]->() DELETE r",
+                {"module": self.module, "project": self.project},
+            )
+        else:
+            self._write_tx(
+                "MATCH (f:SRC_Function {module: $module})-[r:SRC_CALLS]->() DELETE r",
+                {"module": self.module},
+            )
+
         if not self._call_edges:
             return
 
@@ -5888,6 +6001,8 @@ class SourceCodeKnowledgeGraphBuilder:
                     "name_pattern": regex_pat,
                     "access_type": ra["access_type"],
                     "field": ra.get("field", ""),
+                    "in_critical_section": ra.get("in_critical_section", False),
+                    "critical_section_name": ra.get("critical_section_name", ""),
                 })
 
         # Determine target device from SFR include dir (e.g. "TC44xA")
@@ -5895,32 +6010,37 @@ class SourceCodeKnowledgeGraphBuilder:
 
         sfr_edges_created = 0
         for chunk in self._chunked(edge_batch, self.BATCH_SIZE):
-            # Match by exact name or suffix — no module filter so cross-module
-            # edges (e.g. ADC → EGTM/SCU registers) are created too.
+            # Match by exact name OR suffix/regex scoped to same module.
+            # Module-scoping prevents bare names like "PROTSE" from matching
+            # every module's PROTSE register (e.g. ADC_PROTSE, SENT_PROTSE…).
             if target_device:
                 cypher = (
                     "UNWIND $items AS item "
                     "MATCH (f:SRC_Function {function_id: item.func_id}) "
                     "MATCH (r:SFR_Register {device: $device}) "
                     "WHERE r.name = item.register_name "
-                    "   OR r.name ENDS WITH ('_' + item.norm_name) "
-                    "   OR (item.name_pattern <> '' AND r.name =~ item.name_pattern) "
+                    "   OR (r.module = $module AND r.name ENDS WITH ('_' + item.norm_name)) "
+                    "   OR (item.name_pattern <> '' AND r.module = $module AND r.name =~ item.name_pattern) "
                     "MERGE (f)-[rel:SRC_ACCESSES_SFR {access_type: item.access_type}]->(r) "
-                    "SET rel.field = item.field"
+                    "SET rel.field = item.field, "
+                    "    rel.in_critical_section = item.in_critical_section, "
+                    "    rel.critical_section_name = CASE WHEN item.critical_section_name <> '' THEN item.critical_section_name ELSE null END"
                 )
-                self._write_tx(cypher, {"items": chunk, "device": target_device})
+                self._write_tx(cypher, {"items": chunk, "device": target_device, "module": self.module})
             else:
                 cypher = (
                     "UNWIND $items AS item "
                     "MATCH (f:SRC_Function {function_id: item.func_id}) "
                     "MATCH (r:SFR_Register) "
                     "WHERE r.name = item.register_name "
-                    "   OR r.name ENDS WITH ('_' + item.norm_name) "
-                    "   OR (item.name_pattern <> '' AND r.name =~ item.name_pattern) "
+                    "   OR (r.module = $module AND r.name ENDS WITH ('_' + item.norm_name)) "
+                    "   OR (item.name_pattern <> '' AND r.module = $module AND r.name =~ item.name_pattern) "
                     "MERGE (f)-[rel:SRC_ACCESSES_SFR {access_type: item.access_type}]->(r) "
-                    "SET rel.field = item.field"
+                    "SET rel.field = item.field, "
+                    "    rel.in_critical_section = item.in_critical_section, "
+                    "    rel.critical_section_name = CASE WHEN item.critical_section_name <> '' THEN item.critical_section_name ELSE null END"
                 )
-                self._write_tx(cypher, {"items": chunk})
+                self._write_tx(cypher, {"items": chunk, "module": self.module})
             sfr_edges_created += len(chunk)
 
         self.stats["register_access_functions"] = len(by_func)
@@ -5928,6 +6048,181 @@ class SourceCodeKnowledgeGraphBuilder:
         self.stats["rel:SRC_ACCESSES_SFR"] = sfr_edges_created
         logger.info("    → %d functions, %d accesses, %d SFR edges",
                      len(by_func), len(self._register_accesses), sfr_edges_created)
+
+    def _compute_reachable_branches(
+        self,
+        callee_id: str,
+        api_id: str,
+        caller_to_callees: dict,
+        func_name_to_id: dict,
+        func_id_to_name: dict,
+    ) -> "set[str] | None":
+        """Determine which branches of callee_id are reachable from api_id.
+
+        Checks if ANY function on the call path from api_id to callee_id
+        passes constant arguments to callee_id AND the callee has a
+        branch_map with param-conditional branches. Returns:
+          - A set of reachable branch_ids (including "B0") if filtering applies
+          - None if no filtering applies (propagate all)
+
+        Logic:
+          1. Find which functions directly call callee_id (from call edges)
+          2. For each such direct caller, check if it has call_constant_args
+             for the callee's function name
+          3. If yes and callee has a branch_map, resolve which branches match
+             the constant value passed for the condition_param
+          4. Include B0 (unconditional body) and all matching branches +
+             their else/siblings that don't conflict
+        """
+        # Does the callee have a branch map?
+        branch_map = self._branch_maps.get(callee_id)
+        if not branch_map:
+            return None
+
+        # Find param-conditional branches (non-root branches with condition_param)
+        param_branches = [
+            b for b in branch_map
+            if b["branch_id"] != "B0" and b.get("condition_param")
+        ]
+        if not param_branches:
+            return None
+
+        callee_name = func_id_to_name.get(callee_id, "")
+        if not callee_name:
+            return None
+
+        # Find which callers pass constant args to this callee.
+        # Check api_id first (direct call), then check any intermediate caller.
+        callers_with_const: list[dict[str, str]] = []  # list of {param_idx: value}
+
+        # Build reverse map: callee_id → set of caller_ids that directly call it
+        callee_to_callers: dict[str, set] = {}
+        for caller_id, callees in caller_to_callees.items():
+            if callee_id in callees:
+                callee_to_callers.setdefault(callee_id, set()).add(caller_id)
+
+        direct_callers = callee_to_callers.get(callee_id, set())
+
+        # CRITICAL: Only consider callers that are on the path from api_id to
+        # callee_id. Otherwise, when multiple APIs call the same callee with
+        # different constants, they'd disagree and filtering would be disabled.
+        # Relevant callers = api_id itself + intermediate callees of api_id.
+        # We use a BFS from api_id limited to 4 levels to find the reachable set.
+        reachable_from_api = {api_id}
+        queue = [api_id]
+        for _ in range(4):
+            next_queue = []
+            for cid in queue:
+                for child in caller_to_callees.get(cid, set()):
+                    if child not in reachable_from_api:
+                        reachable_from_api.add(child)
+                        next_queue.append(child)
+            queue = next_queue
+
+        relevant_callers = direct_callers & reachable_from_api
+
+        for caller_id in relevant_callers:
+            const_args_map = self._call_constant_args.get(caller_id, {})
+            if callee_name in const_args_map:
+                callers_with_const.append(const_args_map[callee_name])
+
+        if not callers_with_const:
+            return None
+
+        # Build parameter index map from function's parameter list
+        # We need to map condition_param (name) to param index
+        callee_params: list[str] = []
+        for func in self._functions:
+            if func["function_id"] == callee_id:
+                params_raw = func.get("parameters")
+                if params_raw:
+                    # Parameters stored as JSON string in func_node
+                    if isinstance(params_raw, str):
+                        try:
+                            params_list = json.loads(params_raw)
+                        except (json.JSONDecodeError, TypeError):
+                            params_list = []
+                    else:
+                        params_list = params_raw
+                    # Parameters may be dicts with "name" key or strings like "const uint8 ServiceId"
+                    for p in params_list:
+                        if isinstance(p, dict):
+                            callee_params.append(p["name"])
+                        elif isinstance(p, str):
+                            # Extract last token as parameter name (e.g. "const uint8 ServiceId" → "ServiceId")
+                            parts = p.strip().rstrip(",").split()
+                            if parts:
+                                # Strip pointer markers
+                                name = parts[-1].lstrip("*")
+                                callee_params.append(name)
+                break
+
+        if not callee_params:
+            return None
+
+        param_name_to_idx: dict[str, int] = {
+            name: idx for idx, name in enumerate(callee_params)
+        }
+
+        # Determine reachable branches based on constant args
+        # Start with B0 (always reachable)
+        reachable: set[str] = {"B0"}
+
+        # Group param_branches by (condition_param, parent) to find sibling chains
+        # For each if/else chain, determine which branch the constant selects
+        for b in param_branches:
+            cparam = b["condition_param"]
+            cparam_idx = param_name_to_idx.get(cparam)
+            if cparam_idx is None:
+                # Can't resolve param index → conservatively include
+                reachable.add(b["branch_id"])
+                continue
+
+            idx_str = str(cparam_idx)
+
+            # Check if ALL callers agree on the constant value for this param
+            values = set()
+            for ca in callers_with_const:
+                if idx_str in ca:
+                    values.add(ca[idx_str])
+
+            if len(values) != 1:
+                # Multiple callers disagree or no const → conservatively include
+                reachable.add(b["branch_id"])
+                continue
+
+            passed_value = values.pop()
+
+            # Does this branch's condition match the passed value?
+            cond_value = b.get("condition_value")
+            cond_op = b.get("condition_op")
+            is_else = b.get("is_else", False)
+
+            if is_else:
+                # else branch: reachable only if no sibling's condition matches
+                # Check siblings: if any sibling with == matches passed_value,
+                # the else is NOT taken
+                siblings = b.get("sibling_ids", [])
+                sibling_matches = False
+                for sb in param_branches:
+                    if sb["branch_id"] in siblings and sb.get("condition_op") == "==":
+                        if sb.get("condition_value") == passed_value:
+                            sibling_matches = True
+                            break
+                if not sibling_matches:
+                    reachable.add(b["branch_id"])
+            elif cond_op == "==":
+                if cond_value == passed_value:
+                    reachable.add(b["branch_id"])
+                # else: this branch is NOT taken
+            elif cond_op == "!=":
+                if cond_value != passed_value:
+                    reachable.add(b["branch_id"])
+            else:
+                # Unknown operator → conservatively include
+                reachable.add(b["branch_id"])
+
+        return reachable
 
     def _propagate_callee_accesses(self):
         """Propagate callee accessed_members and registers to API-level callers.
@@ -5939,8 +6234,15 @@ class SourceCodeKnowledgeGraphBuilder:
         2. Unions callee registers_read/registers_written into the caller's
            properties.
 
+        **Dispatcher-aware filtering** (Issues 13-16 fix):
+        Functions that dispatch to different callees via switch/case statements
+        are detected as "dispatchers". BFS does NOT follow outgoing edges from
+        dispatcher functions, preventing phantom edges from propagating through
+        conditional branches that are never actually taken by a given caller.
+
         This enables the DaFA analysis to see all struct member accesses and
-        register accesses at the API level without manual graph traversal.
+        register accesses at the API level without manual graph traversal,
+        while avoiding false positives from path-insensitive call graph analysis.
         """
         if not self._call_edges or not self._functions:
             return
@@ -5954,17 +6256,47 @@ class SourceCodeKnowledgeGraphBuilder:
             fname = func["name"]
             func_name_to_id[fname] = fid
             func_id_to_name[fid] = fname
-            # Detect static (local) functions — they start with module prefix + 'l'
-            # e.g. Adc_lInit, Dma_lChannelReset
             func_id_is_static[fid] = func.get("is_static", False)
 
+        # Build caller→callee map WITH case_label tracking
+        # caller_to_callees: caller_id → set of (callee_id, case_label) tuples
+        caller_to_callees_full: dict[str, set] = {}
         caller_to_callees: dict[str, set] = {}
         for edge in self._call_edges:
             caller_id = edge["caller_id"]
             callee_name = edge["callee_name"]
             callee_id = func_name_to_id.get(callee_name)
             if callee_id:
+                case_lbl = edge.get("case_label") or ""
+                caller_to_callees_full.setdefault(caller_id, set()).add(
+                    (callee_id, case_lbl)
+                )
                 caller_to_callees.setdefault(caller_id, set()).add(callee_id)
+
+        # --- Identify dispatcher functions ---
+        # A dispatcher is a function that calls ≥2 DIFFERENT callees from
+        # within case/default statement contexts. This indicates a switch-based
+        # routing pattern where only one branch is taken per call.
+        # Note: we check for distinct callee_ids (not distinct case labels)
+        # because _get_case_value may return "?" when the enum/macro value
+        # can't be extracted from the AST.
+        dispatcher_ids: set = set()
+        for caller_id, edges in caller_to_callees_full.items():
+            # Collect distinct callees that are called under case contexts
+            case_callee_ids = {cid for cid, lbl in edges if lbl}
+            if len(case_callee_ids) >= 2:
+                dispatcher_ids.add(caller_id)
+
+        if dispatcher_ids:
+            dispatcher_names = sorted(
+                func_id_to_name.get(d, "?") for d in dispatcher_ids
+            )
+            logger.info(
+                "  Detected %d dispatcher functions (switch-case routing): %s",
+                len(dispatcher_ids),
+                ", ".join(dispatcher_names[:10])
+                + ("..." if len(dispatcher_names) > 10 else ""),
+            )
 
         # Identify API functions (non-static, public)
         api_func_ids = [
@@ -5975,8 +6307,25 @@ class SourceCodeKnowledgeGraphBuilder:
         if not api_func_ids:
             return
 
-        # BFS: for each API function, collect all transitive callees (max depth 4)
+        # BFS: for each API function, collect all transitive callees (max depth)
+        # DISPATCHER-AWARE: do NOT follow outgoing edges from dispatchers.
+        # The dispatcher itself is still added to visited (its own direct
+        # accesses are captured), but its conditional callees are excluded.
+        #
+        # When the START function itself is a dispatcher, only follow its
+        # non-case-labeled direct callees.  Case-labeled callees represent
+        # mutually-exclusive dispatch branches (e.g., different event types)
+        # whose accesses should not all be attributed to the dispatcher API.
         MAX_DEPTH = 4
+
+        # Pre-compute non-case-labeled callees for dispatcher start nodes
+        dispatcher_noncase_callees: dict[str, set] = {}
+        for did in dispatcher_ids:
+            noncase = set()
+            for callee_id, lbl in caller_to_callees_full.get(did, set()):
+                if not lbl:  # No case label → always-taken call
+                    noncase.add(callee_id)
+            dispatcher_noncase_callees[did] = noncase
 
         def _get_all_callees(start_id: str) -> set:
             visited = set()
@@ -5985,10 +6334,25 @@ class SourceCodeKnowledgeGraphBuilder:
                 current, depth = queue.pop(0)
                 if depth >= MAX_DEPTH:
                     continue
-                for callee_id in caller_to_callees.get(current, set()):
-                    if callee_id not in visited and callee_id != start_id:
-                        visited.add(callee_id)
-                        queue.append((callee_id, depth + 1))
+                # If current is a dispatcher, add it to visited but don't
+                # follow its outgoing edges (blocks conditional paths)
+                if current in dispatcher_ids and current != start_id:
+                    # Still include the dispatcher so its OWN accesses propagate
+                    # but don't traverse through it
+                    continue
+                # When the start node IS a dispatcher, only follow its
+                # non-case-labeled callees (skip conditional dispatch branches)
+                if current == start_id and current in dispatcher_ids:
+                    allowed = dispatcher_noncase_callees.get(current, set())
+                    for callee_id in allowed:
+                        if callee_id not in visited and callee_id != start_id:
+                            visited.add(callee_id)
+                            queue.append((callee_id, depth + 1))
+                else:
+                    for callee_id in caller_to_callees.get(current, set()):
+                        if callee_id not in visited and callee_id != start_id:
+                            visited.add(callee_id)
+                            queue.append((callee_id, depth + 1))
             return visited
 
         # Build lookup: function_id → list of global_ref_edges
@@ -6004,38 +6368,148 @@ class SourceCodeKnowledgeGraphBuilder:
         # Propagate: collect callee edges for each API function
         propagated_edges: list[dict] = []
         register_propagation: dict[str, dict] = {}  # func_id → {reads: set, writes: set}
+        branch_filtered_count = 0  # track how many refs were eliminated by branch filtering
 
         for api_id in api_func_ids:
             all_callees = _get_all_callees(api_id)
             if not all_callees:
                 continue
 
-            # Existing accessed_members for this API (to avoid duplicates)
+            # --- Rule 1: Direct access priority ---
+            # Build set of (global_name, member) pairs that the API already
+            # accesses directly (STRUCT_CHAIN or DIRECT context). Callee
+            # accesses for these pairs will be suppressed because the API's
+            # own direct access is the authoritative classification.
+            direct_access_members: set = set()
+            # Also track simple variables (no member) accessed directly
+            direct_access_globals: set = set()
             existing_members: set = set()
             for gre in func_to_global_refs.get(api_id, []):
                 member = gre.get("accessed_member", "")
+                ctx = gre.get("access_context", "DIRECT")
                 if member:
-                    existing_members.add((gre["global_name"], member))
+                    existing_members.add((gre["global_name"], member, gre.get("access_type", "READ")))
+                    if ctx in ("STRUCT_CHAIN", "DIRECT"):
+                        direct_access_members.add((gre["global_name"], member))
+                else:
+                    existing_members.add((gre["global_name"], "", gre.get("access_type", "READ")))
+                    if ctx in ("STRUCT_CHAIN", "DIRECT"):
+                        direct_access_globals.add(gre["global_name"])
 
-            # Propagate global_ref edges from callees
+            # --- First pass: collect ALL candidate callee edges ---
+            # We collect candidates per (global_name, member) so we can
+            # apply cross-callee conflict resolution (Rule 2) afterwards.
+            # candidate_edges: (global_name, member) → list of edge dicts
+            candidate_edges: dict[tuple, list] = {}
+
             for callee_id in all_callees:
-                for gre in func_to_global_refs.get(callee_id, []):
+                callee_refs = func_to_global_refs.get(callee_id, [])
+
+                # ── Branch-conditional filtering ──
+                # If any direct caller of this callee passes constant args,
+                # compute which branches of the callee are reachable.
+                reachable_branches = self._compute_reachable_branches(
+                    callee_id, api_id, caller_to_callees,
+                    func_name_to_id, func_id_to_name,
+                )
+                if reachable_branches is not None:
+                    # Filter callee_refs to only reachable branches
+                    orig_count = len(callee_refs)
+                    callee_refs = [
+                        ref for ref in callee_refs
+                        if ref.get("branch_id", "B0") in reachable_branches
+                    ]
+                    filtered = orig_count - len(callee_refs)
+                    if filtered > 0:
+                        branch_filtered_count += filtered
+                        logger.debug(
+                            "    Branch filter: %s → %s eliminated %d/%d refs "
+                            "(reachable branches: %s)",
+                            func_id_to_name.get(api_id, "?"),
+                            func_id_to_name.get(callee_id, "?"),
+                            filtered, orig_count, reachable_branches,
+                        )
+
+                # Pre-compute per-(global, member) access types for this
+                # callee to detect when both READ and WRITE exist for the
+                # same member.  With the parser's split_rw fix (guard-then-
+                # write patterns now emit only WRITE), remaining READ+WRITE
+                # pairs indicate genuine bidirectional access → merge to
+                # READ_WRITE rather than suppressing either direction.
+                callee_access_map: dict[tuple, set] = {}
+                for gre in callee_refs:
                     member = gre.get("accessed_member", "")
                     if not member:
                         continue
-                    key = (gre["global_name"], member)
+                    gm_key = (gre["global_name"], member)
+                    callee_access_map.setdefault(gm_key, set()).add(
+                        gre.get("access_type", "READ"))
+
+                for gre in callee_refs:
+                    member = gre.get("accessed_member", "")
+                    if not member:
+                        continue
+                    access = gre.get("access_type", "READ")
+                    gm_key = (gre["global_name"], member)
+
+                    # Rule 1: skip if API already has direct access for this member
+                    if gm_key in direct_access_members:
+                        continue
+
+                    # When a callee has both READ and WRITE for the same
+                    # (global, member), merge to READ_WRITE.  Skip individual
+                    # READ/WRITE edges and emit one READ_WRITE instead.
+                    types = callee_access_map.get(gm_key, set())
+                    if "READ" in types and "WRITE" in types and "READ_WRITE" not in types:
+                        if access == "WRITE":
+                            # Skip WRITE; we'll use READ edge as template for READ_WRITE
+                            continue
+                        else:
+                            # Upgrade READ to READ_WRITE
+                            access = "READ_WRITE"
+
+                    key = (gre["global_name"], member, access)
                     if key in existing_members:
                         continue
                     existing_members.add(key)
-                    propagated_edges.append({
+                    candidate_edges.setdefault(gm_key, []).append({
                         "function_id": api_id,
                         "global_name": gre["global_name"],
-                        "access_type": gre.get("access_type", "READ"),
+                        "access_type": access,
                         "access_context": "CALLEE_PROPAGATED",
                         "via_chain": gre.get("via_chain", ""),
                         "accessed_member": member,
                         "callee": func_id_to_name.get(callee_id, ""),
                     })
+
+            # --- Rule 2: Write-dominates for cross-callee conflicts ---
+            # For each (global, member) group, if DIFFERENT callees contribute
+            # conflicting types (some READ, some WRITE), the write is the
+            # dominant observable effect (guard-then-modify pattern).
+            # Exception: READ_WRITE from any single callee is always kept.
+            for gm_key, edges in candidate_edges.items():
+                # Collect distinct (access_type, callee) pairs
+                access_types = {e["access_type"] for e in edges}
+                callee_per_type: dict[str, set] = {}
+                for e in edges:
+                    callee_per_type.setdefault(e["access_type"], set()).add(e["callee"])
+
+                if "READ_WRITE" in access_types:
+                    # A callee genuinely does read-modify-write (e.g. |=)
+                    # → propagate READ_WRITE edges, skip pure READ/WRITE
+                    for e in edges:
+                        if e["access_type"] == "READ_WRITE":
+                            propagated_edges.append(e)
+                elif "READ" in access_types and "WRITE" in access_types:
+                    # Different callees contribute READ vs WRITE.
+                    # This is the guard-then-modify pattern: validate reads
+                    # the state, then transition writes it. Net effect = WRITE.
+                    for e in edges:
+                        if e["access_type"] == "WRITE":
+                            propagated_edges.append(e)
+                else:
+                    # All callees agree on one type → propagate all
+                    propagated_edges.extend(edges)
 
             # Propagate registers
             api_reads: set = set()
@@ -6058,6 +6532,9 @@ class SourceCodeKnowledgeGraphBuilder:
             logger.info("  Propagating %d callee accessed_members to %d API functions…",
                          len(propagated_edges),
                          len({e["function_id"] for e in propagated_edges}))
+            if branch_filtered_count:
+                logger.info("    Branch-conditional filtering eliminated %d callee refs",
+                             branch_filtered_count)
 
             # Build lookup for global variable IDs
             gv_name_to_id: dict[str, str] = {}
@@ -6130,21 +6607,37 @@ class SourceCodeKnowledgeGraphBuilder:
         # Propagate SRC_ACCESSES_SFR edges from callees to API functions
         # This uses Cypher to traverse SRC_CALLS edges (already written)
         # and MERGE SFR edges from callees onto their callers.
-        # Only send API functions that have at least one callee in call graph.
+        # DISPATCHER-AWARE: mark dispatcher functions first, then exclude
+        # paths that traverse through them.
         api_with_callees = [fid for fid in api_func_ids if fid in caller_to_callees]
         if api_with_callees:
+            # Mark dispatcher functions in Neo4j for Cypher filtering
+            if dispatcher_ids:
+                disp_list = list(dispatcher_ids)
+                for chunk in self._chunked(disp_list, self.BATCH_SIZE):
+                    self._write_tx(
+                        "UNWIND $ids AS fid "
+                        "MATCH (f:SRC_Function {function_id: fid}) "
+                        "SET f.is_dispatcher = true",
+                        {"ids": chunk},
+                    )
+
             logger.info("  Propagating SRC_ACCESSES_SFR edges via call graph…")
             cypher = (
                 "UNWIND $func_ids AS fid "
                 "MATCH (api:SRC_Function {function_id: fid}) "
-                "MATCH (api)-[:SRC_CALLS*1..4]->(callee:SRC_Function) "
+                "MATCH path = (api)-[:SRC_CALLS*1..5]->(callee:SRC_Function) "
+                "WHERE ALL(n IN nodes(path)[1..-1] WHERE "
+                "  NOT coalesce(n.is_dispatcher, false)) "
                 "MATCH (callee)-[cr:SRC_ACCESSES_SFR]->(reg:SFR_Register) "
                 "WHERE NOT (api)-[:SRC_ACCESSES_SFR {access_type: cr.access_type}]->(reg) "
                 "MERGE (api)-[pr:SRC_ACCESSES_SFR {access_type: cr.access_type}]->(reg) "
                 "SET pr.propagated = true, "
                 "    pr.field = CASE WHEN pr.field IS NULL THEN cr.field ELSE pr.field END"
             )
-            for chunk in self._chunked(api_with_callees, self.BATCH_SIZE):
+            # Use smaller batches to avoid Neo4j timeout on deep graph traversal
+            sfr_batch_size = min(self.BATCH_SIZE, 20)
+            for chunk in self._chunked(api_with_callees, sfr_batch_size):
                 self._write_tx(cypher, {"func_ids": chunk})
 
         self.stats["propagated_member_edges"] = len(propagated_edges)
@@ -6928,12 +7421,12 @@ class SFRKnowledgeGraphBuilder:
                     "MATCH (f:SRC_Function {function_id: item.func_id}) "
                     "MATCH (r:SFR_Register {device: $device}) "
                     "WHERE r.name = item.register_name "
-                    "   OR r.name ENDS WITH ('_' + item.norm_name) "
-                    "   OR (item.name_pattern <> '' AND r.name =~ item.name_pattern) "
+                    "   OR (r.module = $module AND r.name ENDS WITH ('_' + item.norm_name)) "
+                    "   OR (item.name_pattern <> '' AND r.module = $module AND r.name =~ item.name_pattern) "
                     "MERGE (f)-[rel:SRC_ACCESSES_SFR]->(r) "
                     "SET rel.access_type = item.access_type"
                 )
-                self._write_tx(cypher, {"items": chunk, "device": device})
+                self._write_tx(cypher, {"items": chunk, "device": device, "module": self.module})
 
         count_res = self._run(
             "MATCH (f:SRC_Function {module: $module})-[r:SRC_ACCESSES_SFR]->() RETURN count(r) AS cnt",

@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "mcp"))
 class TestResolveDaName:
     """Unit tests for _resolve_da_name()."""
 
-    def test_known_key_returns_principal_id(self, tmp_path):
+    def test_known_key_returns_principal_id(self, tmp_path, monkeypatch):
         """An API key in the registry resolves to its principal_id."""
         import yaml
 
@@ -29,18 +29,26 @@ class TestResolveDaName:
             }
         }))
 
+        monkeypatch.setenv("API_KEY_REGISTRY_PATH", str(keys_file))
+        from core.config import get_settings
+        get_settings.cache_clear()
+
         from core.auth_middleware import reload_api_keys
         reload_api_keys(keys_file)
 
         from core.mcp_server import _resolve_da_name
         assert _resolve_da_name("test-key-001") == "gest_assistant"
 
-    def test_unknown_key_returns_unknown(self, tmp_path):
+    def test_unknown_key_returns_unknown(self, tmp_path, monkeypatch):
         """An unknown API key resolves to 'unknown'."""
         import yaml
 
         keys_file = tmp_path / "api_keys.yaml"
         keys_file.write_text(yaml.dump({"keys": {}}))
+
+        monkeypatch.setenv("API_KEY_REGISTRY_PATH", str(keys_file))
+        from core.config import get_settings
+        get_settings.cache_clear()
 
         from core.auth_middleware import reload_api_keys
         reload_api_keys(keys_file)
@@ -52,7 +60,7 @@ class TestResolveDaName:
 class TestDaNameContextVar:
     """Verify _current_da_name is async-safe across concurrent tasks."""
 
-    def test_concurrent_tasks_isolated(self, tmp_path):
+    def test_concurrent_tasks_isolated(self, tmp_path, monkeypatch):
         """Each async task gets its own _current_da_name value."""
         import yaml
 
@@ -63,6 +71,10 @@ class TestDaNameContextVar:
                 "key-b": {"principal_id": "da_beta", "roles": {"illd": ["public"]}},
             }
         }))
+
+        monkeypatch.setenv("API_KEY_REGISTRY_PATH", str(keys_file))
+        from core.config import get_settings
+        get_settings.cache_clear()
 
         from core.auth_middleware import reload_api_keys
         reload_api_keys(keys_file)

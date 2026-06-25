@@ -252,7 +252,11 @@ class IngestionService:
         try:
             p = safe_path_under(file_path, roots)
         except ValueError as exc:
-            raise ValueError(f"Rejected file path: {exc}") from exc
+            # Log the resolved-path / allowed-roots detail internally but keep it
+            # out of the caller-facing message so directory structure is not
+            # leaked to API clients (F3).
+            logger.warning("Rejected file path %s: %s", file_path, exc)
+            raise ValueError("Rejected file path: not permitted") from None
 
         if not p.exists():
             raise FileNotFoundError(f"File not found: {file_path}")

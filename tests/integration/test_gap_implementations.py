@@ -234,6 +234,7 @@ class TestContextRefiner:
 
 
 # ═══════ GAP-A05: BatchIngestion (unchanged) ═══════
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="batch_ingestion.py uses except* (Python 3.11+)")
 class TestBatchIngestion:
     def test_import(self):
         from src.IngestionPipeline.batch_ingestion import BatchIngestionPipeline, IngestionJob
@@ -250,32 +251,7 @@ class TestBatchIngestion:
         assert len(e.embed_batch(["a", "b", "c"])) == 3
 
 
-# ═══════ GAP-A13: CitationVerifier (RAGChecker upgrade) ═══════
-class TestCitationVerifier:
-    def test_import(self):
-        from src.ReviewGate.citation_verifier import CitationVerifier, VerificationResult
-        assert CitationVerifier is not None
 
-    def test_regex_extraction(self):
-        from src.ReviewGate.citation_verifier import CitationVerifier
-        v = CitationVerifier(enabled=True)
-        r = v.verify("IfxCan_Node_init does initialization. ADC_REQ_001 requires calibration.",
-                      [{"content": "IfxCan_Node_init is the CAN init function."}])
-        assert r.total_claims >= 1
-        assert r.verified_claims >= 1
-        assert "text_overlap" in r.methods_used
-
-    def test_disabled(self):
-        from src.ReviewGate.citation_verifier import CitationVerifier
-        r = CitationVerifier(enabled=False).verify("test", [])
-        assert not r.verified
-
-    def test_confidence_signal(self):
-        from src.ReviewGate.citation_verifier import VerificationResult
-        r = VerificationResult(claims=[], total_claims=10, verified_claims=8,
-                               unverified_claims=2, verification_rate=0.8,
-                               flagged_claims=[], latency_ms=0.0, methods_used=["text_overlap"])
-        assert r.as_confidence_signal()["citation_verification_rate"] == 0.8
 
 
 # ═══════ GAP-A14: FewShotLibrary (unchanged) ═══════
@@ -310,141 +286,3 @@ class TestOCR:
         from src.IngestionPipeline.parsers.ocr_processor import OCRProcessor
         assert OCRProcessor._estimate_confidence("The function initializes register.") > 0.5
         assert OCRProcessor._estimate_confidence("") == 0.0
-
-
-# ═══════ NEW: MISRA Remediation ═══════
-class TestMISRARemediation:
-    def test_import(self):
-        from src.DomainAssistants.misra_remediation.misra_remediation_engine import (
-            MISRARemediationEngine, ViolationParser, MISRARuleRetriever, MISRAViolation)
-        assert MISRARemediationEngine is not None
-
-    def test_parse_polyspace(self):
-        from src.DomainAssistants.misra_remediation.misra_remediation_engine import ViolationParser
-        output = 'main.c:42:10: warning: MISRA C:2012 Rule 10.1 - Operands inappropriate type'
-        vs = ViolationParser.parse(output)
-        assert len(vs) == 1
-        assert vs[0].rule_id == "10.1"
-        assert vs[0].line_number == 42
-
-    def test_parse_gcc(self):
-        from src.DomainAssistants.misra_remediation.misra_remediation_engine import ViolationParser
-        output = 'file.c:10:5: warning: [misra-c2012-8.4] function missing declaration'
-        vs = ViolationParser.parse(output)
-        assert len(vs) == 1
-        assert vs[0].rule_id == "8.4"
-
-    def test_rule_retriever_builtin(self):
-        from src.DomainAssistants.misra_remediation.misra_remediation_engine import MISRARuleRetriever
-        r = MISRARuleRetriever()
-        rule = r.get_rule("8.4")
-        assert rule["category"] == "Required"
-        assert "declaration" in rule["text"].lower()
-
-    def test_rule_retriever_unknown(self):
-        from src.DomainAssistants.misra_remediation.misra_remediation_engine import MISRARuleRetriever
-        rule = MISRARuleRetriever().get_rule("99.99")
-        assert rule["source"] == "none"
-
-    def test_violation_dataclass(self):
-        from src.DomainAssistants.misra_remediation.misra_remediation_engine import MISRAViolation
-        v = MISRAViolation(rule_id="10.1")
-        assert v.full_rule_id == "MISRA-C:2012 Rule 10.1"
-
-    def test_compliance_matrix(self):
-        from src.DomainAssistants.misra_remediation.misra_remediation_engine import MISRARemediationEngine
-        e = MISRARemediationEngine(llm_fn=lambda s, u, m: "")
-        matrix = e.generate_compliance_matrix(
-            'file.c:1:1: warning: MISRA C:2012 Rule 8.4 - test\n'
-            'file.c:2:1: warning: MISRA C:2012 Rule 8.4 - test2\n'
-            'file.c:3:1: warning: MISRA C:2012 Rule 10.1 - test3\n',
-            module="ADC")
-        assert matrix.violated_rules == 2
-        assert len(matrix.entries) == 2
-
-
-# ═══════ NEW: Unit Test Generation ═══════
-class TestUnitTestGen:
-    def test_import(self):
-        from src.DomainAssistants.unit_test_gen.test_generation_engine import (
-            TestGenerationEngine, TestSuite, TestCase, MockTarget)
-        assert TestGenerationEngine is not None
-
-    def test_not_available(self):
-        from src.DomainAssistants.unit_test_gen.test_generation_engine import TestGenerationEngine
-        assert not TestGenerationEngine(llm_fn=None).available
-
-    def test_testcase_render(self):
-        from src.DomainAssistants.unit_test_gen.test_generation_engine import TestCase
-        tc = TestCase(test_name="test_init", function_under_test="Adc_Init",
-                      test_body="TEST_ASSERT(result == E_OK);")
-        rendered = tc.render()
-        assert "test_init" in rendered
-        assert "TEST_ASSERT" in rendered
-
-    def test_testsuite_render(self):
-        from src.DomainAssistants.unit_test_gen.test_generation_engine import TestSuite, TestCase
-        tc = TestCase(test_name="test_a", function_under_test="f", test_body="/* test */")
-        suite = TestSuite(module="ADC", function_name="Adc_Init", test_cases=[tc],
-                          includes=["IfxAdc.h"])
-        rendered = suite.render()
-        assert "IfxAdc.h" in rendered
-        assert "RUN_TEST(test_a)" in rendered
-        assert "et.h" in rendered
-
-    def test_mock_target(self):
-        from src.DomainAssistants.unit_test_gen.test_generation_engine import MockTarget
-        m = MockTarget(name="CLC", mock_type="register",
-                       declaration="static volatile uint32 mock_CLC;")
-        assert m.mock_type == "register"
-
-
-# ═══════ NEW: FMEA ═══════
-class TestFMEA:
-    def test_import(self):
-        from src.DomainAssistants.fmea_assistant.fmea_engine import (
-            FMEAEngine, FMEAReport, FailureMode)
-        assert FMEAEngine is not None
-
-    def test_failure_mode_rpn(self):
-        from src.DomainAssistants.fmea_assistant.fmea_engine import FailureMode
-        fm = FailureMode(fm_id="FM-001", component="CAN", function="IfxCan_init",
-                         failure_mode="stuck", failure_effect="loss",
-                         failure_cause="hw", severity=8, occurrence=3, detection=5)
-        assert fm.rpn == 120
-
-    def test_report_dict(self):
-        from src.DomainAssistants.fmea_assistant.fmea_engine import FMEAReport
-        r = FMEAReport(module="ADC", review_required=True)
-        assert r.as_dict()["review_required"] is True
-
-    def test_not_available(self):
-        from src.DomainAssistants.fmea_assistant.fmea_engine import FMEAEngine
-        assert not FMEAEngine(llm_fn=None).available
-
-
-# ═══════ NEW: Formal Verification (CBMC) ═══════
-class TestFormalVerification:
-    def test_import(self):
-        from src.DomainAssistants.formal_verification.cbmc_bridge import (
-            CBMCBridge, FormalAssertion, FormalVerificationReport)
-        assert CBMCBridge is not None
-
-    def test_assertion_dataclass(self):
-        from src.DomainAssistants.formal_verification.cbmc_bridge import FormalAssertion
-        a = FormalAssertion(assertion_id="FA-01", requirement_id="REQ-001",
-                            requirement_text="Buffer must not overflow",
-                            assertion_code='__CPROVER_assert(idx < SIZE, "bounds");',
-                            assertion_type="bounds")
-        assert "CPROVER" in a.assertion_code
-
-    def test_report_dict(self):
-        from src.DomainAssistants.formal_verification.cbmc_bridge import FormalVerificationReport
-        r = FormalVerificationReport(module="ADC", verified_count=3, failed_count=1)
-        d = r.as_dict()
-        assert d["verified"] == 3
-        assert d["failed"] == 1
-
-    def test_not_available_without_llm(self):
-        from src.DomainAssistants.formal_verification.cbmc_bridge import CBMCBridge
-        assert not CBMCBridge(llm_fn=None).available

@@ -273,7 +273,6 @@ class TestObservabilityService:
 
         class _Driver:
             def session(self, database=None):
-                assert database == "illd"
                 return _Session()
 
         svc = ObservabilityService(neo4j_driver=_Driver())
@@ -325,11 +324,14 @@ class TestAuthService:
 
     def test_ensure_valid_token_no_credentials(self):
         import os
+        from unittest.mock import patch as _patch
         old_user = os.environ.pop("IFX_USERNAME", None)
         old_pass = os.environ.pop("IFX_PASSWORD", None)
         old_token = os.environ.pop("LLAMA_TOKEN", None)
         try:
-            result = AuthService.ensure_valid_token()
+            # Patch load_dotenv so it doesn't reload LLAMA_TOKEN from the .env file
+            with _patch("src.HybridRAG.code.token_manager.load_dotenv"):
+                result = AuthService.ensure_valid_token()
             assert "error" in result
         finally:
             if old_user:

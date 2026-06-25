@@ -15,11 +15,8 @@ import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
-import sys
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
-
-from MemoryLayer.memory.ephemeral_sandbox import (
+from src.MemoryLayer.memory.ephemeral_sandbox import (
     SandboxManager, EphemeralSandbox, SandboxParserDispatcher,
     SandboxAdapter, TraceabilityPuller, HybridGraphService
 )
@@ -28,6 +25,7 @@ from MemoryLayer.memory.ephemeral_sandbox import (
 class TestSandboxUploadFlow:
     """Test complete sandbox_upload workflow."""
     
+
     @pytest.mark.asyncio
     @patch("MemoryLayer.memory.ephemeral_sandbox.SandboxParserDispatcher")
     @patch("MemoryLayer.memory.ephemeral_sandbox.TraceabilityPuller")
@@ -102,7 +100,7 @@ class TestSandboxUploadFlow:
             sandbox.graph.load_prod_nodes(prod_nodes, prod_rels)
             
             # 2. Verify prod nodes loaded with correct tags
-            canonical_adc_init = "SRC_Function:Adc_Init:Adc"
+            canonical_adc_init = "SRC_Function:Adc_Init:ADC"
             prod_node = sandbox.graph.get_node(canonical_adc_init)
             
             assert prod_node is not None
@@ -146,6 +144,7 @@ class TestSandowUploadThenQuery:
 class TestShadowingDuringUpload:
     """Test shadowing behavior when sandbox ingests same functions as prod pull."""
     
+
     def test_shadowing_during_adapter_ingest(self):
         """When SandboxAdapter ingests parsed node matching prod node, shadow it."""
         
@@ -177,7 +176,7 @@ class TestShadowingDuringUpload:
         }
         
         # Simulate adapter shadow logic
-        node_id = "SRC_Function:Adc_Init:Adc"
+        node_id = "SRC_Function:Adc_Init:ADC"
         existing = sandbox.graph.get_node(node_id)
         
         if existing and existing.get("_origin") == "production":

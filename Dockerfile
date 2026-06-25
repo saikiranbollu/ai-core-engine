@@ -46,9 +46,18 @@ RUN pip install --no-cache-dir --timeout 120 \
 
 # Pre-download the sentence-transformers embedding model into the image
 # so the first search_database call doesn't block on a network download.
+# Revision must match embedding.revision in storage_config.yaml so the
+# Embedder can load it offline (HF_HUB_OFFLINE) from this baked cache.
 ENV HF_HOME=/app/.cache \
     SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', revision='1110a243fdf4706b3f48f1d95db1a4f5529b4d41')"
+# Also resolve the model WITHOUT a revision so HF writes the 'refs/main' pointer.
+# The pinned revision above IS the current HEAD, so this reuses the same snapshot
+# (no extra download) and only materializes refs/main. Without this, components
+# that load the model offline WITHOUT a revision (e.g. SemanticCache via
+# embedding_singleton.get_shared_model) fail with LocalEntryNotFoundError
+# because refs/main is missing in the baked cache.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
 # Pre-download LLMLingua model files into the image (download only, no loading
 # into memory — avoids OOM during build while keeping first-call latency low).

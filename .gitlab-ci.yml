@@ -1,0 +1,189 @@
+# =============================================================================
+#  AI Core Engine — GitLab CI/CD Pipeline
+# =============================================================================
+#  Triggered on Merge Request events. Runs entirely on the in-cluster
+#  GitLab Runner (Kubernetes executor, mcswai namespace).
+#
+#  Flow:
+#    1. build      — OpenShift build of the MR branch -> test-aice-mcp:<slug>
+#    2. unit-test  — run pytest unit suite INSIDE the freshly-built image
+#    3. deploy     — deploy the branch image to ai-core-engine test env
+#    4. e2e-test   — run E2E tests against the live deployed MCP server
+#    5. cleanup    — teardown test env + branch image tag (always runs)
+#
+#  Auth: job pods run as the 'gitlab-ci' service account (mcswai), which has
+#  'edit' in both mcswai and ai-core-engine. `oc` auto-uses the in-cluster
+#  service-account token — no OC_TOKEN/login required.
+# =============================================================================
+
+# Only ever create a single pipeline per change: the Merge Request pipeline,
+# and only when the MR targets the main branch.
+# Without this, a push to a branch with an open MR creates BOTH a branch
+# (push) pipeline and an MR pipeline. The branch pipeline has no matching
+# jobs (all jobs require merge_request_event) and fails as "no jobs to run",
+# and the duplicate can cause the MR pipeline to fail at creation too.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+    - when: never
+
+variables:
+  BUILD_NAMESPACE: "mcswai"
+  DEPLOY_NAMESPACE: "ai-core-engine"
+  INTERNAL_REGISTRY: "image-registry.openshift-image-registry.svc:5000"
+  IMAGE_NAME: "test-aice-mcp"
+  # Sanitized branch name used as image tag
+  IMAGE_TAG: "${CI_COMMIT_REF_SLUG}"
+  # Image built from THIS branch — referenced by later stages
+  BRANCH_IMAGE: "${INTERNAL_REGISTRY}/${BUILD_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}"
+  OC_CLI_IMAGE: "${INTERNAL_REGISTRY}/openshift/cli:latest"
+  # Test environment route (edge-TLS, defined in mcp/k8s/test/route.yaml)
+  MCP_TEST_URL: "https://test-mcp-ai-core-engine.eu-de-7.icp.infineon.com"
+
+stages:
+  - build
+  - unit-test
+  - deploy
+  - e2e-test
+  - cleanup
+
+# ─── Build Stage ─────────────────────────────────────────────────────────────
+# Builds the image from the MR branch commit and tags it with the branch slug.
+build-image:
+  stage: build
+  image: "${OC_CLI_IMAGE}"
+  resource_group: aice-pipeline
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    # Build directly from the MR commit; BuildConfig outputs :latest.
+    - |
+      oc start-build ${IMAGE_NAME} \
+        -n ${BUILD_NAMESPACE} \
+        --commit="${CI_COMMIT_SHA}" \
+        --wait --follow
+    # Re-tag the built image to the branch slug so each MR has an isolated tag.
+    - |
+      oc tag \
+        ${BUILD_NAMESPACE}/${IMAGE_NAME}:latest \
+        ${BUILD_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG} \
+        -n ${BUILD_NAMESPACE}
+  timeout: 40m
+
+# ─── Unit Test Stage ─────────────────────────────────────────────────────────
+# Runs the branch's unit test suite INSIDE the image built from this branch.
+# This validates the exact artifact produced from the MR's code + Dockerfile.
+run-unit-tests:
+  stage: unit-test
+  image: "${BRANCH_IMAGE}"
+  resource_group: aice-pipeline
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    # Kubernetes executor resource limits — sentence-transformers + PyTorch
+    # load ~2GB into RAM; default pod limits are too low → OOMKilled (137).
+    KUBERNETES_MEMORY_REQUEST: "3Gi"
+    KUBERNETES_MEMORY_LIMIT: "5Gi"
+    KUBERNETES_CPU_REQUEST: "1"
+    KUBERNETES_CPU_LIMIT: "2"
+    # The image provides the installed dependencies; the GitLab checkout
+    # ($CI_PROJECT_DIR) provides tests/ + src/ + conftest.py (which bootstraps
+    # sys.path). The Dockerfile does NOT copy tests/ into /app, so we run from
+    # the checkout rather than /app.
+    PYTHONPATH: "${CI_PROJECT_DIR}:${CI_PROJECT_DIR}/src:${CI_PROJECT_DIR}/src/MemoryLayer"
+    HF_HUB_OFFLINE: "1"
+    TRANSFORMERS_OFFLINE: "1"
+    # Point HF / sentence-transformers at the cache baked into the image
+    # (Dockerfile pre-downloads the embedder model here). The Kubernetes
+    # executor does not always preserve the image's ENV, so set it explicitly.
+    HF_HOME: "/app/.cache"
+    SENTENCE_TRANSFORMERS_HOME: "/app/.cache/sentence_transformers"
+    # Keep pytest cache off the (possibly read-only) checkout/app dirs.
+    PYTEST_ADDOPTS: "-o cache_dir=/tmp/pytest_cache"
+  script:
+    - cd "${CI_PROJECT_DIR}"
+    - export PYTHONPATH="${CI_PROJECT_DIR}:${CI_PROJECT_DIR}/src:${CI_PROJECT_DIR}/src/MemoryLayer"
+    - python -m pytest tests/unit --import-mode=importlib -v --tb=short
+  timeout: 30m
+
+# ─── Deploy Stage ────────────────────────────────────────────────────────────
+# Deploys/updates the test environment in ai-core-engine using the branch image,
+# then waits for the MCP server route to become healthy.
+deploy-test-env:
+  stage: deploy
+  image: "${OC_CLI_IMAGE}"
+  resource_group: aice-pipeline
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - oc apply -k mcp/k8s/test/ -n ${DEPLOY_NAMESPACE}
+    - |
+      oc set image deployment/test-aice-mcp-server \
+        aice-mcp="${BRANCH_IMAGE}" \
+        -n ${DEPLOY_NAMESPACE}
+    - |
+      oc delete job test-init-postgres -n ${DEPLOY_NAMESPACE} --ignore-not-found
+      oc apply -f mcp/k8s/test/init-postgres.yaml -n ${DEPLOY_NAMESPACE}
+    - oc rollout status deployment/test-aice-mcp-server -n ${DEPLOY_NAMESPACE} --timeout=300s
+    # Wait for the external route to become healthy (pods may be ready before
+    # the route/HAProxy propagates). Retry up to 30 × 10s = 5 min.
+    - |
+      echo "Waiting for MCP server route to become healthy..."
+      for i in $(seq 1 30); do
+        CODE=$(curl -sk -o /dev/null -w "%{http_code}" "${MCP_TEST_URL}/docs" || true)
+        echo "  attempt $i: HTTP $CODE"
+        if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+          echo "Route is healthy."
+          exit 0
+        fi
+        sleep 10
+      done
+      echo "ERROR: MCP server route did not become healthy within 5 min"
+      exit 1
+  timeout: 15m
+
+# ─── E2E Test Stage ──────────────────────────────────────────────────────────
+# Runs end-to-end MCP tool tests against the live deployed test environment.
+# Uses MCP_TEST_URL (route) and MCP_TEST_API_KEY to exercise the full stack.
+run-e2e-tests:
+  stage: e2e-test
+  image: "${BRANCH_IMAGE}"
+  resource_group: aice-pipeline
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    PYTHONPATH: "${CI_PROJECT_DIR}:${CI_PROJECT_DIR}/src:${CI_PROJECT_DIR}/src/MemoryLayer"
+    MCP_TEST_API_KEY: "key-admin-pipeline"
+    PYTEST_ADDOPTS: "-o cache_dir=/tmp/pytest_cache"
+  script:
+    - cd "${CI_PROJECT_DIR}"
+    - export PYTHONPATH="${CI_PROJECT_DIR}:${CI_PROJECT_DIR}/src:${CI_PROJECT_DIR}/src/MemoryLayer"
+    - echo "Running E2E tests against ${MCP_TEST_URL}"
+    # Collect-only first to surface any import errors before the real run.
+    - python -m pytest tests/e2e --collect-only -q -o asyncio_mode=auto
+    # Run E2E. asyncio_mode=auto avoids strict-mode collection issues across
+    # pytest-asyncio versions (1.3 vs 1.4+ handle module-level pytestmark differently).
+    - python -m pytest tests/e2e --import-mode=importlib -o asyncio_mode=auto -v --tb=short
+  timeout: 20m
+
+# ─── Cleanup Stage ───────────────────────────────────────────────────────────
+# Teardown of the test environment + the branch image tag.
+# Runs ALWAYS after E2E tests (pass or fail) to free cluster resources.
+cleanup-test-env:
+  stage: cleanup
+  image: "${OC_CLI_IMAGE}"
+  resource_group: aice-pipeline
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: always
+  script:
+    # The 'oc delete all,...' enumerates cluster-wide CRD API groups (acid.zalan.do,
+    # app.k8s.io) which the SA can't list. The actual resources are deleted fine;
+    # we suppress the non-zero exit from those "Forbidden" warnings with || true.
+    - |
+      oc delete all,secret,configmap,pvc,networkpolicy,route,job \
+        -l app.kubernetes.io/part-of=aice-test-env \
+        -n ${DEPLOY_NAMESPACE} \
+        --ignore-not-found || true
+    - oc tag -d ${BUILD_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG} -n ${BUILD_NAMESPACE} || true
+  timeout: 5m

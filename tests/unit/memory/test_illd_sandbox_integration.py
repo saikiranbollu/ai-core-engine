@@ -295,7 +295,7 @@ class TestIlldIngestion:
         assert len(val_edges) == 2
 
     def test_ingest_sfr_creates_register_nodes(self, sandbox, adapter):
-        """SFR ingestion should create Register + BitField nodes + HAS_BITFIELD edges."""
+        """SFR ingestion should create HardwareRegister + RegisterField nodes + HAS_FIELD edges."""
         parsed = {
             "type": "illd_sfr",
             "registers": {
@@ -312,19 +312,42 @@ class TestIlldIngestion:
         names = adapter.ingest_parsed(sandbox, parsed, "IfxAdc_regdef.h", module="ADC")
         assert "Ifx_ADC_GLOBCFG" in names
 
-        # Register node
-        node = sandbox.graph.get_node("Register:Ifx_ADC_GLOBCFG:ADC")
+        # HardwareRegister node (prod-compatible ID format)
+        node = sandbox.graph.get_node("HardwareRegister:Ifx_ADC_GLOBCFG:ADC")
         assert node is not None
-        assert node["register_name"] == "Ifx_ADC_GLOBCFG"
+        assert node["name"] == "Ifx_ADC_GLOBCFG"
+        assert node["id"] == "HWREG_ADC_Ifx_ADC_GLOBCFG"
 
-        # BitField nodes
-        bf_node = sandbox.graph.get_node("BitField:BITFIELD_Ifx_ADC_GLOBCFG_DIVA:ADC")
+        # RegisterField nodes (prod-compatible ID format)
+        field_node_id = "RegisterField:REGFIELD_ADC_Ifx_ADC_GLOBCFG_DIVA:ADC"
+        bf_node = sandbox.graph.get_node(field_node_id)
         assert bf_node is not None
         assert bf_node["bit_range"] == "0:4"
+        assert bf_node["register"] == "Ifx_ADC_GLOBCFG"
 
-        # HAS_BITFIELD edges
-        bf_edges = _get_outgoing_edges(sandbox.graph, "Register:Ifx_ADC_GLOBCFG:ADC", "HAS_BITFIELD")
-        assert len(bf_edges) == 2
+        # HAS_FIELD edges
+        reg_node_id = "HardwareRegister:Ifx_ADC_GLOBCFG:ADC"
+        has_field_edges = _get_outgoing_edges(sandbox.graph, reg_node_id, "HAS_FIELD")
+        assert len(has_field_edges) == 2
+
+    def test_ingest_sfr_submodule_filename_maps_to_parent_module(self, sandbox, adapter):
+        """Submodule regdef filenames like IfxPmscore_regdef.h must normalize to PMS."""
+        parsed = {
+            "type": "illd_sfr",
+            "module": "Pmscore",
+            "registers": {
+                "Ifx_PMS_CLC": [
+                    {"name": "DISR", "width": "1", "bit_range": "0:0", "description": "Disable request"},
+                ],
+            },
+            "file": "IfxPmscore_regdef.h",
+        }
+
+        names = adapter.ingest_parsed(sandbox, parsed, "IfxPmscore_regdef.h", module=None)
+        assert "Ifx_PMS_CLC" in names
+        node = sandbox.graph.get_node("HardwareRegister:Ifx_PMS_CLC:PMS")
+        assert node is not None
+        assert node["module"] == "PMS"
 
     def test_ingest_xlsx_requirements_illd(self, sandbox, adapter):
         """xlsx Jama requirements should create Requirement nodes."""
@@ -436,6 +459,267 @@ class TestIlldIngestion:
         # Should only have 1 chunk (for the 1 function), NOT many overlapping text chunks
         stats = sandbox.vectors.stats()
         assert stats["chunk_count"] == 1
+
+    def test_ingest_swa_header_creates_typedef_node_and_chunk(self, sandbox, adapter):
+        """Typedef ingestion should create a Typedef KG node AND a vector chunk."""
+        parsed = {
+            "type": "illd_swa",
+            "functions": [],
+            "structs": [],
+            "enums": [],
+            "typedefs": [
+                {"name": "IfxAdc_ConfigType", "type": "struct IfxAdc_Config",
+                 "brief": "ADC configuration typedef"},
+            ],
+            "macros": [],
+            "file": "IfxAdc_swa.h",
+        }
+
+        names = adapter.ingest_parsed(sandbox, parsed, "IfxAdc_swa.h", module="ADC")
+
+        # KG node must exist
+        assert "IfxAdc_ConfigType" in names
+        node = sandbox.graph.get_node("Typedef:IfxAdc_ConfigType:ADC")
+        assert node is not None, "Typedef KG node must be created"
+        assert node["id"] == "TYPEDEF_IfxAdc_ConfigType"
+        assert node["underlying_type"] == "struct IfxAdc_Config"
+        assert node["source"] == "SWA_Typedefs"
+        assert node["module"] == "ADC"
+
+        # Vector chunk must exist (for search_database)
+        stats = sandbox.vectors.stats()
+        assert stats["chunk_count"] >= 1, "Typedef must produce a vector chunk"
+        results = sandbox.vectors.search("ADC configuration typedef", top_k=5)
+        assert len(results) >= 1, "Vector search must find the typedef chunk"
+        chunk_ids = [r.metadata.get("node_type") for r in results]
+        assert "Typedef" in chunk_ids, "Chunk must be tagged as node_type=Typedef"
+
+    def test_ingest_swa_header_creates_macro_node_and_chunk(self, sandbox, adapter):
+        """Macro ingestion should create a Macro KG node AND a vector chunk."""
+        parsed = {
+            "type": "illd_swa",
+            "functions": [],
+            "structs": [],
+            "enums": [],
+            "typedefs": [],
+            "macros": [
+                {"name": "IFX_ADC_CHANNEL_MAX", "value": "16",
+                 "description": "Maximum number of ADC channels"},
+            ],
+            "file": "IfxAdc_swa.h",
+        }
+
+        names = adapter.ingest_parsed(sandbox, parsed, "IfxAdc_swa.h", module="ADC")
+
+        # KG node must exist (for MATCH (m:Macro {module}) Cypher)
+        assert "IFX_ADC_CHANNEL_MAX" in names
+        node = sandbox.graph.get_node("Macro:IFX_ADC_CHANNEL_MAX:ADC")
+        assert node is not None, "Macro KG node must be created"
+        assert node["id"] == "MACRO_IFX_ADC_CHANNEL_MAX"
+        assert node["value"] == "16"
+        assert node["source"] == "SWA_Macros"
+        assert node["module"] == "ADC"
+
+        # Vector chunk must exist (for search_database)
+        stats = sandbox.vectors.stats()
+        assert stats["chunk_count"] >= 1, "Macro must produce a vector chunk"
+        results = sandbox.vectors.search("ADC channel maximum", top_k=5)
+        assert len(results) >= 1, "Vector search must find the macro chunk"
+        chunk_ids = [r.metadata.get("node_type") for r in results]
+        assert "Macro" in chunk_ids, "Chunk must be tagged as node_type=Macro"
+
+    def test_macro_node_id_is_canonical(self, sandbox, adapter):
+        """Macro node_id must use canonical format (no legacy MACRO:name:MODULE format)."""
+        parsed = {
+            "type": "illd_swa",
+            "functions": [], "structs": [], "enums": [], "typedefs": [],
+            "macros": [{"name": "IFX_ADC_TIMEOUT_MS", "value": "100", "description": ""}],
+            "file": "IfxAdc_swa.h",
+        }
+        adapter.ingest_parsed(sandbox, parsed, "IfxAdc_swa.h", module="ADC")
+
+        node = sandbox.graph.get_node("Macro:IFX_ADC_TIMEOUT_MS:ADC")
+        assert node is not None, "Macro must use canonical Macro:name:MODULE node ID"
+        # Old legacy format must NOT exist
+        legacy_node = sandbox.graph.get_node("MACRO:IFX_ADC_TIMEOUT_MS:ADC")
+        assert legacy_node is None, "Legacy MACRO: prefix format must not be created"
+
+    def test_typedef_chunk_metadata(self, sandbox, adapter):
+        """Typedef vector chunk must carry correct source_file, module, node_id metadata."""
+        parsed = {
+            "type": "illd_swa",
+            "functions": [], "structs": [], "enums": [],
+            "typedefs": [{"name": "IfxAdc_Resolution", "type": "uint8", "brief": "ADC resolution type"}],
+            "macros": [],
+            "file": "IfxAdc_swa.h",
+        }
+        adapter.ingest_parsed(sandbox, parsed, "IfxAdc_swa.h", module="ADC")
+
+        results = sandbox.vectors.search("ADC resolution type", top_k=5)
+        assert len(results) >= 1
+        meta = results[0].metadata
+        assert meta["source_file"] == "IfxAdc_swa.h"
+        assert meta["module"] == "ADC"
+        assert meta["node_type"] == "Typedef"
+        assert meta["node_id"] == "Typedef:IfxAdc_Resolution:ADC"
+
+    def test_macro_chunk_metadata(self, sandbox, adapter):
+        """Macro vector chunk must carry correct source_file, module, node_id metadata."""
+        parsed = {
+            "type": "illd_swa",
+            "functions": [], "structs": [], "enums": [], "typedefs": [],
+            "macros": [{"name": "IFX_ADC_VREF_MV", "value": "3300", "description": "ADC voltage reference"}],
+            "file": "IfxAdc_swa.h",
+        }
+        adapter.ingest_parsed(sandbox, parsed, "IfxAdc_swa.h", module="ADC")
+
+        results = sandbox.vectors.search("ADC voltage reference", top_k=5)
+        assert len(results) >= 1
+        meta = results[0].metadata
+        assert meta["source_file"] == "IfxAdc_swa.h"
+        assert meta["module"] == "ADC"
+        assert meta["node_type"] == "Macro"
+        assert meta["node_id"] == "Macro:IFX_ADC_VREF_MV:ADC"
+
+    def test_shadow_removes_old_typedef_chunk_on_re_upload(self, sandbox, adapter):
+        """Re-uploading same file must remove stale typedef chunk and replace it."""
+        base_parsed = {
+            "type": "illd_swa",
+            "functions": [], "structs": [], "enums": [],
+            "typedefs": [{"name": "IfxAdc_ConfigType", "type": "struct IfxAdc_Config",
+                          "brief": "Old brief"}],
+            "macros": [],
+            "file": "IfxAdc_swa.h",
+        }
+        adapter.ingest_parsed(sandbox, base_parsed, "IfxAdc_swa.h", module="ADC")
+        assert sandbox.vectors.stats()["chunk_count"] == 1
+
+        updated_parsed = {
+            "type": "illd_swa",
+            "functions": [], "structs": [], "enums": [],
+            "typedefs": [{"name": "IfxAdc_ConfigType", "type": "struct IfxAdc_Config",
+                          "brief": "Updated brief"}],
+            "macros": [],
+            "file": "IfxAdc_swa.h",
+        }
+        adapter.ingest_parsed(sandbox, updated_parsed, "IfxAdc_swa.h", module="ADC")
+
+        # Still 1 chunk, not 2 (stale removed + new added)
+        assert sandbox.vectors.stats()["chunk_count"] == 1
+        results = sandbox.vectors.search("Updated brief", top_k=5)
+        assert len(results) >= 1
+
+    def test_reupload_c_illd_replaces_old_function_chunk(self, sandbox, adapter):
+        """Re-uploading the same iLLD C file should replace old semantic chunks."""
+        parsed_v1 = {
+            "type": "c_source",
+            "functions": [{
+                "name": "IfxAdc_initModule",
+                "return_type": "void",
+                "parameters": "",
+                "internal_calls": [],
+            }],
+            "content": "void IfxAdc_initModule(void) {}",
+            "file": "IfxAdc.c",
+        }
+        adapter.ingest_parsed(sandbox, parsed_v1, "IfxAdc.c", module="ADC")
+        assert sandbox.vectors.stats()["chunk_count"] == 1
+
+        parsed_v2 = {
+            "type": "c_source",
+            "functions": [{
+                "name": "IfxAdc_initModule",
+                "return_type": "sint32",
+                "parameters": "",
+                "internal_calls": [],
+            }],
+            "content": "sint32 IfxAdc_initModule(void) { return 0; }",
+            "file": "IfxAdc.c",
+        }
+        adapter.ingest_parsed(sandbox, parsed_v2, "IfxAdc.c", module="ADC")
+
+        assert sandbox.vectors.stats()["chunk_count"] == 1
+        results = sandbox.vectors.search("sint32", top_k=5)
+        assert len(results) >= 1
+        assert results[0].metadata["source_file"] == "IfxAdc.c"
+
+    def test_reupload_json_requirements_replaces_old_chunks(self, sandbox, adapter):
+        """Re-uploading the same requirements JSON should not leave stale chunks behind."""
+        parsed_v1 = {
+            "type": "json",
+            "data": {
+                "requirements": [
+                    {"document_key": "AURC1-REQA-300", "name": "Old Name", "description": "Old description"},
+                ]
+            },
+            "file": "adc_reqs.json",
+        }
+        adapter.ingest_parsed(sandbox, parsed_v1, "adc_reqs.json", module="ADC")
+        assert sandbox.vectors.stats()["chunk_count"] == 1
+
+        parsed_v2 = {
+            "type": "json",
+            "data": {
+                "requirements": [
+                    {"document_key": "AURC1-REQA-300", "name": "New Name", "description": "Fresh description"},
+                ]
+            },
+            "file": "adc_reqs.json",
+        }
+        adapter.ingest_parsed(sandbox, parsed_v2, "adc_reqs.json", module="ADC")
+
+        assert sandbox.vectors.stats()["chunk_count"] == 1
+        results = sandbox.vectors.search("Fresh description", top_k=5)
+        assert len(results) >= 1
+        assert results[0].metadata["source_file"] == "adc_reqs.json"
+
+    def test_reupload_pdf_sections_replaces_old_chunks(self, sandbox, adapter):
+        """Re-uploading the same PDF-derived section set should replace old section chunks."""
+        parsed_v1 = {
+            "type": "pdf_md",
+            "sections": [{"heading": "Overview", "section_num": "1", "content": "Old PDF text"}],
+            "file": "spec.pdf",
+        }
+        adapter.ingest_parsed(sandbox, parsed_v1, "spec.pdf", module="ADC")
+        assert sandbox.vectors.stats()["chunk_count"] == 1
+
+        parsed_v2 = {
+            "type": "pdf_md",
+            "sections": [{"heading": "Overview", "section_num": "1", "content": "Updated PDF text"}],
+            "file": "spec.pdf",
+        }
+        adapter.ingest_parsed(sandbox, parsed_v2, "spec.pdf", module="ADC")
+
+        assert sandbox.vectors.stats()["chunk_count"] == 1
+        results = sandbox.vectors.search("Updated PDF text", top_k=5)
+        assert len(results) >= 1
+        assert results[0].metadata["source_file"] == "spec.pdf"
+
+    def test_full_swa_all_entity_types(self, sandbox, adapter):
+        """All 5 entity types from a single SWA header must create correct nodes+chunks."""
+        parsed = {
+            "type": "illd_swa",
+            "functions": [{"name": "IfxAdc_init", "brief": "Init",
+                           "return_type": "void", "dependencies": []}],
+            "structs": [{"name": "IfxAdc_Config", "brief": "Config struct", "members": []}],
+            "enums": [{"name": "IfxAdc_Channel", "brief": "Channels", "values": []}],
+            "typedefs": [{"name": "IfxAdc_ConfigType", "type": "struct IfxAdc_Config",
+                          "brief": "Config typedef"}],
+            "macros": [{"name": "IFX_ADC_MAX_CH", "value": "16",
+                        "description": "Max channels"}],
+            "file": "IfxAdc_swa.h",
+        }
+        adapter.ingest_parsed(sandbox, parsed, "IfxAdc_swa.h", module="ADC")
+
+        # 5 KG nodes (one per entity type)
+        assert sandbox.graph.get_node("Function:IfxAdc_init:ADC") is not None
+        assert sandbox.graph.get_node("Struct:IfxAdc_Config:ADC") is not None
+        assert sandbox.graph.get_node("Enum:IfxAdc_Channel:ADC") is not None
+        assert sandbox.graph.get_node("Typedef:IfxAdc_ConfigType:ADC") is not None
+        assert sandbox.graph.get_node("Macro:IFX_ADC_MAX_CH:ADC") is not None
+
+        # 5 vector chunks (one per entity)
+        assert sandbox.vectors.stats()["chunk_count"] == 5
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -808,6 +1092,24 @@ class TestNodeNameExtraction:
         }
         names = adapter._extract_node_names_from_parsed(parsed)
         assert "AURC1-REQA-200" in names
+
+    def test_extract_swa_names_includes_typedefs_and_macros(self, adapter):
+        """_extract_node_names_from_parsed must include typedefs + macros for prod context pull."""
+        parsed = {
+            "type": "illd_swa",
+            "functions": [{"name": "IfxAdc_init"}],
+            "structs": [{"name": "IfxAdc_Config"}],
+            "enums": [{"name": "IfxAdc_Channel"}],
+            "typedefs": [{"name": "IfxAdc_ConfigType"}],
+            "macros": [{"name": "IFX_ADC_MAX_CH"}],
+        }
+        names = adapter._extract_node_names_from_parsed(parsed)
+        assert "IfxAdc_init" in names
+        assert "IfxAdc_Config" in names
+        assert "IfxAdc_Channel" in names
+        assert "IfxAdc_ConfigType" in names, "Typedefs must be included for prod context pull"
+        assert "IFX_ADC_MAX_CH" in names, "Macros must be included for prod context pull"
+        assert len(names) == 5
 
 
 # ═══════════════════════════════════════════════════════════════════════════

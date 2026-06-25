@@ -509,9 +509,16 @@ class PolarionConnector:
                 "AICE_SYNC_STATE_ROOTS",
                 ["/data/aice/sync_state", tempfile.gettempdir()],
             )
-            self._sync_state_dir: Optional[Path] = safe_path_under(
-                sync_state_dir, sync_roots
-            )
+            self._sync_state_dir: Optional[Path]
+            try:
+                self._sync_state_dir = safe_path_under(
+                    sync_state_dir, sync_roots
+                )
+            except ValueError as exc:
+                # Keep resolved-path / allowed-roots detail out of the propagated
+                # error so directory structure is not leaked (F4).
+                logger.warning("Rejected sync_state_dir %s: %s", sync_state_dir, exc)
+                raise ValueError("Rejected sync_state_dir: not permitted") from None
             self._sync_state_dir.mkdir(parents=True, exist_ok=True)
         else:
             self._sync_state_dir = None

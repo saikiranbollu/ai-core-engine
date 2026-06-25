@@ -48,8 +48,12 @@ def parse(path: str) -> Dict[str, Any]:
     # Group 2: field name (empty for anonymous/reserved fields)
     # Group 3: bit width
     # Group 4: full comment text
+    # The type token matches any Infineon bitfield type (Ifx_UReg_32Bit,
+    # Ifx_Strict_32Bit, Ifx_SReg_32Bit, Ifx_UReg_16Bit, etc.) without
+    # hard-coding specific names — any identifier starting with Ifx_ and
+    # ending with Bit is accepted.
     bitfield_re = re.compile(
-        r'^\s*(__\w+)\s+Ifx_UReg_32Bit(?:\s+(\w+))?\s*:(\d+);\s*/\*\*<(.*?)\*/\s*$'
+        r'^\s*(__\w+)\s+(Ifx_\w+Bit)(?:\s+(\w+))?\s*:(\d+);\s*/\*\*<(.*?)\*/\s*$'
     )
     comment_re = re.compile(r'\\brief\s*\[([^\]]+)\]\s*(.*)')
     access_type_re = re.compile(r'\(([a-zA-Z0-9]+)\)\s*$')  # e.g. (rw), (rh), (rw1sh)
@@ -77,9 +81,10 @@ def parse(path: str) -> Dict[str, Any]:
         bm = bitfield_re.search(line)
         if bm and current_struct is not None:
             access_qualifier = bm.group(1)        # e.g. __IOM, __IM, __OM (raw, as-is)
-            field_name       = bm.group(2) or ''
-            bit_width        = bm.group(3)
-            comment          = bm.group(4).strip()
+            # group(2) is the Ifx_*Bit type token — captured but not used further
+            field_name       = bm.group(3) or ''
+            bit_width        = bm.group(4)
+            comment          = bm.group(5).strip()
 
             cm = comment_re.search(comment)
             bit_range   = cm.group(1) if cm else ''

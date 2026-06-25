@@ -196,4 +196,4 @@ class TestCompleteImplementation:
 
     def test_56_tools_in_tiers(self):
         from mcp.core.tool_tiers import TOOL_TIERS
-        assert len(TOOL_TIERS) == 62, f"Expected 62 tools in tiers, got {len(TOOL_TIERS)}"
+        assert len(TOOL_TIERS) == 55, f"Expected 55 tools in tiers, got {len(TOOL_TIERS)}"

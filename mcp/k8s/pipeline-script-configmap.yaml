@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-runner-script
+  namespace: ai-core-engine
+  labels:
+    app: aice-pipeline
+    environment: test
+data:
+  git_askpass.sh: |
+    #!/bin/bash
+    # GIT_ASKPASS helper — returns IFX_USERNAME or IFX_PASSWORD based on prompt
+    if echo "$1" | grep -qi "username"; then
+      echo "$IFX_USERNAME"
+    else
+      echo "$IFX_PASSWORD"
+    fi
+  run_nightly.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    # ---------------------------------------------------------------------------
+    # Nightly MCAL Ingestion Pipeline
+    # Runs main pipeline (steps 0-3,5-8, skipping EA step 4) + HW UM pipeline
+    # for all production modules against the test Neo4j instance.
+    # ---------------------------------------------------------------------------
+
+    PROFILE="test"
+    PROJECT="A3G"
+    DEVICE="TC44x"
+
+    # All production MCAL modules
+    MODULES=(
+      ADC CAN SPI PORT GPT ICU DIO MCU FLS PWM
+      WDG LIN ETH FR I2C DSADC SENT UART OCU STM
+    )
+
+    LOG_DIR="/workspace/logs/$(date +%Y%m%d)"
+    mkdir -p "$LOG_DIR"
+
+    echo "=========================================="
+    echo "  AICE Nightly Pipeline - $(date -Iseconds)"
+    echo "  Profile: $PROFILE | Project: $PROJECT"
+    echo "  Modules: ${MODULES[*]}"
+    echo "=========================================="
+
+    FAILED_MODULES=()
+
+    for MODULE in "${MODULES[@]}"; do
+      echo ""
+      echo "══════════════════════════════════════════"
+      echo "  MODULE: $MODULE"
+      echo "══════════════════════════════════════════"
+
+      # --- Main Pipeline (skip EA step 4) ---
+      echo "  [1/2] Main pipeline (steps 0-3,5-8)..."
+      if python /app/src/HybridRAG/code/run_pipeline.py \
+        --module "$MODULE" \
+        --profile "$PROFILE" \
+        --project "$PROJECT" \
+        --auto-fetch \
+        --only 0,1,2,3,5,6,7,8 \
+        2>&1 | tee "$LOG_DIR/${MODULE}_main.log"; then
+        echo "  ✓ Main pipeline completed for $MODULE"
+      else
+        echo "  ✗ Main pipeline FAILED for $MODULE (exit $?)"
+        FAILED_MODULES+=("${MODULE}:main")
+        # Continue with next steps — don't abort entire run
+      fi
+
+      # --- HW UM Pipeline (skip datasheet, skip images) ---
+      echo "  [2/2] HW UM pipeline..."
+      if python /app/src/HybridRAG/code/run_hw_um_pipeline.py \
+        --module "$MODULE" \
+        --device "$DEVICE" \
+        --profile "$PROFILE" \
+        --project "$PROJECT" \
+        --auto-fetch \
+        --auto-fetch-val \
+        --no-images \
+        --skip-datasheet \
+        2>&1 | tee "$LOG_DIR/${MODULE}_hw_um.log"; then
+        echo "  ✓ HW UM pipeline completed for $MODULE"
+      else
+        echo "  ✗ HW UM pipeline FAILED for $MODULE (exit $?)"
+        FAILED_MODULES+=("${MODULE}:hw_um")
+      fi
+    done
+
+    echo ""
+    echo "=========================================="
+    echo "  NIGHTLY RUN COMPLETE - $(date -Iseconds)"
+    echo "=========================================="
+
+    if [ ${#FAILED_MODULES[@]} -gt 0 ]; then
+      echo "  FAILURES (${#FAILED_MODULES[@]}):"
+      for f in "${FAILED_MODULES[@]}"; do
+        echo "    - $f"
+      done
+      echo ""
+      echo "  Logs: $LOG_DIR/"
+      exit 1
+    else
+      echo "  All modules ingested successfully."
+      exit 0
+    fi

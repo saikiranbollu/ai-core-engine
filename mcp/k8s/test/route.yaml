@@ -8,12 +8,12 @@ apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
   name: test-mcp
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: aice-mcp-server
     env: test
 spec:
-  host: test-mcp-mcswai.eu-de-7.icp.infineon.com
+  host: test-mcp-ai-core-engine.eu-de-7.icp.infineon.com
   to:
     kind: Service
     name: test-mcp
@@ -31,12 +31,12 @@ apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
   name: test-neo4j-ui-route
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: test-neo4j
     env: test
 spec:
-  host: neo4j-ui-mcswai-test.icp.infineon.com
+  host: neo4j-ui-ai-core-engine-test.icp.infineon.com
   to:
     kind: Service
     name: test-neo4j
@@ -54,12 +54,12 @@ apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
   name: test-neo4j-bolt-edge-route
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: test-neo4j
     env: test
 spec:
-  host: bolt-edge-neo4j-mcswai-test.icp.infineon.com
+  host: bolt-edge-neo4j-ai-core-engine-test.icp.infineon.com
   to:
     kind: Service
     name: test-neo4j
@@ -77,12 +77,12 @@ apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
   name: test-neo4j-bolt-passthrough-route
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: test-neo4j
     env: test
 spec:
-  host: bolt-passthrough-neo4j-mcswai-test.icp.infineon.com
+  host: bolt-passthrough-neo4j-ai-core-engine-test.icp.infineon.com
   to:
     kind: Service
     name: test-neo4j
@@ -99,12 +99,12 @@ apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
   name: test-qdrant-route
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: test-qdrant
     env: test
 spec:
-  host: qdrant-mcswai-test.icp.infineon.com
+  host: qdrant-ai-core-engine-test.icp.infineon.com
   to:
     kind: Service
     name: test-qdrant

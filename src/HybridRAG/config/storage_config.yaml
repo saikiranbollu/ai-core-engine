@@ -50,6 +50,22 @@ neo4j:
       embedding_dimension: 1536
       similarity_threshold: 0.85
 
+  test:
+    description: "Test Instance (bolt-passthrough-neo4j-mcswai-test)"
+    uri: "bolt+ssc://bolt-passthrough-neo4j-mcswai-test.icp.infineon.com:443"
+    username: "neo4j"
+    password: "${NEO4J_PASSWORD}"
+    database: "neo4j"
+    encrypted: false
+    max_connection_lifetime: 3600
+    max_connection_pool_size: 50
+    connection_acquisition_timeout: 60
+    in_cluster_uri: "bolt://test-neo4j:7687"
+    graph_settings:
+      node_label_prefix: "MCAL_"
+      embedding_dimension: 1536
+      similarity_threshold: 0.85
+
   local:
     description: "Local Neo4j Desktop - Incremental Ingestion Testing"
     uri: "neo4j://127.0.0.1:7687"
@@ -130,7 +146,11 @@ data:
 # ---------------------------------------------------------------------------
 embedding:
   model: "sentence-transformers/all-MiniLM-L6-v2"
-  revision: "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"   # pinned HF commit hash
+  # Pinned to the current HEAD commit, which is the only revision the internal
+  # artifactory HF mirror serves. Weights are identical to the older c9745ed1
+  # commit (that commit only changed README/metadata). Using the served commit
+  # lets the model load offline from the cache baked into the image.
+  revision: "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"   # pinned HF commit hash
   dimension: 384
   batch_size: 64
 

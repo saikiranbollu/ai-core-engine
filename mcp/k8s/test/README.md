@@ -28,9 +28,9 @@ Or re-run the init job for a different profile after the initial deploy:
 
 ```bash
 # Delete the old job and re-create with desired profile
-kubectl delete job test-init-neo4j -n mcswai --ignore-not-found
+kubectl delete job test-init-neo4j -n ai-core-engine --ignore-not-found
 
-kubectl create job test-init-neo4j -n mcswai \
+kubectl create job test-init-neo4j -n ai-core-engine \
   --image=neo4j:4.4.48 \
   -- /bin/bash -c "echo 'Use kubectl apply -k with edited ONTOLOGY_PROFILE instead'"
 
@@ -45,20 +45,20 @@ Shared indexes (`NodeSet`, `ApprovedPattern`) are always created regardless of p
 Before deploying, patch the external secrets with real credentials:
 
 ```bash
-kubectl patch secret test-aice-external-secrets -n mcswai -p \
+kubectl patch secret test-aice-external-secrets -n ai-core-engine -p \
   '{"stringData":{"ifx-username":"<REAL>","ifx-password":"<REAL>","jama-api-key":"<REAL>","jama-api-secret":"<REAL>"}}'
-kubectl rollout restart deployment/test-aice-mcp-server -n mcswai
+kubectl rollout restart deployment/test-aice-mcp-server -n ai-core-engine
 ```
 
 ## Routes
 
 | Service | URL | Port |
 |---------|-----|------|
-| MCP Server | https://test-mcp-mcswai.eu-de-7.icp.infineon.com/mcp | 8000 |
-| Neo4j Browser | https://neo4j-ui-mcswai-test.icp.infineon.com | 7474 |
-| Neo4j Bolt (edge) | https://bolt-edge-neo4j-mcswai-test.icp.infineon.com | 7687 |
-| Neo4j Bolt (passthrough) | https://bolt-passthrough-neo4j-mcswai-test.icp.infineon.com | 7687 |
-| Qdrant REST | https://qdrant-mcswai-test.icp.infineon.com | 6333 |
+| MCP Server | https://test-mcp-ai-core-engine.eu-de-7.icp.infineon.com/mcp | 8000 |
+| Neo4j Browser | https://neo4j-ui-ai-core-engine-test.icp.infineon.com | 7474 |
+| Neo4j Bolt (edge) | https://bolt-edge-neo4j-ai-core-engine-test.icp.infineon.com | 7687 |
+| Neo4j Bolt (passthrough) | https://bolt-passthrough-neo4j-ai-core-engine-test.icp.infineon.com | 7687 |
+| Qdrant REST | https://qdrant-ai-core-engine-test.icp.infineon.com | 6333 |
 
 **Internal services** (cluster-only, no external route):
 
@@ -71,5 +71,5 @@ kubectl rollout restart deployment/test-aice-mcp-server -n mcswai
 ## Cleanup
 
 ```bash
-kubectl delete all,secret,configmap,pvc,networkpolicy,route -l app.kubernetes.io/part-of=aice-test-env -n mcswai
+kubectl delete all,secret,configmap,pvc,networkpolicy,route -l app.kubernetes.io/part-of=aice-test-env -n ai-core-engine
 ```

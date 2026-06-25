@@ -400,7 +400,7 @@ def step2_jama_fetch(module: str, dry_run: bool) -> None:
     )
 
 
-def step3_relationships(module: str, dry_run: bool) -> None:
+def step3_relationships(module: str, dry_run: bool, workers: int = 10) -> None:
     """Fetch Jama relationships."""
     jama_mod = _jama_module_name(module)
     if not dry_run:
@@ -408,8 +408,9 @@ def step3_relationships(module: str, dry_run: bool) -> None:
             JAMA_REQ_DIR / f"jama_{jama_mod.lower()}_combined_requirements.json",
             "Run Step 2 first or use: python KG/fetch_jama_requirements.py --module <MODULE>"
         )
+    cmd = [PYTHON, "fetch_jama_relationships.py", "--module", jama_mod, "--max-workers", str(workers), "-v"]
     _run(
-        [PYTHON, "fetch_jama_relationships.py", "--module", jama_mod, "-v"],
+        cmd,
         cwd=CODE_DIR / "KG",
         label="Step 3: Fetch Jama relationships",
         dry_run=dry_run,
@@ -634,6 +635,8 @@ def main() -> None:
                         help="Enable DEBUG logging.")
     parser.add_argument("--project", type=str, default="A3G",
                         help="Project tag to stamp on all nodes (e.g. A3G, RC1). Default: A3G")
+    parser.add_argument("--workers", type=int, default=10,
+                        help="Number of parallel threads for API calls (default: 10).")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -737,6 +740,8 @@ def main() -> None:
             kwargs["force"] = args.force
         if "project" in sig.parameters:
             kwargs["project"] = args.project
+        if "workers" in sig.parameters:
+            kwargs["workers"] = args.workers
         if step.get("needs_qeax"):
             kwargs["qeax_path"] = qeax_path
         if step["needs_module"]:

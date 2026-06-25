@@ -1,0 +1,14 @@
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+temp/
+tests/
+docs/
+monitoring/
+*.egg-info/
+.vscode/
+env/
+src/HybridRAG/temp/

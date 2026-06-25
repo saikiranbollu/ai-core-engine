@@ -8,7 +8,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: test-init-neo4j
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: aice-mcp-server
     env: test

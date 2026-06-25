@@ -47,6 +47,7 @@ anyio>=3.7.0
 
 # ─── Document Parsing ─────────────────────────────────────
 PyMuPDF>=1.23.0           # fitz
+pymupdf4llm>=0.0.17       # PDF→Markdown for sandbox offline_pdf_parser
 openpyxl>=3.1.0
 pandas>=2.0.0
 python-docx>=1.0.0        # docx

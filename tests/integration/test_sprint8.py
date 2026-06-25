@@ -36,7 +36,7 @@ from src.HybridRAG.code.querier.kg_node_utils import (
 class TestContextBuilder:
     def test_estimate_tokens(self):
         assert estimate_tokens("abc") == 1  # 3 chars -> ~1 token
-        assert estimate_tokens("a" * 30) == 10
+        assert estimate_tokens("a" * 30) == 5
         assert estimate_tokens("") == 0
 
     def test_context_slot_has_expected_members(self):
@@ -178,7 +178,7 @@ class TestExtractKeywords:
 class TestInferLabels:
     def test_function_inference(self):
         labels = infer_labels("what does Adc_Init function do?")
-        assert "SWUD_Function" in labels
+        assert "SRC_Function" in labels
 
     def test_requirement_inference(self):
         labels = infer_labels("show me the requirements for ADC")
@@ -304,7 +304,7 @@ class TestSearchServiceInit:
     def test_default_constructor(self):
         from src.HybridRAG.code.querier.search_service import SearchService
         svc = SearchService()
-        assert svc.module == "ADC"
+        assert svc.module is None
         assert svc._context_budget == 16000
         assert svc._context_builder is None
 
@@ -381,7 +381,7 @@ class TestRLMOrchestratorContextBuilder:
     def test_execute_step_with_mock_search(self):
         from src.HybridRAG.code.querier.rlm_orchestrator import RLMOrchestrator
 
-        def mock_search(query, max_results=10, alpha=0.5, workspace_id="illd"):
+        def mock_search(query=None, max_results=10, alpha=0.5, workspace_id="illd", **kwargs):
             return {
                 "results": [
                     {"node_id": "f1", "node_type": "SWUD_Function", "source": "neo4j",

@@ -787,7 +787,7 @@ class SandboxParserDispatcher:
             if "_regdef" in fname_lower:
                 return self._parse_sfr(p)
         try:
-            from src.IngestionPipeline.Parsers.c_parser import parse as c_parse
+            from src.IngestionPipeline.parsers.c_parser import parse as c_parse
             parsed = c_parse(
                 str(p),
                 include_paths=self._include_paths or None,
@@ -810,7 +810,7 @@ class SandboxParserDispatcher:
         # Uses pymupdf4llm-based section parser (no GPT, offline-capable).
         # Returns "pdf_md" type → SandboxAdapter creates per-section vector chunks only.
         try:
-            from src.IngestionPipeline.Parsers.offline_pdf_parser import (
+            from src.IngestionPipeline.parsers.offline_pdf_parser import (
                 convert_pdf_to_sections,
             )
             return convert_pdf_to_sections(str(p))
@@ -824,7 +824,7 @@ class SandboxParserDispatcher:
     def _parse_xlsx(self, p: Path, fname_lower: str) -> Dict:
         if "_ts_" in fname_lower or "testspec" in fname_lower:
             try:
-                from src.IngestionPipeline.Parsers.testspec_parsers import parse_testspec_workbook
+                from src.IngestionPipeline.parsers.testspec_parsers import parse_testspec_workbook
                 nodes = parse_testspec_workbook(str(p))
                 return {"type": "testspec", "nodes": nodes, "file": str(p)}
             except (ImportError, Exception):
@@ -837,7 +837,7 @@ class SandboxParserDispatcher:
                 return result
 
         try:
-            from src.IngestionPipeline.Parsers.xlsx_parser import parse as xlsx_parse
+            from src.IngestionPipeline.parsers.xlsx_parser import parse as xlsx_parse
             sheets = xlsx_parse(str(p))
             return {"type": "xlsx", "sheets": sheets, "file": str(p)}
         except ImportError:
@@ -893,21 +893,21 @@ class SandboxParserDispatcher:
 
     def _parse_arxml(self, p: Path) -> Dict:
         try:
-            from src.IngestionPipeline.Parsers.arxml_parser import parse as arxml_parse
+            from src.IngestionPipeline.parsers.arxml_parser import parse as arxml_parse
             return arxml_parse(str(p))
         except ImportError:
             return {"type": "arxml", "modules": [], "file": str(p)}
 
     def _parse_puml(self, p: Path) -> Dict:
         try:
-            from src.IngestionPipeline.Parsers.puml_parser import parse as puml_parse
+            from src.IngestionPipeline.parsers.puml_parser import parse as puml_parse
             return puml_parse(str(p))
         except ImportError:
             return {"type": "puml", "functions": [], "file": str(p)}
 
     def _parse_rst(self, p: Path) -> Dict:
         try:
-            from src.IngestionPipeline.Parsers.rst_parser import parse as rst_parse
+            from src.IngestionPipeline.parsers.rst_parser import parse as rst_parse
             sections = rst_parse(str(p))
             return {"type": "rst", "sections": sections, "file": str(p)}
         except ImportError:
@@ -926,7 +926,7 @@ class SandboxParserDispatcher:
     def _parse_illd_swa(self, p: Path) -> Dict:
         """Route SWA headers to illd_swa_parser (regex-based, no includes)."""
         try:
-            from src.IngestionPipeline.Parsers.illd_swa_parser import parse as swa_parse
+            from src.IngestionPipeline.parsers.illd_swa_parser import parse as swa_parse
             result = swa_parse(str(p), enrich=False)
             result["type"] = "illd_swa"
             result.setdefault("file", str(p))
@@ -942,7 +942,7 @@ class SandboxParserDispatcher:
     def _parse_sfr(self, p: Path) -> Dict:
         """Route SFR regdef headers to sfr_parser (regex-based, no includes)."""
         try:
-            from src.IngestionPipeline.Parsers.sfr_parser import parse as sfr_parse
+            from src.IngestionPipeline.parsers.sfr_parser import parse as sfr_parse
             result = sfr_parse(str(p))
             result["type"] = "illd_sfr"
             result.setdefault("file", str(p))
@@ -1367,26 +1367,73 @@ class SandboxAdapter:
     def _ingest_swa_header(self, sandbox, parsed, filename, module) -> List[str]:
         """Ingest SWA parser output → Function, Struct, StructMember, Enum, EnumValue, Typedef nodes.
 
-        Matches production node types and IDs from illd_kg_builder.py.
+        Matches production node types, IDs, properties and relationships from illd_kg_builder.py.
+        LLM-enriched fields (purpose on Struct/Enum/Typedef, usage_notes, error_handling on
+        Function) are stored as empty strings — they require the offline enrichment pipeline.
+        Function.purpose uses detailed_description as fallback (same as production fallback).
         """
+        _PRIMITIVE_TYPES = {
+            "uint8", "uint16", "uint32", "uint64",
+            "int8", "int16", "int32", "int64",
+            "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+            "int8_t", "int16_t", "int32_t", "int64_t",
+            "float32", "float64", "boolean", "sint8", "sint16", "sint32",
+            "void", "char", "int", "unsigned", "float", "double",
+        }
+
+        def _clean_type(raw: str) -> str:
+            """Strip pointer/const/volatile qualifiers for type resolution."""
+            return raw.replace("const ", "").replace("volatile ", "").strip().rstrip("*").strip()
+
         node_names = []
         mod = module or (parsed.get("module") or "unknown").upper()
         sandbox.vectors.remove_by_metadata(source_file=filename)
 
-        # Functions
+        # ── Collections for two-pass derived-relationship creation ────────
+        struct_node_ids: dict = {}    # struct_name → canonical node_id
+        typedef_node_ids: dict = {}   # typedef_name → canonical node_id
+        enum_node_ids: dict = {}      # enum_name → canonical node_id
+        param_info: list = []         # (param_node_id, raw_type, func_node_id)
+        member_info: list = []        # (member_node_id, raw_type, struct_node_id)
+        ret_type_seen: set = set()    # dedup ReturnType nodes
+        func_node_ids_by_name: dict = {}  # func_name → canonical node_id
+
+        # ── Functions ─────────────────────────────────────────────────────
         for fn in parsed.get("functions", []):
             if not isinstance(fn, dict):
                 continue
             name = fn.get("name", "")
             if not name:
                 continue
+
+            return_type = fn.get("return_type", "")
+            params_list = fn.get("parameters", [])
+            req_ids = fn.get("trace_info", {}).get("requirements", [])
+
+            # signature_hash — matches production _signature_hash()
+            norm_params = [
+                p.get("type", "").strip()
+                for p in params_list if isinstance(p, dict)
+            ]
+            sig = f"{name}|{return_type.strip()}|{','.join(norm_params)}"
+            sig_hash = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:12]
+
             node_type = "Function"
             node_id = EphemeralGraph._canonical_id(node_type, {"name": name, "module": mod})
+            func_node_ids_by_name[name] = node_id
+
             props = {
                 "name": name,
                 "id": f"FUNC_{name}",
+                "label": name,
                 "brief": fn.get("brief", ""),
-                "return_type": fn.get("return_type", ""),
+                "purpose": fn.get("purpose") or fn.get("detailed_description", ""),
+                "return_type": return_type,
+                "return_brief": fn.get("return_details", "") or fn.get("return_doc", ""),
+                "signature_hash": sig_hash,
+                "traces": json.dumps(req_ids) if req_ids else None,
+                "origin": "arch_only",
+                "source_files": [filename],
                 "source": "SWA_Functions",
                 "module": mod,
                 "source_file": filename,
@@ -1394,9 +1441,17 @@ class SandboxAdapter:
             self._add_node_with_shadow(sandbox, node_type, node_id, props,
                                        clear_rel_types=self.ILLD_DETECTABLE_REL_TYPES)
             node_names.append(name)
-            # Semantic chunk
+
+            # RAG chunk — enriched with parameter info (H2)
             brief = fn.get("brief", "")
-            text = f"Function: {name}\nReturn: {fn.get('return_type', 'void')}\nBrief: {brief}"
+            params_text = ", ".join(
+                f"{p.get('type', '')} {p.get('name', '')}".strip()
+                for p in params_list if isinstance(p, dict)
+            )
+            text = (
+                f"Function: {name}\nReturn: {return_type or 'void'}\nBrief: {brief}"
+                + (f"\nParameters: {params_text}" if params_text else "")
+            )
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
                 source_file=filename,
@@ -1404,14 +1459,73 @@ class SandboxAdapter:
                           "node_id": node_id, "module": mod},
             )])
 
-            # Dependencies (function → function)
+            # ReturnType node + RETURN_TYPE edge (dedup across functions)
+            if return_type and return_type != "void":
+                rt_id = f"RETTYPE_{return_type}"
+                rt_node_id = EphemeralGraph._canonical_id(
+                    "ReturnType", {"name": rt_id, "module": mod})
+                if rt_id not in ret_type_seen:
+                    ret_type_seen.add(rt_id)
+                    self._add_node_with_shadow(sandbox, "ReturnType", rt_node_id, {
+                        "id": rt_id, "name": return_type, "label": return_type, "module": mod,
+                    })
+                sandbox.graph.add_relationship(
+                    node_id, rt_node_id, "RETURN_TYPE", {"_origin": "sandbox"})
+
+            # DEPENDS_ON edges (with dependency_type attr matching prod)
             for dep in fn.get("dependencies", []):
                 if dep and isinstance(dep, str):
-                    dep_id = EphemeralGraph._canonical_id("Function", {"name": dep, "module": mod})
+                    dep_node_id = EphemeralGraph._canonical_id(
+                        "Function", {"name": dep, "module": mod})
                     sandbox.graph.add_relationship(
-                        node_id, dep_id, "DEPENDS_ON", {"_origin": "sandbox"})
+                        node_id, dep_node_id, "DEPENDS_ON",
+                        {"_origin": "sandbox", "dependency_type": "Calls"})
 
-        # Structs + StructMembers
+            # Parameter nodes + HAS_PARAMETER edges (with position attr)
+            for idx, param in enumerate(params_list):
+                if not isinstance(param, dict):
+                    continue
+                pname = param.get("name", "")
+                if not pname:
+                    continue
+                ptype = param.get("type", "")
+                p_node_type = "Parameter"
+                pid_key = f"{name}__{pname}"               # canonical key (unique)
+                pid_prod = f"PARAM_{name}_{pname}"         # prod-matching id property
+                p_node_id = EphemeralGraph._canonical_id(
+                    p_node_type, {"name": pid_key, "module": mod})
+                p_props = {
+                    "name": pname,
+                    "id": pid_prod,
+                    "label": f"{pname}: {ptype}",
+                    "type": ptype,
+                    "module": mod,
+                    "source_file": filename,
+                }
+                self._add_node_with_shadow(sandbox, p_node_type, p_node_id, p_props)
+                sandbox.graph.add_relationship(
+                    node_id, p_node_id, "HAS_PARAMETER",
+                    {"_origin": "sandbox", "position": idx})
+                param_info.append((p_node_id, ptype, node_id))
+
+            # IMPLEMENTED_BY + IMPLEMENTS edges from \trace doxygen tags (C1)
+            for req_id in req_ids:
+                if not req_id:
+                    continue
+                req_node_type = "Requirement"
+                req_node_id = EphemeralGraph._canonical_id(
+                    req_node_type, {"name": req_id, "module": mod})
+                if sandbox.graph.get_node(req_node_id) is None:
+                    sandbox.graph.add_node(req_node_type, req_node_id, {
+                        "requirement_id": req_id, "name": req_id, "module": mod,
+                        "source": "SWA_trace_tag", "source_file": filename,
+                    })
+                sandbox.graph.add_relationship(
+                    req_node_id, node_id, "IMPLEMENTED_BY", {"_origin": "sandbox"})
+                sandbox.graph.add_relationship(
+                    node_id, req_node_id, "IMPLEMENTS", {"_origin": "sandbox"})
+
+        # ── Structs + StructMembers ───────────────────────────────────────
         for s in parsed.get("structs", []):
             if not isinstance(s, dict):
                 continue
@@ -1420,40 +1534,43 @@ class SandboxAdapter:
                 continue
             node_type = "Struct"
             node_id = EphemeralGraph._canonical_id(node_type, {"name": sname, "module": mod})
+            struct_node_ids[sname] = node_id
             props = {
                 "name": sname,
                 "id": f"STRUCT_{sname}",
+                "label": sname,
                 "brief": s.get("brief", ""),
+                "purpose": "",   # LLM-only field — empty without enrichment pipeline
                 "source": "SWA_Structs",
                 "module": mod,
                 "source_file": filename,
             }
             self._add_node_with_shadow(sandbox, node_type, node_id, props)
             node_names.append(sname)
-            # Semantic chunk
-            members_text = ", ".join(m.get("name", "") for m in s.get("members", []) if isinstance(m, dict))
+            members_text = ", ".join(
+                m.get("name", "") for m in s.get("members", []) if isinstance(m, dict))
             text = f"Struct: {sname}\nBrief: {s.get('brief', '')}\nMembers: {members_text}"
             sandbox.vectors.add_chunks([Chunk(
-                text=text,
-                source_file=filename,
+                text=text, source_file=filename,
                 metadata={"source_file": filename, "node_type": "Struct",
                           "node_id": node_id, "module": mod},
             )])
 
-            # Members → StructMember nodes + HAS_MEMBER edges
             for m in s.get("members", []):
                 if not isinstance(m, dict):
                     continue
                 mname = m.get("name", "")
                 if not mname:
                     continue
+                mtype = m.get("type", "unknown")
                 m_node_type = "StructMember"
                 mid = f"MEMBER_{sname}_{mname}"
                 m_node_id = EphemeralGraph._canonical_id(m_node_type, {"name": mid, "module": mod})
                 m_props = {
                     "name": mname,
                     "id": mid,
-                    "type": m.get("type", "unknown"),
+                    "label": f"{mname}: {mtype}",
+                    "type": mtype,
                     "description": m.get("description", ""),
                     "module": mod,
                     "source_file": filename,
@@ -1461,8 +1578,9 @@ class SandboxAdapter:
                 self._add_node_with_shadow(sandbox, m_node_type, m_node_id, m_props)
                 sandbox.graph.add_relationship(
                     node_id, m_node_id, "HAS_MEMBER", {"_origin": "sandbox"})
+                member_info.append((m_node_id, mtype, node_id))
 
-        # Enums + EnumValues
+        # ── Enums + EnumValues ────────────────────────────────────────────
         for e in parsed.get("enums", []):
             if not isinstance(e, dict):
                 continue
@@ -1471,27 +1589,28 @@ class SandboxAdapter:
                 continue
             node_type = "Enum"
             node_id = EphemeralGraph._canonical_id(node_type, {"name": ename, "module": mod})
+            enum_node_ids[ename] = node_id
             props = {
                 "name": ename,
                 "id": f"ENUM_{ename}",
+                "label": ename,
                 "brief": e.get("brief", ""),
+                "purpose": "",   # LLM-only
                 "source": "SWA_Enums",
                 "module": mod,
                 "source_file": filename,
             }
             self._add_node_with_shadow(sandbox, node_type, node_id, props)
             node_names.append(ename)
-            # Semantic chunk
-            vals_text = ", ".join(v.get("name", "") for v in e.get("values", []) if isinstance(v, dict))
+            vals_text = ", ".join(
+                v.get("name", "") for v in e.get("values", []) if isinstance(v, dict))
             text = f"Enum: {ename}\nBrief: {e.get('brief', '')}\nValues: {vals_text}"
             sandbox.vectors.add_chunks([Chunk(
-                text=text,
-                source_file=filename,
+                text=text, source_file=filename,
                 metadata={"source_file": filename, "node_type": "Enum",
                           "node_id": node_id, "module": mod},
             )])
 
-            # Values → EnumValue nodes + HAS_VALUE edges
             for v in e.get("values", []):
                 if not isinstance(v, dict):
                     continue
@@ -1504,6 +1623,7 @@ class SandboxAdapter:
                 v_props = {
                     "name": vname,
                     "id": vid,
+                    "label": vname,
                     "value": v.get("value", ""),
                     "description": v.get("description", ""),
                     "module": mod,
@@ -1513,7 +1633,7 @@ class SandboxAdapter:
                 sandbox.graph.add_relationship(
                     node_id, v_node_id, "HAS_VALUE", {"_origin": "sandbox"})
 
-        # Typedefs
+        # ── Typedefs ──────────────────────────────────────────────────────
         for td in parsed.get("typedefs", []):
             if not isinstance(td, dict):
                 continue
@@ -1522,10 +1642,13 @@ class SandboxAdapter:
                 continue
             node_type = "Typedef"
             node_id = EphemeralGraph._canonical_id(node_type, {"name": tname, "module": mod})
+            typedef_node_ids[tname] = node_id
             props = {
                 "name": tname,
                 "id": f"TYPEDEF_{tname}",
+                "label": tname,
                 "brief": td.get("brief", ""),
+                "purpose": "",   # LLM-only
                 "underlying_type": td.get("type", ""),
                 "source": "SWA_Typedefs",
                 "module": mod,
@@ -1533,16 +1656,29 @@ class SandboxAdapter:
             }
             self._add_node_with_shadow(sandbox, node_type, node_id, props)
             node_names.append(tname)
-            # Semantic chunk — enables search_database to find typedefs
-            text = f"Typedef: {tname}\nUnderlying type: {td.get('type', '')}\nBrief: {td.get('brief', '')}"
+            text = (f"Typedef: {tname}\nUnderlying type: {td.get('type', '')}"
+                    f"\nBrief: {td.get('brief', '')}")
             sandbox.vectors.add_chunks([Chunk(
-                text=text,
-                source_file=filename,
+                text=text, source_file=filename,
                 metadata={"source_file": filename, "node_type": "Typedef",
                           "node_id": node_id, "module": mod},
             )])
 
-        # Macros — add KG node (for Cypher MATCH) + vector chunk (for search_database)
+            # PrimitiveType node + ALIASES edge
+            utype_clean = _clean_type(td.get("type", ""))
+            if utype_clean.lower() in {p.lower() for p in _PRIMITIVE_TYPES}:
+                pt_id = f"PRIMITIVE_{utype_clean}"
+                pt_node_id = EphemeralGraph._canonical_id(
+                    "PrimitiveType", {"name": pt_id, "module": mod})
+                if sandbox.graph.get_node(pt_node_id) is None:
+                    sandbox.graph.add_node("PrimitiveType", pt_node_id, {
+                        "id": pt_id, "name": utype_clean,
+                        "label": utype_clean, "module": mod,
+                    })
+                sandbox.graph.add_relationship(
+                    node_id, pt_node_id, "ALIASES", {"_origin": "sandbox"})
+
+        # ── Macros ────────────────────────────────────────────────────────
         for macro in parsed.get("macros", []):
             if not isinstance(macro, dict):
                 continue
@@ -1554,21 +1690,58 @@ class SandboxAdapter:
             props = {
                 "name": mname,
                 "id": f"MACRO_{mname}",
+                "label": mname,
                 "value": macro.get("value", ""),
                 "description": macro.get("description", ""),
+                "purpose": "",   # LLM-only
                 "source": "SWA_Macros",
                 "module": mod,
                 "source_file": filename,
             }
             self._add_node_with_shadow(sandbox, node_type, node_id, props)
             node_names.append(mname)
-            text = f"Macro: {mname}\nValue: {macro.get('value', '')}\nDescription: {macro.get('description', '')}"
+            text = (f"Macro: {mname}\nValue: {macro.get('value', '')}"
+                    f"\nDescription: {macro.get('description', '')}")
             sandbox.vectors.add_chunks([Chunk(
-                text=text,
-                source_file=filename,
+                text=text, source_file=filename,
                 metadata={"source_file": filename, "node_type": "Macro",
                           "node_id": node_id, "module": mod},
             )])
+
+        # ── Pass 2: Derived relationships (type resolution) ───────────────
+        struct_names  = set(struct_node_ids)
+        typedef_names = set(typedef_node_ids)
+        enum_names    = set(enum_node_ids)
+
+        # OF_TYPE: Parameter → Struct / Typedef / Enum
+        # USED_BY: Struct → Function (derived from param→struct OF_TYPE)
+        for p_node_id, ptype_raw, func_node_id in param_info:
+            clean = _clean_type(ptype_raw)
+            if clean in struct_names:
+                tgt = struct_node_ids[clean]
+                sandbox.graph.add_relationship(
+                    p_node_id, tgt, "OF_TYPE", {"_origin": "sandbox"})
+                sandbox.graph.add_relationship(
+                    tgt, func_node_id, "USED_BY",
+                    {"_origin": "sandbox", "usage_context": "Parameter"})
+            elif clean in typedef_names:
+                sandbox.graph.add_relationship(
+                    p_node_id, typedef_node_ids[clean], "OF_TYPE", {"_origin": "sandbox"})
+            elif clean in enum_names:
+                sandbox.graph.add_relationship(
+                    p_node_id, enum_node_ids[clean], "OF_TYPE", {"_origin": "sandbox"})
+
+        # OF_TYPE: StructMember → Typedef
+        # USED_IN: Typedef → Struct (derived from member→typedef OF_TYPE)
+        for m_node_id, mtype_raw, struct_node_id in member_info:
+            clean = _clean_type(mtype_raw)
+            if clean in typedef_names:
+                tgt = typedef_node_ids[clean]
+                sandbox.graph.add_relationship(
+                    m_node_id, tgt, "OF_TYPE", {"_origin": "sandbox"})
+                sandbox.graph.add_relationship(
+                    tgt, struct_node_id, "USED_IN",
+                    {"_origin": "sandbox", "member_name": ""})
 
         return node_names
 
@@ -1637,6 +1810,7 @@ class SandboxAdapter:
                     "bit_range": bf.get("bit_range", ""),
                     "bits": bf.get("bit_range", "") or bf.get("bits", ""),
                     "width": bf.get("width", ""),
+                    "reset_value": bf.get("reset_value", ""),
                     "description": bf.get("description", ""),
                     "sfr_source_file": filename,
                     "source_file": filename,
@@ -1720,17 +1894,22 @@ class SandboxAdapter:
             node_type = "Requirement"
             node_id = EphemeralGraph._canonical_id(
                 node_type, {"name": req_id, "module": mod})
+            req_desc = req.get("description", "")
             props = {
                 "requirement_id": req_id,
                 "name": req.get("name", req_id),
+                "description": req_desc,
                 "module": mod,
                 "status": req.get("status", ""),
                 "source_file": filename,
             }
             self._add_node_with_shadow(sandbox, node_type, node_id, props)
             node_names.append(req_id)
-            # Semantic chunk
-            text = f"Requirement: {req_id}\nName: {req.get('name', '')}"
+            # Semantic chunk — include description when available (M1)
+            text = (
+                f"Requirement: {req_id}\nName: {req.get('name', '')}"
+                + (f"\nDescription: {req_desc[:300]}" if req_desc else "")
+            )
             sandbox.vectors.add_chunks([Chunk(
                 text=text,
                 source_file=filename,

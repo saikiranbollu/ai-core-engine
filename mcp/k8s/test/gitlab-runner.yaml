@@ -1,0 +1,113 @@
+# GitLab Runner for AI Core Engine CI/CD
+# ========================================
+# Deploys a GitLab Runner in mcswai namespace that registers
+# against the ai-core-engine project and uses Kubernetes executor.
+#
+# Apply:  oc apply -f mcp/k8s/test/gitlab-runner.yaml -n mcswai
+# ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gitlab-runner-config
+  namespace: mcswai
+  labels:
+    app: gitlab-runner
+data:
+  config.toml: |
+    concurrent = 2
+    check_interval = 10
+
+    [[runners]]
+      name = "aice-openshift-runner"
+      url = "https://gitlab.intra.infineon.com/"
+      token = "__RUNNER_TOKEN__"
+      executor = "kubernetes"
+      environment = ["GIT_SSL_NO_VERIFY=1", "HOME=/tmp"]
+      [runners.kubernetes]
+        namespace = "mcswai"
+        service_account = "gitlab-ci"
+        image = "dockerregistry-v2.vih.infineon.com/alpine:latest"
+        helper_image = "dockerregistry-v2.vih.infineon.com/gitlab/gitlab-runner-helper:x86_64-v19.1.0"
+        image_pull_secrets = ["gitlab-ci-dockercfg-bw9qc"]
+        privileged = false
+        pull_policy = ["if-not-present"]
+        dns_policy = "ClusterFirst"
+        # Allow CI jobs to raise their own pod resources via KUBERNETES_*_LIMIT
+        # / KUBERNETES_*_REQUEST variables (up to these maxima). Without these,
+        # the defaults below are HARD caps and job variables are silently ignored
+        # — which caused OOMKilled (137) on memory-heavy unit tests (PyTorch +
+        # sentence-transformers need ~3-4Gi).
+        memory_request_overwrite_max_allowed = "6Gi"
+        memory_limit_overwrite_max_allowed = "8Gi"
+        cpu_request_overwrite_max_allowed = "2"
+        cpu_limit_overwrite_max_allowed = "4"
+        [runners.kubernetes.pod_labels]
+          "app" = "gitlab-runner-job"
+        [runners.kubernetes.resources]
+          [runners.kubernetes.resources.requests]
+            cpu = "250m"
+            memory = "512Mi"
+          [runners.kubernetes.resources.limits]
+            cpu = "1"
+            memory = "2Gi"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitlab-runner-secret
+  namespace: mcswai
+  labels:
+    app: gitlab-runner
+type: Opaque
+stringData:
+  runner-registration-token: "REPLACE_WITH_RUNNER_TOKEN"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitlab-runner
+  namespace: mcswai
+  labels:
+    app: gitlab-runner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitlab-runner
+  template:
+    metadata:
+      labels:
+        app: gitlab-runner
+    spec:
+      containers:
+        - name: gitlab-runner
+          image: dockerregistry-v2.vih.infineon.com/gitlab/gitlab-runner:alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              mkdir -p /tmp/builds
+              cp /configmap/config.toml /tmp/config.toml
+              sed -i "s|__RUNNER_TOKEN__|$RUNNER_TOKEN|g" /tmp/config.toml
+              exec gitlab-runner run --working-directory /tmp/builds --config /tmp/config.toml
+          env:
+            - name: RUNNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gitlab-runner-secret
+                  key: runner-registration-token
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: config
+              mountPath: /configmap
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: gitlab-runner-config

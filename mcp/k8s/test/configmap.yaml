@@ -7,7 +7,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: test-aice-storage-config
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: aice-mcp-server
     env: test
@@ -110,7 +110,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: test-aice-api-keys
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: aice-mcp-server
     env: test

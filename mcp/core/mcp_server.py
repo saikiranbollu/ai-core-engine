@@ -255,7 +255,7 @@ def _err_from_exc(exc: BaseException, component: str) -> str:
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or "timeout" in name or "timed out" in text:
         return _err("INTERNAL_TIMEOUT", f"{component} operation timed out", _raw_exception=exc)
     if isinstance(exc, (FileNotFoundError, ValueError, KeyError, TypeError)):
-        return _err("INVALID_INPUT", str(exc), _raw_exception=exc)
+        return _err("INVALID_INPUT", f"{component}: invalid input", _raw_exception=exc)
     if (
         any(kw in name for kw in (
             "serviceunavailable", "connection", "connect", "refused",
@@ -266,8 +266,25 @@ def _err_from_exc(exc: BaseException, component: str) -> str:
         # Detail is logged above but kept out of the envelope (infra hygiene).
         return _err("BACKEND_UNAVAILABLE", f"{component} backend unavailable", _raw_exception=exc)
     if any(kw in name for kw in ("permission", "forbidden", "unauthorized")):
-        return _err("PERMISSION_DENIED", str(exc), _raw_exception=exc)
+        return _err("PERMISSION_DENIED", f"{component}: permission denied", _raw_exception=exc)
     return _err("INTERNAL_ERROR", str(exc), _raw_exception=exc)
+
+
+def _reject_bad_session_id(session_id: str) -> Optional[str]:
+    """Return an INVALID_INPUT envelope if *session_id* is unsafe, else ``None``.
+
+    Defense-in-depth for F-CB-09: ``session_id`` flows into in-memory/Redis keys
+    at every session-consuming tool and into filesystem paths in ``session_end``
+    and ``sandbox_upload``. Rejecting unsafe ids at the boundary of all such
+    tools keeps validation consistent and blocks oversized/odd identifiers
+    (key/log injection) even where the value is only used as a dict key today.
+    """
+    from src._common.path_safety import validate_session_id
+    try:
+        validate_session_id(session_id)
+        return None
+    except ValueError:
+        return _err("INVALID_INPUT", "Invalid session_id format.")
 
 
 # ── Metrics helpers (Tickets 7 & 8) ──────────────────────────────────────
@@ -363,15 +380,18 @@ def _resolve_da_name(api_key: str) -> str:
 
 
 def _resolve_da_tier(api_key: str, workspace_id: str = "illd") -> str:
-    """Look up the caller's role tier for *workspace_id* (metric labelling, F-P5-M01)."""
+    """Look up the caller's highest role tier for *workspace_id* (metric labelling, F-P5-M01)."""
     from .auth_middleware import load_api_keys
+    _ROLE_PRIORITY = {"admin": 3, "developer": 2, "public": 1}
     registry = load_api_keys()
     entry = registry.get(api_key)
     if not entry:
         return "unknown"
     roles = entry.get("roles", {}) or {}
     ws_roles = roles.get(workspace_id) or roles.get("*") or []
-    return ws_roles[0] if ws_roles else "unknown"
+    if not ws_roles:
+        return "unknown"
+    return max(ws_roles, key=lambda r: _ROLE_PRIORITY.get(r, 0))
 
 
 def _default_workspace_for_key(api_key: str) -> str:
@@ -438,8 +458,8 @@ def _emit_first_result_latency(session_id: Optional[str], signals: Any) -> None:
             DA_FIRST_RESULT_LATENCY.labels(
                 da_name=_current_da_name.get("unknown"), task_type=str(tt or "adhoc"),
             ).observe(max(0.0, time.time() - float(started_at)))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_emit_first_result_latency failed: %s", exc)
 
 
 def _authorize(tool_name: str, **kw) -> Optional[str]:
@@ -2851,6 +2871,9 @@ async def session_store(session_id: str, key: str, value: Any) -> str:
     denied = _authorize("session_store", session_id=session_id)
     if denied:
         return denied
+    bad = _reject_bad_session_id(session_id)
+    if bad:
+        return bad
     try:
         mgr = _get_session_manager()
         if not mgr:
@@ -2879,6 +2902,9 @@ async def session_retrieve(session_id: str, key: str) -> str:
     denied = _authorize("session_retrieve", session_id=session_id)
     if denied:
         return denied
+    bad = _reject_bad_session_id(session_id)
+    if bad:
+        return bad
     try:
         mgr = _get_session_manager()
         if not mgr:
@@ -2921,6 +2947,9 @@ async def build_context(
     denied = _authorize("build_context", session_id=session_id)
     if denied:
         return denied
+    bad = _reject_bad_session_id(session_id)
+    if bad:
+        return bad
     try:
         builder = _get_context_builder(max_tokens=max_tokens, budget_unit=budget_unit)
         if not builder:
@@ -3078,7 +3107,7 @@ async def sandbox_upload(
     # anything that is not a safe path component before touching the filesystem.
     from src._common.path_safety import validate_session_id
     try:
-        validate_session_id(session_id)
+        safe_sid = validate_session_id(session_id)
     except ValueError:
         return _err("INVALID_INPUT", "Invalid session_id format.")
     try:
@@ -3117,7 +3146,7 @@ async def sandbox_upload(
             workspace_id=workspace_id,
         )
         adapter = SandboxAdapter(workspace_id=workspace_id)
-        tmp_dir = Path(f"/tmp/sandbox_{session_id}")
+        tmp_dir = Path(f"/tmp/sandbox_{safe_sid}")
 
         try:
             tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -3685,6 +3714,9 @@ async def sandbox_status(session_id: str) -> str:
     denied = _authorize("sandbox_status")
     if denied:
         return denied
+    bad = _reject_bad_session_id(session_id)
+    if bad:
+        return bad
     try:
         sm = _get_sandbox_manager()
         if not sm:
@@ -3709,6 +3741,9 @@ async def sandbox_clear(session_id: str) -> str:
     denied = _authorize("sandbox_clear")
     if denied:
         return denied
+    bad = _reject_bad_session_id(session_id)
+    if bad:
+        return bad
     try:
         sm = _get_sandbox_manager()
         if not sm:
@@ -3740,6 +3775,9 @@ async def sandbox_diff(session_id: str) -> str:
     denied = _authorize("sandbox_diff")
     if denied:
         return denied
+    bad = _reject_bad_session_id(session_id)
+    if bad:
+        return bad
     try:
         sm = _get_sandbox_manager()
         if not sm:

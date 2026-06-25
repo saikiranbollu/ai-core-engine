@@ -7,7 +7,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: test-aice-mcp-server
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: aice-mcp-server
     env: test
@@ -27,7 +27,10 @@ spec:
     spec:
       containers:
         - name: aice-mcp
-          image: image-registry.openshift-image-registry.svc:5000/mcswai/aice-mcp:latest
+          # Image built in mcswai namespace from the MR branch's Dockerfile.
+          # Tag is set dynamically by CI; defaults to 'latest' for manual deploys.
+          image: image-registry.openshift-image-registry.svc:5000/mcswai/test-aice-mcp:latest
+          imagePullPolicy: Always
           # Uses Dockerfile CMD: python aice_mcp/app.py
           ports:
             - name: mcp-http
@@ -127,11 +130,11 @@ spec:
             periodSeconds: 10
           resources:
             requests:
-              cpu: "250m"
-              memory: "512Mi"
+              cpu: "500m"
+              memory: "1536Mi"
             limits:
-              cpu: "1000m"
-              memory: "1Gi"
+              cpu: "2"
+              memory: "4Gi"
       volumes:
         - name: storage-config
           configMap:
@@ -145,7 +148,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: test-mcp
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: aice-mcp-server
     env: test

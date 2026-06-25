@@ -144,6 +144,13 @@ class TestPerDAMetrics:
         for name in _DA_METRICS:
             assert name in src, f"metric {name} not defined"
 
+    def test_metric_count_23(self):
+        """Sprint 27 should define exactly 23 Prometheus metrics (17 base + 6 DA)."""
+        src = _METRICS.read_text(encoding="utf-8")
+        metric_defs = re.findall(r'"(aice_[a-z_]+)"', src)
+        unique = set(metric_defs)
+        assert len(unique) == 23, f"Expected 23 metric definitions, found {len(unique)}: {sorted(unique)}"
+
     def test_tool_metric_has_tier_label(self):
         src = _METRICS.read_text(encoding="utf-8")
         block = src.split("aice_tool_requests_total", 1)[1].split(")", 1)[0]
@@ -175,7 +182,7 @@ class TestPerDAMetrics:
             if p not in sys.path:
                 sys.path.insert(0, p)
         from mcp.core.mcp_server import _resolve_da_tier
-        assert _resolve_da_tier("key-eda-001", "illd") == "public"
+        assert _resolve_da_tier("key-eda-001", "illd") == "developer"
         assert _resolve_da_tier("key-triplea-001", "mcal") == "developer"
         assert _resolve_da_tier("nope", "mcal") == "unknown"
 

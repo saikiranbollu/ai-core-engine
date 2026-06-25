@@ -12,11 +12,8 @@ Validates that:
 import pytest
 from unittest.mock import MagicMock
 from pathlib import Path
-import sys
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
-
-from MemoryLayer.memory.ephemeral_sandbox import HybridGraphService, EphemeralGraph
+from src.MemoryLayer.memory.ephemeral_sandbox import HybridGraphService, EphemeralGraph
 
 
 class TestShallowQueryRouting:
@@ -112,12 +109,15 @@ class TestDeepQueryRouting:
             {"node_id": "prod_a", "name": "ProdFunc", "_origin": "production"}
         ]
         
-        # Create sandbox with additional node
+        # Create sandbox with additional node — must include _node_type and module
+        # for _sandbox_node_matches_query to accept it
         mock_sandbox = MagicMock()
         sandbox_nodes = {
             "sandbox_node_1": {
                 "node_id": "sandbox_node_1",
                 "name": "SandboxOnlyFunc",
+                "module": "Adc",
+                "_node_type": "SRC_Function",
                 "_origin": "sandbox"
             }
         }
@@ -127,12 +127,51 @@ class TestDeepQueryRouting:
         hybrid = HybridGraphService(sandbox=mock_sandbox, neo4j_driver=mock_driver)
         
         # Simulate deep_query logic
-        result = hybrid.deep_query("MATCH (n) RETURN n", {})
+        result = hybrid.deep_query(
+            "MATCH (n:SRC_Function) WHERE n.module = $mod RETURN n",
+            {"mod": "Adc"},
+        )
         
         # Should include both prod and sandbox-only nodes
         injected = [r for r in result if r.get("_injected") is True]
         assert injected
         assert injected[0].get("name") == "SandboxOnlyFunc"
+
+    def test_deep_query_injects_only_nodes_matching_query_shape(self):
+        """Sandbox-only injection should respect Cypher label/module shape."""
+
+        mock_driver = MagicMock()
+        mock_session = MagicMock()
+        mock_driver.session.return_value.__enter__.return_value = mock_session
+        mock_session.run.return_value.data.return_value = []
+
+        mock_sandbox = MagicMock()
+        mock_sandbox.graph.get_nodes_by_origin.return_value = [
+            ("Macro:IFX_ADC_MAX_CH:ADC", {
+                "name": "IFX_ADC_MAX_CH",
+                "module": "ADC",
+                "_node_type": "Macro",
+                "_origin": "sandbox",
+            }),
+            ("Function:IfxAdc_init:ADC", {
+                "name": "IfxAdc_init",
+                "module": "ADC",
+                "_node_type": "Function",
+                "_origin": "sandbox",
+            }),
+        ]
+        mock_sandbox.graph.get_node.return_value = None
+
+        hybrid = HybridGraphService(sandbox=mock_sandbox, neo4j_driver=mock_driver)
+        result = hybrid.deep_query(
+            "MATCH (m:Macro) WHERE m.module = $mod RETURN m",
+            {"mod": "ADC"},
+            workspace_id="illd",
+        )
+
+        injected = [r for r in result if r.get("_injected") is True]
+        assert len(injected) == 1
+        assert injected[0]["name"] == "IFX_ADC_MAX_CH"
 
 
 class TestToolClassification:

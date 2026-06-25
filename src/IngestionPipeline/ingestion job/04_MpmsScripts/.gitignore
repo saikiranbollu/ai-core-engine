@@ -1,0 +1,35 @@
+# Comment this if you are on master branch
+Results
+
+# Global Ignore patterns
+*.bak
+*.orig
+.idea
+
+# Bifaces
+*9_Make*
+*2_Out*
+
+# Eclipse / Tresos
+*RemoteSystemsTempFiles*
+.metadata
+*.~lock
+
+# Buildspace
+BuildSpace
+tmpFlashBatchFile2G.mtb
+CfgMcal
+
+#Python
+*.pyc
+!einblick_usrdata.pyc
+__pycache__
+
+
+# Generated Backup
+./bak
+
+# Python package build output
+/build/
+/dist/
+*.egg-info/

@@ -1,0 +1,130 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-ingestion
+  namespace: ai-core-engine
+  labels:
+    app: aice-pipeline
+    environment: test
+spec:
+  schedule: "0 0 * * *"              # Every day at midnight UTC
+  timeZone: "Europe/Berlin"          # Midnight CET/CEST
+  concurrencyPolicy: Forbid          # Never overlap runs
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600       # If missed by >10min, skip
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 43200   # 12h hard timeout
+      backoffLimit: 0                # No retries (pipeline handles partial failures)
+      template:
+        metadata:
+          labels:
+            app: aice-pipeline
+            job: nightly-ingestion
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: pipeline
+              image: image-registry.openshift-image-registry.svc:5000/ai-core-engine/aice-build:latest
+              command: ["/bin/bash", "/scripts/run_nightly.sh"]
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "2Gi"
+                limits:
+                  cpu: "1"
+                  memory: "4Gi"
+              env:
+                # Python path (matches Dockerfile + workspace layout)
+                - name: PYTHONPATH
+                  value: "/app:/app/src:/app/src/HybridRAG/code"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                # HuggingFace offline (model already baked into image)
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: TRANSFORMERS_OFFLINE
+                  value: "1"
+                # Neo4j (in-cluster direct connection — no TLS passthrough needed)
+                - name: NEO4J_URI
+                  value: "bolt://test-neo4j:7687"
+                - name: NEO4J_USERNAME
+                  value: "neo4j"
+                - name: NEO4J_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: test-aice-db-secrets
+                      key: neo4j-password
+                # Qdrant (in-cluster)
+                - name: QDRANT_URL
+                  value: "http://test-qdrant:6333"
+                - name: QDRANT_API_KEY
+                  value: ""
+                # Jama API credentials
+                - name: JAMA_BASE_URL
+                  value: "https://rqmprod.intra.infineon.com"
+                - name: JAMA_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: test-aice-external-secrets
+                      key: jama-api-key
+                - name: JAMA_API_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: test-aice-external-secrets
+                      key: jama-api-secret
+                # IFX credentials (for Bitbucket git clone)
+                - name: IFX_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: test-aice-external-secrets
+                      key: ifx-username
+                - name: IFX_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: test-aice-external-secrets
+                      key: ifx-password
+                # Git config for Bitbucket HTTPS auth
+                - name: GIT_ASKPASS
+                  value: "/scripts/git_askpass.sh"
+                # SSL: Use OpenShift-injected CA bundle (includes Infineon internal CA)
+                - name: SSL_CERT_FILE
+                  value: "/etc/pki/tls/certs/ca-bundle.crt"
+                - name: REQUESTS_CA_BUNDLE
+                  value: "/etc/pki/tls/certs/ca-bundle.crt"
+              volumeMounts:
+                - name: workspace
+                  mountPath: /app/temp
+                  subPath: app_temp
+                - name: workspace
+                  mountPath: /app/src/HybridRAG/temp
+                  subPath: hybridrag_temp
+                - name: workspace
+                  mountPath: /app/src/HybridRAG/jama-req
+                  subPath: jama-req
+                - name: workspace
+                  mountPath: /app/src/HybridRAG/testspec
+                  subPath: testspec
+                - name: workspace
+                  mountPath: /workspace/logs
+                  subPath: logs
+                - name: scripts
+                  mountPath: /scripts
+                - name: trusted-ca
+                  mountPath: /etc/pki/tls/certs
+                  readOnly: true
+          volumes:
+            - name: workspace
+              persistentVolumeClaim:
+                claimName: pipeline-workspace
+            - name: scripts
+              configMap:
+                name: pipeline-runner-script
+                defaultMode: 0755
+            - name: trusted-ca
+              configMap:
+                name: config-trusted-cabundle
+                items:
+                  - key: ca-bundle.crt
+                    path: ca-bundle.crt

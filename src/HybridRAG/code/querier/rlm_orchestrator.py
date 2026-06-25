@@ -54,12 +54,36 @@ _LLM_UNAVAILABLE_SENTINEL = "[LLM unavailable]"
 # Tokens reserved for the synthesis response, and per-model context windows.
 _SYNTH_RESPONSE_TOKENS = 8000
 _DEFAULT_MODEL_CONTEXT_TOKENS = 32000
-_MODEL_CONTEXT_TOKENS = {
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
-    "gpt-4": 128000,
-    "gpt-5.2": 128000,
-}
+
+
+def _load_model_context_tokens() -> Dict[str, int]:
+    """Per-model context windows, overridable via ``RLM_MODEL_CONTEXT_TOKENS``.
+
+    The env var, when set, is a JSON object mapping model name -> context-window
+    token count; entries merge over (and extend) the built-in defaults so a new
+    model release needs no code change (F5 follow-up to F-CC-R04). A malformed
+    override is ignored with a warning so it can never break planning.
+    """
+    base: Dict[str, int] = {
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+        "gpt-4": 128000,
+        "gpt-5.2": 128000,
+    }
+    raw = os.environ.get("RLM_MODEL_CONTEXT_TOKENS", "").strip()
+    if raw:
+        try:
+            override = json.loads(raw)
+            if not isinstance(override, dict):
+                raise ValueError("expected a JSON object")
+            for name, tokens in override.items():
+                base[str(name)] = int(tokens)
+        except (ValueError, TypeError) as exc:
+            logger.warning("Ignoring invalid RLM_MODEL_CONTEXT_TOKENS: %s", exc)
+    return base
+
+
+_MODEL_CONTEXT_TOKENS = _load_model_context_tokens()
 
 # ── Config-driven default alpha (MEG_SW-308) ─────────────────────────
 _DEFAULT_ALPHA: Optional[float] = None

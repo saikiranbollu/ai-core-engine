@@ -8,7 +8,7 @@ import pytest
 # Adjust sys.path so the parser package is importable
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "IngestionPipeline", "Parsers"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "IngestionPipeline", "parsers"))
 
 from auto_stub_generator import AutoStubGenerator, COMMON_HEADERS
 

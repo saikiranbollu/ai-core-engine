@@ -7,7 +7,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: test-init-postgres
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     app: aice-mcp-server
     env: test
@@ -24,7 +24,8 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: init-postgres
-          image: image-registry.openshift-image-registry.svc:5000/mcswai/aice-mcp:latest
+          image: image-registry.openshift-image-registry.svc:5000/mcswai/test-aice-mcp:latest
+          imagePullPolicy: Always
           command:
             - python
             - "-m"

@@ -2,13 +2,13 @@
 # ===========================================
 # Ensures test pods (env=test) can only communicate with each other
 # and with external services (GPT4IFX, Jama). Production pods in the
-# same mcswai namespace cannot reach test databases and vice versa.
+# same ai-core-engine namespace cannot reach test databases and vice versa.
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: test-isolation
-  namespace: mcswai
+  namespace: ai-core-engine
   labels:
     env: test
 spec:

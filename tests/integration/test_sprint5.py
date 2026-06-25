@@ -43,9 +43,14 @@ class TestComplexityRouting:
         assert should_use_rlm("What does Adc_Init do?") is False
 
     def test_multiple_functions_triggers(self):
-        """3+ function names should trigger RLM (signal 1)."""
-        query = "Compare IfxCan_Can_initModule, IfxCan_Can_sendMessage, and IfxCan_Can_receiveMessage"
+        """3+ function names + register keyword should trigger RLM (2 signals)."""
+        query = "Compare IfxCan_Can_initModule, IfxCan_Can_sendMessage, and IfxCan_Can_receiveMessage register setup"
         assert should_use_rlm(query) is True
+
+    def test_functions_alone_not_enough(self):
+        """3+ function names alone is only 1 signal — not enough for RLM."""
+        query = "Compare IfxCan_Can_initModule, IfxCan_Can_sendMessage, and IfxCan_Can_receiveMessage"
+        assert should_use_rlm(query) is False
 
     def test_register_keywords_trigger(self):
         """Register-level keywords contribute a signal."""
@@ -133,7 +138,7 @@ class TestRLMOrchestratorMocked:
     def test_preview_returns_plan(self):
         rlm = RLMOrchestrator(module="ADC", profile="illd",
                               search_fn=self._mock_search, llm_fn=self._mock_llm)
-        result = rlm.preview("Generate ADC init code", task_type="code_generation")
+        result = rlm.plan_preview("Generate ADC init code", task_type="code_generation")
         assert "plan" in result
         assert "step_count" in result
         assert result["step_count"] >= 1
@@ -171,16 +176,16 @@ class TestRLMAndSandboxToolTiers:
     def test_rlm_tools_developer_tier(self):
         from mcp.core.tool_tiers import TOOL_TIERS
         assert TOOL_TIERS.get("rlm_orchestrate") == "developer"
-        assert TOOL_TIERS.get("rlm_plan_preview") == "developer"
+        assert TOOL_TIERS.get("rlm_plan_preview") == "public"
 
     def test_sandbox_tools_exist(self):
         from mcp.core.tool_tiers import TOOL_TIERS
-        sandbox_tools = ["sandbox_upload", "sandbox_query", "sandbox_status", "sandbox_clear"]
+        sandbox_tools = ["sandbox_upload", "sandbox_status", "sandbox_clear", "sandbox_diff"]
         for tool in sandbox_tools:
             assert tool in TOOL_TIERS, f"Sandbox tool {tool} not in TOOL_TIERS"
 
     def test_sandbox_tools_public_tier(self):
         from mcp.core.tool_tiers import TOOL_TIERS
-        sandbox_tools = ["sandbox_upload", "sandbox_query", "sandbox_status", "sandbox_clear"]
+        sandbox_tools = ["sandbox_upload", "sandbox_status", "sandbox_clear", "sandbox_diff"]
         for tool in sandbox_tools:
             assert TOOL_TIERS[tool] == "public", f"Sandbox tool {tool} should be public"

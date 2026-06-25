@@ -31,8 +31,8 @@ class TestToolInventory:
     """Verify all 56 tools are registered with correct tiers."""
 
     def test_total_tool_count(self):
-        """50 PPTX base + 4 Sandbox + 2 RLM = 56 tools."""
-        assert len(TOOL_TIERS) == 56, f"Expected 56 tools, got {len(TOOL_TIERS)}"
+        """55 tools after Plan 2 Phase 2 cleanup."""
+        assert len(TOOL_TIERS) == 55, f"Expected 55 tools, got {len(TOOL_TIERS)}"
 
     def test_public_tool_count(self):
         public = [t for t, tier in TOOL_TIERS.items() if tier == "public"]
@@ -40,11 +40,11 @@ class TestToolInventory:
 
     def test_developer_tool_count(self):
         dev = [t for t, tier in TOOL_TIERS.items() if tier == "developer"]
-        assert len(dev) == 14, f"Expected 14 Developer tools, got {len(dev)}"
+        assert len(dev) == 16, f"Expected 16 Developer tools, got {len(dev)}"
 
     def test_admin_tool_count(self):
         admin = [t for t, tier in TOOL_TIERS.items() if tier == "admin"]
-        assert len(admin) == 8, f"Expected 8 Admin tools, got {len(admin)}"
+        assert len(admin) == 5, f"Expected 5 Admin tools, got {len(admin)}"
 
     def test_bug_fix_1_naming(self):
         """Bug Fix #1: search_database (singular), not search_databases."""
@@ -52,7 +52,7 @@ class TestToolInventory:
         assert "search_databases" not in TOOL_TIERS
 
     def test_all_categories_represented(self):
-        """All 13 categories + Sandbox + RLM should have tools."""
+        """All categories should have tools."""
         expected_tools = {
             # Cat 1
             "search_database", "search_nodes", "get_node_by_id",
@@ -64,18 +64,18 @@ class TestToolInventory:
             # Cat 4
             "find_requirement_traces", "build_traceability_matrix",
             "find_coverage_gaps", "analyze_hw_sw_links",
-            # Cat 5
-            "ingest_file", "ingest_module_from_repo",
-            "batch_ingest_modules", "ingest_repository",
             # Cat 6
             "session_start", "session_store", "session_retrieve",
             "build_context", "session_end",
             # Cat 6+ Sandbox
-            "sandbox_upload", "sandbox_query", "sandbox_status", "sandbox_clear",
+            "sandbox_upload", "sandbox_status", "sandbox_clear", "sandbox_diff",
             # Cat 6+ RLM
             "rlm_orchestrate", "rlm_plan_preview",
+            # Cat 6+ HSI
+            "get_function_hsi",
             # Cat 7
             "cache_get", "cache_stats", "cache_invalidate_module", "cache_clear",
+            "cache_refresh_config",
             # Cat 8
             "submit_human_feedback", "get_learning_metrics",
             "get_failure_patterns", "process_results",
@@ -92,6 +92,8 @@ class TestToolInventory:
             "visualize_subgraph",
             # Cat 13
             "get_token_info", "ensure_valid_token",
+            # Cat 14: GAP v2
+            "query_enhance",
         }
         actual = set(TOOL_TIERS.keys())
         missing = expected_tools - actual
@@ -121,7 +123,7 @@ class TestAuthorization:
 
     def test_admin_tool_denied_with_public_key(self):
         """Admin tools denied for public-tier keys."""
-        allowed, msg = check_authorization("key-gest-001", "ingest_file", "illd")
+        allowed, msg = check_authorization("key-gest-001", "cache_clear", "illd")
         assert allowed is False
         assert "insufficient" in msg.lower()
 

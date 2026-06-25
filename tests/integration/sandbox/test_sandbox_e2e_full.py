@@ -419,7 +419,7 @@ class FakeQdrantClient:
 #  Core Test Logic -- runs for ONE module
 # =========================================================================
 
-def test_module(mod_name: str, mod: Dict, tmp_dir: Path,
+def _run_module_test(mod_name: str, mod: Dict, tmp_dir: Path,
                 embedder, use_gitlab: bool) -> List[str]:
     """
     Run the full end-to-end test for one module.
@@ -739,7 +739,7 @@ def main():
         print(f"  Keep production: {[f for f in mod['src']+mod['inc']+mod['swa']+mod['sfr'] if f not in [mod['swa'][0], mod['src'][0]]]}")
         print("=" * 72)
 
-        failures = test_module(mod_name, mod, tmp_root, embedder, use_gitlab)
+        failures = _run_module_test(mod_name, mod, tmp_root, embedder, use_gitlab)
         all_failures.extend(failures)
         module_results[mod_name] = failures
 

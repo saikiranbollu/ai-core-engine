@@ -16,8 +16,14 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
+from dotenv import load_dotenv
+
+# Load credentials from env/.env if available
+_ENV_PATH = Path(__file__).resolve().parents[3] / "env" / ".env"
+load_dotenv(_ENV_PATH)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src"))
 

@@ -1,0 +1,57 @@
+# AICE Test Environment — BuildConfig (lives in mcswai namespace)
+# ================================================================
+# Builds the MCP server image from any branch and tags it in the
+# test-aice-mcp ImageStream. The tag is the sanitized branch name.
+#
+# This resource must be applied to the mcswai namespace:
+#   oc apply -f mcp/k8s/test/buildconfig.yaml -n mcswai
+#
+# To trigger a build for a specific branch:
+#   oc start-build test-aice-mcp -n mcswai \
+#     --commit=<branch-or-sha> \
+#     -e BUILD_REF=<branch-slug>
+# ---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: test-aice-mcp
+  namespace: mcswai
+  labels:
+    app: aice-mcp
+    env: test
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: test-aice-mcp
+  namespace: mcswai
+  labels:
+    app: aice-mcp
+    env: test
+    app.kubernetes.io/part-of: AI-Core-Engine
+spec:
+  failedBuildsHistoryLimit: 3
+  successfulBuildsHistoryLimit: 3
+  runPolicy: SerialLatestOnly
+  source:
+    type: Git
+    git:
+      uri: git@gitlab.intra.infineon.com:ifx/atv/mc-sw-ai/ai-core-engine.git
+    sourceSecret:
+      name: hicp
+    contextDir: /
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+  output:
+    to:
+      kind: ImageStreamTag
+      name: test-aice-mcp:latest
+  resources:
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+    requests:
+      cpu: "1"
+      memory: "2Gi"

@@ -76,3 +76,22 @@ def reload_api_keys(path: str | Path | None = None) -> Dict[str, dict]:
     _api_key_registry = None
     _registry_mtime = 0.0
     return load_api_keys(path)
+
+
+def assert_auth_ready(path: str | Path | None = None) -> None:
+    """Refuse to start when auth is required but no API keys are configured.
+
+    F-CA-A07: when ``MCP_REQUIRE_AUTH`` is enabled (1/true/yes) the registry must
+    exist and contain at least one key, otherwise the server would silently
+    accept unauthenticated traffic. Raises ``RuntimeError`` in that case.
+    """
+    require = os.environ.get("MCP_REQUIRE_AUTH", "").strip().lower() in ("1", "true", "yes")
+    if not require:
+        return
+    registry = load_api_keys(path)
+    if not registry:
+        raise RuntimeError(
+            "MCP_REQUIRE_AUTH=1 but the API key registry is missing or empty; "
+            "refusing to start. Configure api_keys.yaml or unset MCP_REQUIRE_AUTH."
+        )
+    logger.info("Auth ready: %d API key(s) loaded (MCP_REQUIRE_AUTH set)", len(registry))

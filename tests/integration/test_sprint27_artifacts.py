@@ -145,11 +145,11 @@ class TestPerDAMetrics:
             assert name in src, f"metric {name} not defined"
 
     def test_metric_count_23(self):
-        """Sprint 27 should define exactly 23 Prometheus metrics (17 base + 6 DA)."""
+        """Sprint 27 base + DA metrics, plus F-CA-A04/F-CC-R01 security gauges."""
         src = _METRICS.read_text(encoding="utf-8")
         metric_defs = re.findall(r'"(aice_[a-z_]+)"', src)
         unique = set(metric_defs)
-        assert len(unique) == 23, f"Expected 23 metric definitions, found {len(unique)}: {sorted(unique)}"
+        assert len(unique) == 25, f"Expected 25 metric definitions, found {len(unique)}: {sorted(unique)}"
 
     def test_tool_metric_has_tier_label(self):
         src = _METRICS.read_text(encoding="utf-8")

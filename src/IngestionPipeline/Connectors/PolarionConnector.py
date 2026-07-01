@@ -34,12 +34,13 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import httpx
 
 from ..config import get_max_workers
 from src._common.path_safety import allowed_roots_from_env, safe_path_under
+from src._common.secret_str import SecretStr
 from src._common.tls_config import enforce_tls_policy
 
 
@@ -473,7 +474,7 @@ class PolarionConnector:
     def __init__(
         self,
         base_url: str,
-        token: str,
+        token: Union[str, Callable[[], str]],
         *,
         max_retries: int = _DEFAULT_MAX_RETRIES,
         backoff_factor: float = _DEFAULT_BACKOFF_FACTOR,
@@ -483,7 +484,15 @@ class PolarionConnector:
     ) -> None:
         verify_ssl = enforce_tls_policy(verify_ssl)
         self._base_url = base_url.rstrip("/")
-        self._token = token
+        # F-CF-P01: accept a token-provider callable so an expired JWT is
+        # refreshed on demand instead of captured once at construction.
+        # F-CF-X02: never store a plaintext token attribute; wrap in SecretStr.
+        if callable(token):
+            self._token_provider: Optional[Callable[[], str]] = token
+            self._token = SecretStr(None)
+        else:
+            self._token_provider = None
+            self._token = SecretStr(token)
         self._max_retries = max_retries
         self._backoff_factor = backoff_factor
         self._timeout = timeout
@@ -498,7 +507,7 @@ class PolarionConnector:
             timeout=timeout,
             headers={
                 "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {self._current_token()}",
             },
         )
 
@@ -544,8 +553,20 @@ class PolarionConnector:
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
+        # F-CF-X02: scrub the bearer header and cached token from memory on close.
+        try:
+            self._client.headers.pop("Authorization", None)
+        except Exception:
+            pass
         self._client.close()
+        self._token.clear()
         logger.debug("HTTP client closed.")
+
+    def _current_token(self) -> str:
+        """Return the active bearer token, refreshing via the provider if set."""
+        if self._token_provider is not None:
+            return self._token_provider() or ""
+        return self._token.get()
 
     # ------------------------------------------------------------------
     # Connection validation
@@ -650,9 +671,13 @@ class PolarionConnector:
         # Strip leading '/' so httpx treats the path as relative to
         # base_url (preserving any sub-path like /polarion).
         rel_path = path.lstrip("/")
+        refreshed = False
 
         for attempt in range(1, self._max_retries + 1):
             try:
+                # F-CF-P01: refresh the Authorization header each attempt so a
+                # token-provider supplies a fresh JWT after expiry.
+                self._client.headers["Authorization"] = f"Bearer {self._current_token()}"
                 response = self._client.request(
                     method,
                     rel_path,
@@ -662,6 +687,15 @@ class PolarionConnector:
 
                 # -- handle HTTP errors -----------------------------------
                 if response.status_code in (401, 403):
+                    # F-CF-P01: a 401 may be a stale JWT — refresh once and retry.
+                    if (
+                        response.status_code == 401
+                        and self._token_provider is not None
+                        and not refreshed
+                    ):
+                        refreshed = True
+                        logger.info("Polarion 401 — refreshing token and retrying")
+                        continue
                     raise PolarionAuthError(
                         f"Authentication failed (HTTP {response.status_code}). "
                         "Please verify your Bearer token."

@@ -38,6 +38,8 @@ from jenkinsapi.custom_exceptions import (
     NotAuthorized,
 )
 
+from src._common.secret_str import SecretStr
+
 from ..config import get_max_workers
 
 # ---------------------------------------------------------------------------
@@ -235,7 +237,8 @@ class JenkinsConnector:
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._username = username
-        self._api_token = api_token
+        # F-CF-X02: keep the API token off a plaintext attribute.
+        self._api_token = SecretStr(api_token)
         self._ssl_verify = ssl_verify
         self._timeout = timeout
         self._use_crumb = use_crumb
@@ -288,7 +291,7 @@ class JenkinsConnector:
             self._client = Jenkins(
                 baseurl=self._base_url,
                 username=self._username,
-                password=self._api_token,
+                password=self._api_token.get(),
                 ssl_verify=self._ssl_verify,
                 timeout=self._timeout,
                 use_crumb=self._use_crumb,
@@ -319,6 +322,8 @@ class JenkinsConnector:
         """Release the underlying client."""
         self._client = None
         self._connected = False
+        # F-CF-X02: scrub the token on close.
+        self._api_token.clear()
         logger.debug("Jenkins client released.")
 
     @property

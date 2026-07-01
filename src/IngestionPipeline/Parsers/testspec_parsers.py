@@ -40,6 +40,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -49,6 +50,20 @@ import pandas as pd
 from openpyxl import load_workbook
 
 logger = logging.getLogger("testspec_parsers")
+
+# F-CE-T01: cap workbook size to avoid ~500 MB peak RAM / OOM-kill on large
+# spreadsheets. Override with AICE_TESTSPEC_MAX_BYTES (bytes); default 50 MB.
+_DEFAULT_TESTSPEC_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _testspec_max_bytes() -> int:
+    raw = os.environ.get("AICE_TESTSPEC_MAX_BYTES", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid AICE_TESTSPEC_MAX_BYTES=%r", raw)
+    return _DEFAULT_TESTSPEC_MAX_BYTES
 
 # ---------------------------------------------------------------------------
 # Regex patterns  (traceability tag extraction)
@@ -587,12 +602,23 @@ def parse_testspec_workbook(
     if not path.exists():
         raise FileNotFoundError(f"Test spec file not found: {xlsx_path}")
 
+    # F-CE-T01: reject oversized workbooks before they are loaded into memory.
+    max_bytes = _testspec_max_bytes()
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(
+            f"Test spec workbook too large: {size} bytes exceeds cap of "
+            f"{max_bytes} bytes (AICE_TESTSPEC_MAX_BYTES). Refusing to load."
+        )
+
     module = module.upper()
     source_doc = path.stem  # e.g. "TC4xx_SW_MCAL_TS_Adc"
 
     logger.info("Parsing test spec workbook: %s (module: %s)", path.name, module)
 
-    wb = load_workbook(str(path), data_only=True, read_only=False)
+    # F-CE-T01: read_only streams rows instead of loading the full sheet,
+    # drastically reducing peak RAM during 20-module batch ingestion.
+    wb = load_workbook(str(path), data_only=True, read_only=True)
 
     try:
         # Parse each sheet

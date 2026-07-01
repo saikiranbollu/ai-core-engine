@@ -178,10 +178,11 @@ def _write_audit(tool_name: str, response_code: str, duration_s: float) -> None:
 
     Captures workspace, session, correlation id, duration, and token count so the
     da_productivity view can aggregate real per-DA tool usage and token totals.
+    F-CA-A03: a denied call with no resolvable key is still audited as 'anonymous'.
     """
     api_key = _current_api_key.get("") or _get_settings().mcp_api_key
-    if not api_key:
-        return  # no authenticated principal to attribute the call to
+    caller = ("sha256:" + __import__("hashlib").sha256(api_key.encode()).hexdigest()[:16]
+             ) if api_key else "anonymous"
     pg = _get_postgres_client()
     if not (pg and pg.available):
         return
@@ -190,7 +191,7 @@ def _write_audit(tool_name: str, response_code: str, duration_s: float) -> None:
             tool_name=tool_name,
             workspace_id=_current_workspace.get("") or "illd",
             session_id=_current_session_id.get("") or None,
-            caller_api_key="sha256:" + __import__("hashlib").sha256(api_key.encode()).hexdigest()[:16],
+            caller_api_key=caller,
             correlation_id=_current_request_id.get("") or None,
             response_code=response_code,
             duration_ms=int(duration_s * 1000),
@@ -478,6 +479,10 @@ def _authorize(tool_name: str, **kw) -> Optional[str]:
 
     api_key = _current_api_key.get("") or _get_settings().mcp_api_key
     if not api_key:
+        # F-CA-A03: seed attempted workspace/session so the anonymous denial is
+        # still attributable, then audit once at completion via _err -> _finish_tool.
+        _current_workspace.set(kw.get("workspace_id") or kw.get("profile") or "illd")
+        _current_session_id.set(kw.get("session_id") or "")
         return _err("PERMISSION_DENIED", "No API key provided (set MCP_API_KEY env var or send Authorization header)")
 
     # Resolve DA name from API key for metrics labelling
@@ -5218,6 +5223,16 @@ def main() -> None:
     logger.info("Tools registered: %d", len(TOOL_TIERS))
     logger.info("Auth enabled: %s", os.environ.get("CERBOS_ENABLED", "true"))
     logger.info("Prometheus metrics: %s", "enabled" if PROMETHEUS_AVAILABLE else "disabled")
+
+    # F-CA-A07: fail fast (before any transport binds) when auth is mandated but
+    # the API-key registry is missing/empty. This is the canonical entrypoint so
+    # the check runs regardless of whether app.py is the launcher.
+    from .auth import assert_auth_ready
+    try:
+        assert_auth_ready()
+    except RuntimeError as exc:
+        logger.critical("Refusing to start: %s", exc)
+        raise SystemExit(1) from exc
 
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
 

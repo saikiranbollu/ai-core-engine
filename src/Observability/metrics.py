@@ -39,6 +39,10 @@ if ENABLE_METRICS:
         REGISTRY = CollectorRegistry()
 
         # ── Tool invocation metrics ────────────────────────────────────────
+        # BREAKING CHANGE (Sprint 27): Added "tier" label (was ["da_name", "tool", "status"]).
+        # Pre-existing Grafana dashboards or PromQL queries referencing this metric
+        # WITHOUT the "tier" label will stop matching after upgrade. Update dashboards
+        # to include tier=~".*" or explicit tier values at deployment time.
         TOOL_REQUESTS_TOTAL = Counter(
             "aice_tool_requests_total",
             "Total MCP tool invocations",
@@ -98,6 +102,21 @@ if ENABLE_METRICS:
             "Number of sub-queries generated per RLM request",
             ["task_type"],
             buckets=(1, 2, 3, 4, 5, 6),
+            registry=REGISTRY,
+        )
+
+        # F-CC-R01: planner LLM fallbacks (all retries exhausted, sentinel used).
+        RLM_PLANNER_FALLBACKS = Counter(
+            "aice_rlm_planner_fallbacks_total",
+            "RLM planner LLM calls that exhausted retries and fell back",
+            ["reason"],  # "exhausted"|"auth"
+            registry=REGISTRY,
+        )
+
+        # F-CA-A04: Cerbos PDP availability (1 = reachable, 0 = unreachable).
+        CERBOS_UP = Gauge(
+            "aice_cerbos_up",
+            "Cerbos PDP availability (1 = up, 0 = down/fallback)",
             registry=REGISTRY,
         )
 
@@ -251,6 +270,8 @@ if not ENABLE_METRICS or not globals().get("PROMETHEUS_AVAILABLE", False):
     ACTIVE_SESSIONS = _noop
     RLM_REQUESTS_TOTAL = _noop
     RLM_SUBQUERIES = _noop
+    RLM_PLANNER_FALLBACKS = _noop
+    CERBOS_UP = _noop
     INGESTION_FILES_TOTAL = _noop
     BACKEND_UP = _noop
     REVIEW_ROUTING_TOTAL = _noop

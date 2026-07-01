@@ -478,7 +478,8 @@ class TestConnectorInit:
         )
         assert conn._base_url == "https://jenkins.test"  # trailing / stripped
         assert conn._username == "user"
-        assert conn._api_token == "tok"
+        assert conn._api_token.get() == "tok"  # F-CF-X02: wrapped in SecretStr
+        assert "tok" not in repr(conn._api_token)
         assert conn._ssl_verify is False
         assert conn._timeout == 60
         assert conn._client is None

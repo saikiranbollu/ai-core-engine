@@ -21,6 +21,7 @@ import httpx
 
 from ..config import get_max_workers
 from src._common.path_safety import allowed_roots_from_env, safe_path_under
+from src._common.secret_str import SecretStr
 from src._common.tls_config import enforce_tls_policy
 
 
@@ -215,6 +216,8 @@ class JamaConnector:
 
         # API-key authentication (Jama uses HTTP Basic auth with
         # client-id / client-secret when using API keys)
+        # F-CF-X02: keep the secret in SecretStr so it is not exposed via repr.
+        self._api_secret = SecretStr(api_secret)
         self._auth = httpx.BasicAuth(username=api_key, password=api_secret)
 
         ssl_context = ssl.create_default_context() if verify_ssl else False
@@ -272,7 +275,11 @@ class JamaConnector:
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
+        # F-CF-X02: drop the BasicAuth credential off the client + cached secret.
+        self._client.auth = None
         self._client.close()
+        self._auth = None
+        self._api_secret.clear()
         logger.debug("HTTP client closed.")
 
     # ------------------------------------------------------------------

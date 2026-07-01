@@ -22,11 +22,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote, quote
 
 import httpx
 
 from ..config import get_max_workers
+from src._common.secret_str import SecretStr
 from src._common.tls_config import enforce_tls_policy
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,41 @@ class BitbucketServerError(BitbucketConnectorError):
 
 class BitbucketConnectionError(BitbucketConnectorError):
     """Raised when a connection to the Bitbucket API cannot be established."""
+
+
+# ---------------------------------------------------------------------------
+# Path safety (F-CF-B02)
+# ---------------------------------------------------------------------------
+
+
+def _safe_repo_path(path: str) -> str:
+    """Normalise and validate a repository-relative path.
+
+    Decodes any percent-encoding first, strips leading slashes, and rejects
+    parent-directory traversal (literal or encoded), backslashes, and NUL bytes
+    so the value cannot escape the repo root when interpolated into the
+    Bitbucket REST URL. Returns the cleaned, decoded path; callers must URL-encode
+    it via :func:`_encode_repo_path` when building the request URL.
+    """
+    # Decode repeatedly so %252e-style double-encoding cannot smuggle '..'.
+    decoded = path
+    for _ in range(3):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    cleaned = decoded.lstrip("/")
+    if "\x00" in cleaned or "\\" in cleaned:
+        raise BitbucketClientError(f"Illegal characters in repo path: {path!r}")
+    parts = cleaned.split("/")
+    if any(p == ".." for p in parts):
+        raise BitbucketClientError(f"Path traversal rejected in repo path: {path!r}")
+    return cleaned
+
+
+def _encode_repo_path(path: str) -> str:
+    """Percent-encode each path segment, preserving '/' separators."""
+    return quote(path, safe="/")
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +241,9 @@ class BitbucketConnector:
         self._backoff_factor = backoff_factor
 
         # Authentication — prefer token (Bearer); fall back to Basic
+        # F-CF-X02: keep secrets in SecretStr so they are not exposed via repr.
+        self._token = SecretStr(token)
+        self._password = SecretStr(password)
         auth: Optional[httpx.Auth] = None
         headers: Dict[str, str] = {"Accept": "application/json"}
         if token:
@@ -370,7 +409,16 @@ class BitbucketConnector:
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
+        # F-CF-X02: scrub bearer header + cached secrets on close.
+        try:
+            self._client.headers.pop("Authorization", None)
+        except Exception:
+            pass
+        # Drop the BasicAuth credential object so the password is not retained.
+        self._client.auth = None
         self._client.close()
+        self._token.clear()
+        self._password.clear()
         logger.debug("HTTP client closed.")
 
     # ------------------------------------------------------------------
@@ -449,11 +497,11 @@ class BitbucketConnector:
         project = project or self._project
         repo = repo or self._repo
         ref = ref or self._ref
-        path = path.lstrip("/")
+        path = _safe_repo_path(path)
 
         raw = self._request_raw(
             "GET",
-            f"/projects/{project}/repos/{repo}/raw/{path}",
+            f"/projects/{project}/repos/{repo}/raw/{_encode_repo_path(path)}",
             params={"at": ref},
         )
         return FileContent(path=path, content=raw, size=len(raw))
@@ -524,14 +572,14 @@ class BitbucketConnector:
         project = project or self._project
         repo = repo or self._repo
         ref = ref or self._ref
-        path = path.strip("/")
+        path = _safe_repo_path(path)
 
         entries: List[FileEntry] = []
         start = 0
         while True:
             data = self._request(
                 "GET",
-                f"/projects/{project}/repos/{repo}/browse/{path}",
+                f"/projects/{project}/repos/{repo}/browse/{_encode_repo_path(path)}",
                 params={"at": ref, "start": start, "limit": self._BROWSE_PAGE_LIMIT},
             )
             children = data.get("children", {})

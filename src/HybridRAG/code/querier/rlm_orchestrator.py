@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 
 from .context_builder import (
     AssembledContext, ContextBuilder, ContextBudget, ContextItem, ContextSlot,
@@ -193,6 +193,17 @@ def _get_shared_openai_client():
         )
         _shared_openai_token = token
         return _shared_openai_client
+
+
+def _reset_shared_openai_client() -> None:
+    """Drop the cached OpenAI client so the next call rebuilds with a fresh token.
+
+    Used after a 401 so a refreshed bearer token is picked up (F-CC-R01).
+    """
+    global _shared_openai_client, _shared_openai_token
+    with _rlm_client_lock:
+        _shared_openai_client = None
+        _shared_openai_token = None
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -724,25 +735,71 @@ class RLMOrchestrator:
         self._llm_fn = llm_fn or self._default_llm
 
     def _default_llm(self, system: str, user: str, max_tokens: int = 1500) -> str:
-        """Call LLM via GPT4IFX OpenAI-compatible proxy (shared connection pool)."""
+        """Call LLM via GPT4IFX OpenAI-compatible proxy (shared connection pool).
+
+        F-CC-R01: retries on real OpenAI SDK transport errors (connection/timeout)
+        and 5xx server errors, refreshes the token once on a 401, and increments
+        ``aice_rlm_planner_fallbacks_total`` when all retries are exhausted.
+        """
+        try:
+            from openai import (
+                APIConnectionError, APITimeoutError, APIStatusError,
+                AuthenticationError, RateLimitError, InternalServerError,
+            )
+            _retryable = (
+                TimeoutError, ConnectionError,
+                APIConnectionError, APITimeoutError, RateLimitError,
+                InternalServerError,
+            )
+        except Exception:  # openai not importable / older SDK
+            APIStatusError = AuthenticationError = ()  # type: ignore[assignment]
+            _retryable = (TimeoutError, ConnectionError)
+
+        def _should_retry(exc: BaseException) -> bool:
+            if isinstance(exc, _retryable):
+                return True
+            # Retry server-side (5xx) APIStatusError; 401 handled inline below.
+            if APIStatusError and isinstance(exc, APIStatusError):
+                return getattr(exc, "status_code", 0) >= 500
+            return False
+
         @retry(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=1, max=4),
-            retry=retry_if_exception_type((TimeoutError, ConnectionError)),
+            retry=retry_if_exception(_should_retry),
             reraise=True,
         )
         def _call():
-            client = _get_shared_openai_client()
-            model = os.environ.get("RLM_ROOT_MODEL", "gpt-4o")
-            resp = client.chat.completions.create(
-                model=model, temperature=0.1, max_tokens=max_tokens,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            )
-            return resp.choices[0].message.content or ""
+            try:
+                client = _get_shared_openai_client()
+                model = os.environ.get("RLM_ROOT_MODEL", "gpt-4o")
+                resp = client.chat.completions.create(
+                    model=model, temperature=0.1, max_tokens=max_tokens,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                )
+                return resp.choices[0].message.content or ""
+            except BaseException as exc:
+                # 401: token likely expired — drop the client to force a refresh
+                # and let tenacity re-attempt with the new token.
+                is_401 = (
+                    isinstance(exc, AuthenticationError)
+                    or (APIStatusError and isinstance(exc, APIStatusError)
+                        and getattr(exc, "status_code", 0) == 401)
+                )
+                if is_401:
+                    logger.warning("[RLM] LLM 401 — refreshing token and retrying")
+                    _reset_shared_openai_client()
+                    raise ConnectionError("token refresh required") from exc
+                raise
         try:
             return _call()
         except Exception as e:
             logger.error("[RLM] LLM call failed after retries: %s", e)
+            try:
+                from src.Observability.metrics import RLM_PLANNER_FALLBACKS
+                RLM_PLANNER_FALLBACKS.labels(reason="exhausted").inc()
+            except Exception:
+                pass
             # F-CC-R02/R03: return a non-JSON sentinel so the planner falls back
             # using the full original query (see _plan) instead of a truncated
             # slice of the wrapped prompt, and synthesis surfaces a clear marker.

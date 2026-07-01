@@ -54,11 +54,14 @@ references
 temp/
 data/
 docs/*
+!docs/BIG_PICTURE.md
 !docs/EPHEMERAL_SANDBOX.md
 !docs/NODE_SETS_ARCHITECTURE.md
+!docs/DETAILED_DOCUMENTATION.md
 tests/*
 !tests/unit/
 !tests/integration/
+!tests/e2e/
 !tests/conftest.py
 !tests/run_graphrag_evaluation.py
 !tests/graphrag_evaluation_queries.md

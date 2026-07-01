@@ -28,11 +28,11 @@ DA generates response
          ▼
 ┌─ ConfidenceCalculator ─────────────────────┐
 │                                             │
-│  Signals: has_kg_context, high_relevance,   │
-│  has_dependency_order, missing_requirements, │
-│  is_safety_critical, ...                    │
+│  Signals: api_verified, call_order_valid,   │
+│  config_valid, output_well_formed,          │
+│  pattern_match, is_safety_critical, ...     │
 │                                             │
-│  base_score = 50                            │
+│  base_score = 20                            │
 │  + positive signals                         │
 │  - negative signals                         │
 │  = final_score                              │
@@ -71,45 +71,54 @@ Scoring is **deterministic and explainable**: given the same signals, the same s
 final_score = clamp(base_score + Σ(signal_weight), 0, 100)
 ```
 
-Where `base_score = 50` (neutral starting point).
+Where `base_score = 20` (starts in FULL-review territory; positive output-quality signals must earn confidence upward).
 
 ### Signal Weights
 
+Scoring uses a **7-signal output-quality model**. Every signal validates the *generated output*
+(not whether the database had data) — if the KG was incomplete, the output signals catch it
+(`api_verified` fails when the SWA was never ingested; `call_order_valid` fails when dependencies
+are unknown). Two weight profiles ship: `DEFAULT_WEIGHTS` (code generation) and `GEST_WEIGHTS`
+(test-code generation).
+
 **Quality signals (positive)**:
 
-| Signal | Weight | Description |
-|--------|--------|-------------|
-| `has_kg_context` | +30 | Response backed by knowledge graph data |
-| `high_relevance` | +20 | Search results had high relevance scores |
-| `has_dependency_order` | +20 | Correct dependency/init ordering present |
-| `has_proven_patterns` | +15 | Uses patterns from approved examples |
-| `format_correct` | +10 | Output follows expected format/structure |
-| `misra_compliant` | +10 | No MISRA C:2012 violations detected |
-| `similar_approved` | +5 | Matches a previously approved pattern |
+| Signal | DEFAULT | GEST | Description |
+|--------|---------|------|-------------|
+| `api_verified` | +25 | +25 | All API calls exist in the module's KG |
+| `call_order_valid` | +25 | +25 | Call/init sequence follows the `DEPENDS_ON` graph |
+| `config_valid` | +15 | +15 | Enum values and struct fields verified against the KG |
+| `pattern_match` | +10 | +10 | Generated sequence matches an approved pattern |
+| `output_well_formed` | +5 | +5 | Code parses and has the required structure |
 
 **Risk signals (negative)**:
 
-| Signal | Weight | Description |
-|--------|--------|-------------|
-| `missing_requirements` | -30 | Referenced requirements not found in KG |
-| `low_relevance` | -20 | Search results had low relevance scores |
-| `compliance_warnings` | -20 | AUTOSAR/MISRA compliance issues detected |
-| `novel_pattern` | -15 | No similar approved patterns found |
-| `is_safety_critical` | -15 | ASIL-B or higher safety context |
-| `complex_logic` | -10 | High cyclomatic complexity or multi-path logic |
+| Signal | DEFAULT | GEST | Description |
+|--------|---------|------|-------------|
+| `is_safety_critical` | -15 | -20 | ASIL-B+ or DMA/ISR/multi-channel complexity |
+| `no_failure_match` | -10 | -15 | Resembles a previously rejected pattern |
+
+> Earlier input-quality signals (`has_context`, `missing_requirements`, `missing_hw_spec`) were
+> removed as redundant with the output signals. There is **no MISRA signal** — the iLLD workspace
+> is reference (non-productive) software.
+
+**Composite signal mapping**: `evaluate()` also accepts scaled inputs — `validation_score`
+(0–100, maps to `output_well_formed` when ≥ 80), `api_match_ratio` (maps to `api_verified` when
+≥ 0.95), and `config_match_ratio` (maps to `config_valid` when ≥ 0.90).
 
 ### evaluate() Method
 
 ```python
-def evaluate(self, signals: Dict[str, bool], response_id: str) -> Dict:
-    score = self.base_score  # 50
-    breakdown = {}
+def evaluate(self, signals: Dict[str, Any], response_id: str = None) -> Dict:
+    base_score = 20
+    score = base_score
+    breakdown = []
 
     for signal_name, is_present in signals.items():
-        if is_present and signal_name in self.weights:
-            weight = self.weights[signal_name]
+        if is_present and signal_name in self._weights:   # DEFAULT_WEIGHTS or GEST_WEIGHTS
+            weight = self._weights[signal_name]
             score += weight
-            breakdown[signal_name] = weight
+            breakdown.append({signal_name: weight})
 
     score = max(0, min(100, score))  # clamp to [0, 100]
 
@@ -128,9 +137,9 @@ def evaluate(self, signals: Dict[str, bool], response_id: str) -> Dict:
 
 Signals are computed by the DA before calling `evaluate_confidence`. DAs determine signals based on their domain:
 
-- **CIA** (code generator): checks for KG-backed API signatures, MISRA compliance, dependency ordering
-- **GEST** (test generator): checks for requirement coverage, test structure validity
-- **ACRA** (code reviewer): checks for compliance warnings, complexity metrics
+- **EDA / CIA** (code generation): `api_verified`, `call_order_valid`, `config_valid`, `output_well_formed`, plus `pattern_match` (uses `DEFAULT_WEIGHTS`)
+- **GEST** (test generation): the same 7 signals re-weighted via `GEST_WEIGHTS` (heavier `is_safety_critical` / `no_failure_match` penalties)
+- Any DA may raise the `is_safety_critical` and `no_failure_match` risk signals
 
 The Review Gate does not compute signals itself — it only scores and routes based on the signals provided.
 
@@ -201,7 +210,7 @@ When a response is `APPROVE`d, the `FeedbackSink` extracts an `ApprovedPattern` 
 
 ## 5. Result Processors
 
-`ResultProcessor` (709 lines) ingests test and analysis results from CI/CD tools and converts them into a unified `TestResult` model.
+`ResultProcessor` (728 lines) ingests test and analysis results from CI/CD tools and converts them into a unified `TestResult` model.
 
 ### Supported Formats
 
@@ -268,8 +277,8 @@ The Review Gate implements a continuous learning loop:
 5. If APPROVE → extract ApprovedPattern → PatternStore (Qdrant)
        │
 6. Next time: ConfidenceCalculator checks PatternStore
-       │  • similar_approved signal (+5 if match found)
-       │  • novel_pattern signal (-15 if no match)
+       │  • pattern_match signal (+10 if an approved pattern matches)
+       │  • no_failure_match signal (-10 / -15 if it resembles a rejected pattern)
        │
 7. Loop: scoring improves as pattern library grows
 ```
@@ -287,5 +296,5 @@ The Review Gate implements a continuous learning loop:
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `confidence.py` | 436 | `ConfidenceCalculator` (scoring), `FeedbackSink` (persistence) |
-| `result_processors.py` | 709 | `ResultProcessor`, `JUnitParser`, `VPParser`, `PolyspaceParser` |
+| `confidence.py` | 465 | `ConfidenceCalculator` (scoring), `FeedbackSink` (persistence) |
+| `result_processors.py` | 728 | `ResultProcessor`, `JUnitParser`, `VPParser`, `PolyspaceParser`, `CoverageParser`, `CompilerParser` |

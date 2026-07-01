@@ -1,7 +1,7 @@
 # Hybrid RAG & Search Architecture
 
 **Component**: `src/HybridRAG/`
-**Primary class**: `SearchService` (1259 lines)
+**Primary class**: `SearchService` (2750 lines)
 **Backing stores**: Neo4j (graph traversal) + Qdrant (vector similarity)
 
 ---
@@ -181,7 +181,7 @@ Each module in each workspace has a dedicated Qdrant collection:
 
 Examples: `illd_adc_embeddings`, `mcal_can_embeddings`
 
-Collection naming is managed by `collection_naming_unified.py` (255 lines) for consistency.
+Collection naming is managed by `collection_naming_unified.py` (258 lines) for consistency.
 
 ### ID Mapping
 
@@ -218,16 +218,25 @@ RRF normalizes both into a shared rank-based scale.
 
 ### Implementation
 
+The merge is workspace-aware: `_merge_results_weighted()` dispatches to `_merge_illd_rrf()`
+(rank-based RRF) for the `illd` workspace, and to `_merge_mcal()` (global score normalisation +
+alpha blend) for the `mcal` workspace, which fans out across multiple collections.
+
 ```python
-def _merge_results_rrf(self, graph_results, vector_results, alpha, k=60):
+def _merge_results_weighted(self, graph, vector, alpha, k=60, workspace_id="illd"):
+    if workspace_id == "mcal":
+        return self._merge_mcal(graph, vector, alpha)
+    return self._merge_illd_rrf(graph, vector, alpha, k)
+
+def _merge_illd_rrf(self, graph, vector, alpha, k=60):
     scores = {}
-    for rank, item in enumerate(graph_results):
-        nid = item["node_id"]
-        scores[nid] = scores.get(nid, 0) + alpha * (1 / (k + rank + 1))
-    for rank, item in enumerate(vector_results):
-        nid = item["node_id"]
-        scores[nid] = scores.get(nid, 0) + (1 - alpha) * (1 / (k + rank + 1))
-    # Deduplicate, sort descending, return
+    for rank, r in enumerate(graph):                 # alpha weights graph
+        nid = r.get("node_id")
+        scores[nid] = scores.get(nid, 0.0) + alpha * (1 / (k + rank + 1))
+    for rank, r in enumerate(vector):                # (1 - alpha) weights vector
+        nid = r.get("node_id")
+        scores[nid] = scores.get(nid, 0.0) + (1 - alpha) * (1 / (k + rank + 1))
+    # sort descending by score, dedupe by node_id
 ```
 
 ### Legacy Merge
@@ -238,15 +247,17 @@ A simpler linear interpolation (`_merge_results()`) is kept for backward compati
 
 ## 7. Alpha Blending
 
-The `alpha` parameter controls the graph-vs-vector weight:
+The `alpha` parameter controls the graph-vs-vector weight. In the RRF formula `alpha` weights the
+graph ranks and `(1 - alpha)` weights the vector ranks, so a **high** alpha favours graph search
+and a **low** alpha favours vector search (config default: `0.6`):
 
 | Alpha | Behavior | Use Case |
 |-------|----------|----------|
-| `0.0` | Pure graph search | Exact structural queries ("what calls function X") |
-| `0.3` | Graph-heavy | Code generation (need exact API signatures + some semantic) |
+| `0.0` | Pure vector search | Broad semantic queries ("how to configure timing") |
+| `0.3` | Vector-heavy | Semantic context retrieval |
 | `0.5` | Balanced | General-purpose queries |
-| `0.8` | Vector-heavy | Structural lookups, struct definitions |
-| `1.0` | Pure vector search | Broad semantic queries ("how to configure timing") |
+| `0.8` | Graph-heavy | Structural lookups, struct definitions |
+| `1.0` | Pure graph search | Exact structural queries ("what calls function X") |
 
 DAs set alpha based on their task type. The `RLMOrchestrator` uses different alphas per sub-query based on the `RLMTaskType` — e.g., `code_generation` uses `α=0.8` for struct lookups and `α=0.3` for semantic context.
 
@@ -270,7 +281,7 @@ This significantly improves precision — instead of searching all node types, t
 
 ## 9. Knowledge Intelligence Service
 
-`KnowledgeIntelligenceService` (683 lines) provides higher-level query operations that build on graph traversal:
+`KnowledgeIntelligenceService` (713 lines) provides higher-level query operations that build on graph traversal:
 
 ### API Function Intelligence (`query_api_function`)
 
@@ -313,7 +324,7 @@ Maps register accesses to functions, detecting undocumented register accesses (f
 
 ## 10. KG Construction Pipeline
 
-`build_knowledge_graph.py` (4668 lines) is the largest file in the codebase. It handles the full pipeline from parsed source documents to Neo4j + Qdrant:
+`build_knowledge_graph.py` (8039 lines) is the largest file in the codebase. It handles the full pipeline from parsed source documents to Neo4j + Qdrant:
 
 1. **Node creation**: MERGE nodes with labels and properties into Neo4j
 2. **Relationship creation**: Create typed edges (CALLS_INTERNALLY, HAS_FIELD, IMPLEMENTS, ACCESS_TYPE, etc.)
@@ -328,19 +339,19 @@ Maps register accesses to functions, detecting undocumented register accesses (f
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `code/querier/search_service.py` | 1259 | Hybrid search pipeline, RRF, entity lookup |
-| `code/querier/knowledge_intelligence.py` | 683 | API/dependency/traceability queries |
-| `code/querier/rlm_orchestrator.py` | 712 | Multi-step retrieval (see [RLM doc](rlm-orchestrator.md)) |
-| `code/querier/context_builder.py` | 236 | 10-slot token budget assembly |
-| `code/querier/kg_node_utils.py` | 625 | Node display, scoring, classification |
-| `code/KG/build_knowledge_graph.py` | 4668 | Full KG construction pipeline |
-| `code/KG/query_knowledge_graph.py` | 1595 | Legacy query module |
-| `code/RAG/hybrid_rag_unified.py` | 295 | Profile-agnostic RAG orchestrator |
-| `code/RAG/rag_query_unified.py` | 404 | Unified RAG query engine |
-| `code/RAG/vector_store_factory.py` | 266 | Qdrant client factory, UUID5 mapping |
-| `code/RAG/collection_naming_unified.py` | 255 | Collection naming conventions |
-| `code/neo4j_manager.py` | 536 | Connection management, config loading |
-| `code/token_manager.py` | 338 | GPT4IFX JWT token lifecycle |
-| `code/pdf_pipeline.py` | 957 | PDF processing with structure-aware chunking |
-| `config/ontology.yaml` | 6166 | Full ontology: profiles, node types, relationships |
-| `config/storage_config.yaml` | ~50 | Neo4j + Qdrant connection configuration |
+| `code/querier/search_service.py` | 2750 | Hybrid search pipeline, RRF, entity lookup |
+| `code/querier/knowledge_intelligence.py` | 713 | API/dependency/traceability queries |
+| `code/querier/rlm_orchestrator.py` | 1031 | Multi-step retrieval (see [RLM doc](rlm-orchestrator.md)) |
+| `code/querier/context_builder.py` | 262 | 10-slot token budget assembly |
+| `code/querier/kg_node_utils.py` | 798 | Node display, scoring, classification |
+| `code/KG/build_knowledge_graph.py` | 8039 | Full KG construction pipeline |
+| `code/KG/query_knowledge_graph.py` | 1738 | Legacy query module |
+| `code/RAG/hybrid_rag_unified.py` | 799 | Profile-agnostic RAG orchestrator |
+| `code/RAG/rag_query_unified.py` | 441 | Unified RAG query engine |
+| `code/RAG/vector_store_factory.py` | 319 | Qdrant client factory, UUID5 mapping |
+| `code/RAG/collection_naming_unified.py` | 258 | Collection naming conventions |
+| `code/neo4j_manager.py` | 578 | Connection management, config loading |
+| `code/token_manager.py` | 341 | GPT4IFX JWT token lifecycle |
+| `code/pdf_pipeline.py` | 1270 | PDF processing with structure-aware chunking |
+| `config/ontology.yaml` | 7275 | Full ontology: profiles, node types, relationships |
+| `config/storage_config.yaml` | 172 | Neo4j + Qdrant connection configuration |

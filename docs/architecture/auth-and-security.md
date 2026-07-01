@@ -1,7 +1,7 @@
 # Authentication & Security Architecture
 
-**Component**: `mcp/core/auth_middleware.py`, `mcp/auth/`
-**Primary classes**: `_APIKeyMiddleware`, auth functions in `auth_middleware.py`
+**Component**: `mcp/core/auth_middleware.py` (ASGI key extraction), `mcp/core/auth/` (Cerbos client + tier logic), `mcp/auth/` (Cerbos policies + API keys)
+**Primary pieces**: `_APIKeyMiddleware`, `check_authorization()` in `mcp/core/auth/cerbos_client.py`
 **Backing services**: Cerbos PDP (subprocess)
 
 ---
@@ -63,8 +63,8 @@ DA Request (HTTP)
 | Tier | Tools | Typical User | Purpose |
 |------|-------|-------------|---------|
 | **public** | 34 tools | All Domain Assistants | Read-only search, sessions, basic operations |
-| **developer** | 14 tools | DA developers, operators | Overrides, analytics, validation, RLM access |
-| **admin** | 6 tools | Platform team | Ingestion, data mutation, token management |
+| **developer** | 16 tools | DA developers, operators | Overrides, analytics, validation, RLM orchestration |
+| **admin** | 5 tools | Platform team | Cache mutation, result processing, token refresh |
 
 ### Tier Inheritance
 
@@ -112,9 +112,8 @@ TOOL_TIERS = {
 ### Key Format
 
 API keys follow the convention `key-{da_code}-{number}`:
-- `key-cia-001` — CIA (Code Generator)
-- `key-gest-001` — GEST (Test Generator)
-- `key-admin-001` — Admin key
+- `key-eda-001` — EDA (Embedded Driver Assistant, iLLD workspace)
+- `key-gest-001` — GEST (Test Generator, MCAL workspace)
 
 ### Key → Principal Mapping
 
@@ -122,26 +121,19 @@ Defined in `mcp/auth/api_keys.yaml`:
 
 ```yaml
 keys:
-  "key-cia-001":
-    principal_id: "cia_assistant"
+  # EDA is the only assistant with iLLD access; every other DA is MCAL-only.
+  "key-eda-001":
+    principal_id: "eda_assistant"
     roles:
-      illd: ["public"]
+      illd: ["public", "developer"]
+
+  "key-gest-001":
+    principal_id: "gest_assistant"
+    roles:
       mcal: ["public"]
-
-  "key-saga-001":
-    principal_id: "saga_assistant"
-    roles:
-      illd: ["developer"]
-      mcal: ["developer"]
-
-  "key-admin-001":
-    principal_id: "platform_admin"
-    roles:
-      illd: ["admin"]
-      mcal: ["admin"]
 ```
 
-**Workspace-scoped roles**: A principal can have different roles in different workspaces. For example, a DA might have `developer` access to `illd` but only `public` access to `mcal`.
+**Workspace-scoped roles**: A principal can hold different roles per workspace. In this deployment EDA holds `public` + `developer` on `illd`, while all other Domain Assistants are scoped to the `mcal` workspace only.
 
 ### Key Resolution
 
@@ -205,19 +197,36 @@ Implements tier inheritance so that `admin` inherits `developer` permissions and
 ### Check Authorization
 
 ```python
-def check_authorization(api_key: str, tool_name: str, workspace_id: str) -> bool:
-    principal = resolve_principal(api_key)
-    role = principal.roles.get(workspace_id, "public")
-    tier = TOOL_TIERS.get(tool_name, "admin")  # default-deny for unknown tools
+def check_authorization(
+    api_key: str, tool_name: str,
+    workspace_id: str = "illd", module_name: str | None = None,
+) -> tuple[bool, str]:
+    principal = resolve_principal(api_key, workspace_id)
+    if principal is None:
+        return False, "Unknown or missing API key"
 
-    # Call Cerbos PDP
-    response = cerbos_client.check_resource(
-        principal={"id": api_key, "roles": [role]},
-        resource={"kind": "mcp_tool", "id": tool_name, "attr": {"tier": tier}},
-        actions=["invoke"],
-    )
-    return response.is_allowed("invoke")
+    tier = get_tool_tier(tool_name)            # from tool_tiers.py
+    if tier is None:
+        return False, f"Unknown tool: {tool_name}"
+
+    if _CERBOS_SDK_AVAILABLE:
+        resource = Resource(id=tool_name, kind="mcp_tool", attr={
+            "tier": tier, "workspace_id": workspace_id,
+            "module_scope": module_name or "", ...
+        })
+        try:
+            resp = client.is_allowed("invoke", principal, resource)  # 1s timeout
+            _set_cerbos_up(True)
+            return (True, "allowed") if resp else (False, "Insufficient access tier ...")
+        except Exception:
+            _set_cerbos_up(False)              # PDP down → reconnect next call
+            # fall through to local tier check
+
+    return check_via_local_tiers(principal, tool_name, tier)
 ```
+
+The check returns `(allowed, message)`. A 1-second Cerbos timeout (`_CERBOS_TIMEOUT_S`) prevents a
+hung PDP from blocking tool dispatch, and the `aice_cerbos_up` gauge tracks PDP reachability.
 
 ---
 
@@ -258,11 +267,11 @@ def _authorize(tool_name: str):
 
     workspace_id = _resolve_workspace()  # from request context or default
 
-    allowed = check_authorization(api_key, tool_name, workspace_id)
+    allowed, message = check_authorization(api_key, tool_name, workspace_id)
     if not allowed:
-        raise AuthorizationError(f"Not authorized to invoke {tool_name}")
+        raise AuthorizationError(message)
 
-    # Best-effort audit logging
+    # Best-effort audit logging (completion-time row records the outcome)
     _audit_log(api_key, tool_name, workspace_id)
 ```
 
@@ -275,13 +284,13 @@ Audit logging writes to PostgreSQL `audit_logs` table. The write is non-blocking
 If Cerbos PDP is unavailable (startup delay, crash, network issue), the auth middleware falls back to a **local tier check**:
 
 ```python
-def check_authorization_local(api_key, tool_name, workspace_id):
-    principal = resolve_principal(api_key)
-    role = principal.roles.get(workspace_id, "public")
-    tier = TOOL_TIERS.get(tool_name, "admin")
-
-    tier_hierarchy = {"public": 0, "developer": 1, "admin": 2}
-    return tier_hierarchy.get(role, 0) >= tier_hierarchy.get(tier, 2)
+def check_via_local_tiers(principal, tool_name, tier) -> tuple[bool, str]:
+    # mcp/core/auth/local_fallback.py — uses TIER_HIERARCHY from tool_tiers.py
+    for role in principal.roles:
+        if tier in TIER_HIERARCHY.get(role, set()):
+            return True, "allowed"
+    return False, (f"Insufficient access tier for tool '{tool_name}'. "
+                   f"Required: {tier}, your roles: {sorted(principal.roles)}")
 ```
 
 This ensures the server remains operational during Cerbos restarts. The fallback provides the same authorization logic, just without the policy-as-code flexibility of Cerbos.
@@ -322,9 +331,13 @@ Unknown tools default to `admin` tier in `TOOL_TIERS`. If a tool isn't explicitl
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `mcp/core/auth_middleware.py` | 252 | Cerbos integration, key resolution, authorization check |
-| `mcp/core/tool_tiers.py` | 82 | 56-tool → tier mapping, `role_may_invoke()` |
-| `mcp/auth/api_keys.yaml` | ~40 | API key → principal mapping |
-| `mcp/auth/policies/resource_mcp_tool.yaml` | ~30 | Cerbos resource policy for tools |
-| `mcp/auth/policies/derived_roles.yaml` | ~20 | Tier inheritance via derived roles |
-| `mcp/auth/.cerbos.yaml` | ~10 | Cerbos PDP configuration |
+| `mcp/core/auth_middleware.py` | 51 | ASGI middleware: extract Bearer key → `contextvars` |
+| `mcp/core/tool_tiers.py` | 166 | 55-tool → tier mapping, `TIER_HIERARCHY`, `get_tool_tier()` |
+| `mcp/core/auth/cerbos_client.py` | 186 | `check_authorization()`, Cerbos PDP call (1s timeout), DENY audit, `aice_cerbos_up` gauge |
+| `mcp/core/auth/api_key_registry.py` | 97 | `load_api_keys()` — API key registry loader |
+| `mcp/core/auth/principal.py` | 62 | `resolve_principal()` — workspace-scoped roles |
+| `mcp/core/auth/local_fallback.py` | 23 | `check_via_local_tiers()` — local check when PDP unreachable |
+| `mcp/auth/api_keys.yaml` | 118 | API key → principal mapping |
+| `mcp/auth/policies/resource_mcp_tool.yaml` | 122 | Cerbos resource policy for tools |
+| `mcp/auth/policies/derived_roles.yaml` | 24 | Tier inheritance via derived roles |
+| `mcp/auth/.cerbos.yaml` | 21 | Cerbos PDP configuration |

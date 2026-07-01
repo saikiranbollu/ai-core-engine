@@ -26,7 +26,7 @@
   - [ADR-014: Docker Compose with 5 Services](#adr-014-docker-compose-with-5-services)
   - [ADR-015: Structure-Aware Chunking for AUTOSAR Documents](#adr-015-structure-aware-chunking-for-autosar-documents)
   - [ADR-016: Celery Task Queue — Deferred](#adr-016-celery-task-queue--deferred)
-  - [ADR-017: MinIO / S3 Object Storage — Deferred](#adr-017-minio--s3-object-storage--deferred)
+  - [ADR-017: MinIO / S3 Object Storage — Adopted](#adr-017-minio--s3-object-storage--adopted)
   - [ADR-018: Cross-Encoder Reranking — Deferred](#adr-018-cross-encoder-reranking--deferred)
   - [ADR-019: Local On-Premise Deployment](#adr-019-local-on-premise-deployment)
   - [ADR-020: Keycloak OAuth — Deferred](#adr-020-keycloak-oauth--deferred)
@@ -92,10 +92,10 @@
 | **Date** | Sprint 2 |
 | **Context** | Pure vector search returns semantically similar content but misses structurally connected data. Pure graph search finds exact property matches and traversals but misses paraphrased queries. Need both, merged intelligently. |
 | **Decision** | Combine graph search (Neo4j) and vector search (Qdrant) results using **Reciprocal Rank Fusion (RRF)** with configurable **alpha blending**. |
-| **Rationale** | (1) RRF is score-agnostic — it only uses rank positions, so scores from different retrievers (Cypher relevance vs. cosine similarity) are naturally comparable. (2) Alpha parameter (0.0–1.0) lets DAs control the blend: `α=0.0` = all graph, `α=1.0` = all vector. (3) Standard `k=60` parameter from literature (Cormack et al.) prevents early-position dominance. |
+| **Rationale** | (1) RRF is score-agnostic — it only uses rank positions, so scores from different retrievers (Cypher relevance vs. cosine similarity) are naturally comparable. (2) Alpha parameter (0.0–1.0) lets DAs control the blend: `α=0.0` = all vector, `α=1.0` = all graph (default `0.6`). (3) Standard `k=60` parameter from literature (Cormack et al.) prevents early-position dominance. |
 | **Alternatives considered** | Linear score interpolation (implemented as `_merge_results()`, kept for backward compatibility but RRF is the primary path). Cross-encoder reranking (see ADR-018 — deferred). Maximal Marginal Relevance (considered for diversity; not needed when RRF already deduplicates by `node_id`). |
 | **Formula** | `RRF_score(d) = α × 1/(k + rank_graph) + (1-α) × 1/(k + rank_vector)` where `k=60` |
-| **Implementation** | `SearchService._merge_results_rrf()` in `search_service.py`. 5-stage pipeline: query analysis → graph search → entity-targeted lookup → vector search → RRF merge. |
+| **Implementation** | `SearchService._merge_results_weighted()` in `search_service.py`, which dispatches to `_merge_illd_rrf()` (RRF, `k=60`) or `_merge_mcal()` by workspace. 5-stage pipeline: query analysis → graph search → entity-targeted lookup → vector search → weighted/RRF merge. |
 
 ---
 
@@ -106,10 +106,10 @@
 | **Status** | Adopted |
 | **Date** | Sprint 4 |
 | **Context** | DA responses need quality gates before delivery. LLM-based evaluation is slow, expensive, and non-reproducible. Automotive domain requires deterministic, auditable, repeatable scoring for ASPICE compliance. |
-| **Decision** | Use a **deterministic weighted-signal formula** for confidence scoring. Base score of 50, with positive signals (quality indicators) adding points and negative signals (risk indicators) subtracting points. |
+| **Decision** | Use a **deterministic weighted-signal formula** for confidence scoring. Base score of **20**, with positive quality signals adding points and negative risk signals subtracting points. Every signal validates the generated **output** (not the input query). |
 | **Rationale** | (1) Reproducibility: same signals → same score, always. (2) Explainability: breakdown shows exactly which signals contributed. (3) Speed: no LLM call, sub-millisecond. (4) Auditability: scoring formula is versioned code, not a prompt. |
 | **Thresholds** | `AUTO ≥ 80` (auto-approve, ~5 min spot check), `QUICK 50–79` (~15-20 min review), `FULL < 50` (≥1 hr deep review) |
-| **Key signals** | `has_kg_context` (+30), `high_relevance` (+20), `has_dependency_order` (+20), `missing_requirements` (-30), `is_safety_critical` (-15) — 13 signals total |
+| **Key signals** | 7 signals (`DEFAULT_WEIGHTS`): `api_verified` (+25), `call_order_valid` (+25), `config_valid` (+15), `pattern_match` (+10), `output_well_formed` (+5), `is_safety_critical` (−15), `no_failure_match` (−10). The GEST DA uses a re-weighted `GEST_WEIGHTS` variant (safety −20, failure −15). |
 | **Implementation** | `ConfidenceCalculator` in `confidence.py`. Integrates with `PatternStore` for similarity-based approved pattern matching. |
 
 ---
@@ -178,10 +178,10 @@
 | **Date** | Sprint 5 |
 | **Context** | Complex DA queries require multiple search passes (e.g., "generate init code for ADC" needs API signatures, struct definitions, dependency order, register maps, and MISRA rules). A single search call cannot gather all the needed context. |
 | **Decision** | Implement **RLM (Retrieval-augmented Language Model) Orchestrator** as an **internal** Core Engine capability. It sits below the MCP interface, above Hybrid RAG, and is invisible to DAs. `build_context` is the public entry point; it may internally delegate to RLM. |
-| **Rationale** | (1) DAs don't need to know about multi-step retrieval — their lifecycle (`session_start → search → build_context → session_end`) stays stable. (2) RLM plans up to 6 sub-queries using an LLM (GPT4IFX), each with its own 8K token budget, then synthesizes results. (3) Task-type-aware planning: 24 `RLMTaskType` values with DA-specific sub-query templates. (4) Preview mode lets operators inspect plans before execution. |
+| **Rationale** | (1) DAs don't need to know about multi-step retrieval — their lifecycle (`session_start → search → build_context → session_end`) stays stable. (2) RLM plans up to 6 sub-queries using an LLM (GPT4IFX), each with its own 8K token budget, then synthesizes results. (3) Task-type-aware planning: 25 `RLMTaskType` values with DA-specific sub-query templates. (4) Preview mode lets operators inspect plans before execution. |
 | **Trigger heuristic** | `build_context` delegates to RLM when the query complexity warrants it (e.g., multiple function references, register-level access, safety-critical context). |
-| **Alternatives considered** | Exposing RLM as a public tool (rejected: leaks implementation detail, complicates DA lifecycle). Having DAs orchestrate their own multi-step retrieval (rejected: duplicates logic across 21 DAs). |
-| **Implementation** | `RLMOrchestrator` in `rlm_orchestrator.py`. `DA_TASK_MAPPING` maps 21 DAs to their task types. Two MCP tools exposed: `rlm_orchestrate` and `rlm_preview` (developer tier). |
+| **Alternatives considered** | Exposing RLM as a public tool (rejected: leaks implementation detail, complicates DA lifecycle). Having DAs orchestrate their own multi-step retrieval (rejected: duplicates logic across the DAs). |
+| **Implementation** | `RLMOrchestrator` in `rlm_orchestrator.py`. `DA_TASK_MAPPING` maps 17 DA codes (16 canonical assistants + `EDA`) to their task types. Two MCP tools exposed: `rlm_orchestrate` and `rlm_plan_preview` (developer tier). |
 
 ---
 
@@ -242,9 +242,11 @@
 
 ## ADR-014: Docker Compose with 5 Services
 
+> **Superseded (Sprint 25+):** AICE now deploys to **OpenShift / Kubernetes** via the Kustomize overlay in `mcp/k8s/test/` — there is no `docker-compose.yml` in the repository. This ADR is retained for historical context; see [deployment.md](deployment.md) for the current model.
+
 | Field | Value |
 |-------|-------|
-| **Status** | Adopted |
+| **Status** | Superseded (by Kubernetes / OpenShift) |
 | **Date** | Sprint 1 |
 | **Context** | AICE requires 4 external services (Neo4j, Qdrant, Redis, PostgreSQL) plus the MCP server itself. Developers need a one-command setup. Production needs defined health checks and restart policies. |
 | **Decision** | Use **Docker Compose** with 5 named services on a shared bridge network (`aice-net`). Named volumes for data persistence. Health checks on all services. MCP server depends on all 4 backends (`service_healthy`). |
@@ -289,10 +291,10 @@
 | **Status** | Adopted |
 | **Date** | Evaluated Sprint 5 (deferred), adopted Sprint 6 |
 | **Context** | Source documents (PDFs, ARXML files, Excel specs) are currently read from local filesystem paths during ingestion. Corpus backup/restore workflows require a shared, durable object store for Neo4j and Qdrant snapshots. |
-| **Decision** | **Adopt MinIO** as S3-compatible object storage for corpus snapshots. MinIO runs as a StatefulSet in the test K8s namespace with a 10Gi PVC. Python client: `minio>=7.2.0`. Default bucket: `corpus-backups`. |
+| **Decision** | **Adopt S3-compatible object storage** for corpus snapshots, accessed through the `minio` Python SDK. In the cluster the endpoint is the platform's **Ceph** S3 gateway (not a self-hosted MinIO server). Default bucket via env; naming convention below. |
 | **Naming convention** | `{profile}/{component}/{profile}-{component}-{ISO8601}.{ext}` (e.g., `illd/neo4j/illd-neo4j-2026-04-20T14-30-00Z.cypher`). 2-year retention (manual cleanup). |
 | **Rationale** | (1) MinIO is open-source (AGPL-3.0), S3-compatible, and lightweight — single binary or container. (2) Consistent with on-premise deployment model (ADR-019). (3) Python `minio` SDK is Apache-2.0 licensed. (4) Qdrant snapshot API and Neo4j APOC export provide the data to back up. (5) Date-stamped naming supports future automated retention policies. |
-| **Implementation** | `mcp/k8s/test/minio.yaml` (StatefulSet + Service), `src/IngestionPipeline/backup/` package (neo4j_dump, qdrant_export, s3_upload, snapshot_all, restore). CLI-only, manual trigger. |
+| **Implementation** | `src/IngestionPipeline/backup/` package (`neo4j_dump`, `qdrant_export`, `s3_upload`, `snapshot_all`, `restore`) plus Qdrant migration scripts in `mcp/k8s/` (`migrate_qdrant.py`, `migrate_qdrant_scroll.py`, `restore_qdrant.py`) that use the `minio` SDK against the Ceph S3 endpoint. CLI-only, manual trigger. No bundled MinIO server manifest. |
 
 ---
 
@@ -317,10 +319,10 @@
 | **Date** | Sprint 1 (foundational constraint) |
 | **Context** | Infineon's engineering data (register maps, safety-critical AUTOSAR code, proprietary silicon IP) cannot leave the corporate network. Cloud-hosted KG/RAG solutions (e.g., Pinecone, managed Neo4j Aura) are not permitted for this data classification. |
 | **Decision** | All backend services (Neo4j, Qdrant, Redis, PostgreSQL, Cerbos) run **on-premise** within Infineon's infrastructure. No external API calls for data storage or retrieval. The only external dependency is GPT4IFX (Infineon's own LLM proxy). |
-| **Rationale** | (1) Data residency — proprietary silicon register maps and AUTOSAR SWS data must stay on-premise. (2) Embedding model (`all-MiniLM-L6-v2`, 384-dim) was chosen specifically because it runs locally without GPU (~80MB, CPU-only inference). (3) Neo4j Community Edition and Qdrant are self-hosted — no cloud vendor dependency. (4) Docker Compose stack allows single-command deployment on any server with Docker installed. (5) Air-gapped operation is possible (all container images can be pre-pulled). |
+| **Rationale** | (1) Data residency — proprietary silicon register maps and AUTOSAR SWS data must stay on-premise. (2) Embedding model (`all-MiniLM-L6-v2`, 384-dim) was chosen specifically because it runs locally without GPU (~80MB, CPU-only inference). (3) Neo4j Community Edition and Qdrant are self-hosted — no cloud vendor dependency. (4) The Kustomize overlay (`kubectl apply -k mcp/k8s/test/`) allows single-command deployment into the on-premise cluster. (5) Air-gapped operation is possible (all container images can be pre-pulled into the internal registry). |
 | **Trade-offs** | No managed service auto-scaling. Neo4j Community lacks clustering (acceptable for current data volumes). Qdrant runs single-node (snapshot-based backup). Operational burden on the platform team for upgrades and monitoring. |
 | **Alternatives rejected** | Pinecone (cloud-only, data residency violation). Neo4j Aura (managed cloud, same concern). AWS/Azure managed services (not approved for this data classification). |
-| **Implementation** | `docker-compose.yml` defines 7 services on a bridge network (5 core + Prometheus + Grafana). All services use named Docker volumes for persistence. No external network egress required for data operations. |
+| **Implementation** | Backend services run as Kubernetes/OpenShift workloads (`mcp/k8s/test/` Kustomize overlay) within Infineon's on-premise cluster. No external network egress is required for data operations; the only external dependency is the GPT4IFX LLM proxy. |
 
 ---
 
@@ -349,8 +351,8 @@
 | **Rationale** | (1) Prometheus is the de-facto standard for metrics in containerized deployments. (2) Data is already being collected (timing, success/failure, cache hits) — Prometheus captures it as time-series instead of discarding it. (3) Grafana provides real-time dashboards for operations (query latency percentiles, error rates, cache effectiveness). (4) Both are self-hosted and open-source — consistent with the on-premise deployment model (ADR-019). (5) Alerting rules can trigger on SLA violations (e.g., p95 latency > 2s). |
 | **Metrics collected** | MCP server: query latency, tool success/failure counts, context assembly time, RLM sub-query count, token usage per LLM call. Neo4j: connection pool metrics. Qdrant: search performance. Redis: cache hit rates. |
 | **Grafana dashboards** | Query latency percentiles (p50, p95, p99), search stage breakdown (graph vs. vector), cache effectiveness, error rate trends, system health overview. |
-| **Configuration** | Prometheus: `prometheus.yml` with scrape targets (mcp-server:8000, neo4j:2004, redis-exporter:9121). Grafana: port 3000, provisioned datasource pointing to Prometheus. Both added to Docker Compose with named volumes (`prometheus_data`, `grafana_data`). |
-| **Implementation status** | **Implemented (Sprint 10).** `src/Observability/metrics.py` defines 11 Prometheus metric types with graceful `_NoOp` fallback. The MCP server mounts `/metrics` via Starlette alongside FastMCP. `docker-compose.yml` includes Prometheus (v2.53.0, port 9090) and Grafana (v11.1.0, port 3000) services with auto-provisioned datasource and 10-panel overview dashboard. Dependencies: `prometheus_client>=0.21`, `starlette>=0.37`. |
+| **Configuration** | Prometheus scrape config in `monitoring/prometheus.yml` (target `mcp-server:8000/metrics`). Grafana dashboards under `monitoring/grafana/`. Alert rules in `monitoring/prometheus/aice_silent_failures.yml`. Deployed by the platform monitoring stack, not the AICE application overlay. |
+| **Implementation status** | **Implemented (Sprint 10).** `src/Observability/metrics.py` defines **25** Prometheus metrics with graceful `_NoOp` fallback. The MCP server exposes `/metrics` (enabled via `ENABLE_METRICS=true`). Scrape config and dashboards ship in the repo under `monitoring/` (`prometheus.yml` + 7 Grafana dashboard JSONs, including a 10-panel overview) and are consumed by the platform Prometheus/Grafana stack — not bundled as application pods. Dependencies: `prometheus_client>=0.21`, `starlette>=0.37`. |
 
 ---
 
@@ -543,9 +545,9 @@
 | **Status** | **Adopted (MCP layer only)** |
 | **Date** | Sprint 11 (original deferral), Sprint 25 (revised) |
 | **Context** | Original decision deferred OpenTelemetry entirely. Review3 found Prometheus metrics (11 types) are completely unwired — zero counters incremented. Without tracing, debugging DA request flows through the 6-stage search pipeline (enhance → search → rerank → compress → judge → refine) is impossible. |
-| **Decision** | Add OpenTelemetry tracing for the MCP tool dispatch layer, search pipeline, and LLM calls only. Export via OTLP to Grafana Tempo (added to docker-compose). Skip auto-instrumentation of FastAPI/httpx. |
+| **Decision** | Add OpenTelemetry tracing for the MCP tool dispatch layer, search pipeline, and LLM calls only. Export via OTLP to the platform's Grafana Tempo. Skip auto-instrumentation of FastAPI/httpx. |
 | **Rationale** | (1) MCP tool dispatch + search pipeline are the critical paths that need visibility. (2) Grafana Tempo reuses existing Grafana deployment. (3) Manual spans give better control than auto-instrumentation. (4) Prometheus metrics will also be wired as part of this sprint. |
-| **Implementation** | `src/Observability/tracing.py` (new). Grafana Tempo service in docker-compose. |
+| **Implementation** | `src/Observability/otel_tracing.py`. Traces export via OTLP to the platform's Grafana Tempo (no application-bundled Tempo pod). Dependencies: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp`. |
 
 ---
 
@@ -569,17 +571,19 @@
 | **Status** | Adopted |
 | **Date** | Sprint 25 |
 | **Context** | ADR-022 adopted cross-encoder reranking but left PyTorch (2GB) as dependency. Review3 found `flashrank` missing from requirements.txt — reranker always falls back to CrossEncoder, keeping PyTorch mandatory. The original GAP-A01 intent was to eliminate PyTorch via FlashRank (ONNX). |
-| **Decision** | Add `flashrank>=0.2.0` to requirements.txt. Remove `torch>=2.0.0`, `sentence-transformers>=5.0.0`, and the PyTorch `--extra-index-url`. Keep CrossEncoder as degraded fallback. |
-| **Rationale** | (1) FlashRank uses ONNX Runtime — ~50MB vs ~2GB for PyTorch. (2) Docker image size reduced by ~1.8GB. (3) Cold start time reduced by ~15s. (4) ONNX Runtime is already used by other pipeline components. |
-| **Implementation** | `requirements.txt` update. Existing `reranker.py` already supports FlashRank backend. |
+| **Decision** | Add `flashrank>=0.2.0` to requirements.txt for ONNX-based reranking and remove the pinned PyTorch `--extra-index-url` from requirements. Keep CrossEncoder as a degraded fallback. |
+| **Rationale** | (1) FlashRank uses ONNX Runtime — ~50MB vs ~2GB for a full GPU PyTorch build. (2) Docker image size reduced. (3) Cold start time reduced. (4) ONNX Runtime is already used by other pipeline components. |
+| **Implementation** | `requirements.txt` adds `flashrank>=0.2.0`; `torch` is no longer pinned in `requirements.txt` (a CPU-only build is installed separately in the Dockerfile). **Note:** `sentence-transformers>=2.2.0` remains required for vector-search embeddings (and as the CrossEncoder reranker fallback), so a CPU build of PyTorch is still present in the image — FlashRank removes PyTorch from the *reranking* path, not from embeddings. |
 
 ---
 
 ## ADR-039: Credential Externalization
 
+> **Updated (Sprint 25+):** With the move to OpenShift/Kubernetes (ADR-014 superseded), runtime credentials are now supplied by **Kubernetes Secrets** (`test-aice-db-secrets`, `test-aice-external-secrets`) via `secretKeyRef`, and `api_keys.yaml` is mounted from a ConfigMap. The `.env` / docker-compose mechanism below applied to the earlier Compose-based setup and is retained for historical context.
+
 | Field | Value |
 |-------|-------|
-| **Status** | Adopted |
+| **Status** | Adopted (mechanism now Kubernetes Secrets) |
 | **Date** | Sprint 25 |
 | **Context** | Review2 (F-02) and Review3 (C04) found hardcoded passwords in docker-compose.yml (`aice_dev_2026`, `neo4j_aice_2026`, `redis_aice_2026`). Additionally, `mcp/auth/api_keys.yaml` contains plaintext API keys committed to version control. |
 | **Decision** | (1) Extract all credentials to `.env` file with `${VAR:-default}` syntax in docker-compose.yml (already partially done). (2) Add `.env` to `.gitignore`. (3) Provide `.env.example` with placeholder values. (4) Add `api_keys.yaml` to `.gitignore`. (5) Defer Docker Secrets / HashiCorp Vault to multi-node deployment phase. |
@@ -636,4 +640,4 @@
 | **Context** | Review2 (F-04) and Review3 (C06) found the MCP server runs as a single Python process. No Gunicorn or equivalent ASGI server wrapper. Under load, a single process cannot utilize multiple CPU cores. |
 | **Decision** | Change Dockerfile CMD to `gunicorn mcp.app:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000`. Add `gunicorn>=22.0` to requirements.txt. Worker count configurable via `WEB_CONCURRENCY` env var. |
 | **Rationale** | (1) Gunicorn + UvicornWorker is the standard production deployment for async Python ASGI apps. (2) 4 workers matches typical container CPU allocation. (3) Configurable via environment for different deployment sizes. |
-| **Implementation** | Dockerfile CMD change + requirements.txt update. |
+| **Implementation** | `gunicorn>=22.0` added to `requirements.txt` and `WEB_CONCURRENCY=4` set in the Dockerfile. The recorded `gunicorn …` CMD was **not** adopted verbatim: the container entrypoint is `python aice_mcp/app.py`, which must launch the Cerbos PDP subprocess before the MCP server, so multi-worker concurrency is driven by `WEB_CONCURRENCY` under that entrypoint rather than a direct `gunicorn` command. |

@@ -26,9 +26,9 @@ AICE observability is designed for **ASPICE compliance**: every tool invocation 
 
 - **PostgreSQL 16** — durable storage for audit logs, feedback, and operational data (7 tables)
 - **ObservabilityService** — graph statistics and health monitoring via Neo4j queries
-- **Prometheus** — real-time time-series metrics collection (11 metric types, 15s scrape interval)
-- **Grafana** — pre-provisioned 10-panel dashboard for operations visibility
-- **Health checks** — Docker and Kubernetes health endpoints for all 7 services
+- **Prometheus** — real-time time-series metrics collection (25 metrics, 15s scrape interval)
+- **Grafana** — pre-provisioned datasource with a 10-panel overview dashboard plus 6 specialized dashboards
+- **Health checks** — Kubernetes liveness/readiness probes and an in-process `health_check` tool for all backends
 - **Best-effort persistence** — all PostgreSQL writes are non-blocking; failures are logged but never crash the server
 
 ```
@@ -60,7 +60,7 @@ Graph Stats (on-demand)
 
 ## 2. PostgreSQL Audit Schema
 
-`PostgresClient` (408 lines) manages a 7-table schema. Tables are auto-created on first connection.
+`PostgresClient` (479 lines) manages a 7-table schema (plus a `da_productivity` analytics view). Tables are auto-created on first connection.
 
 ### Table Definitions
 
@@ -234,10 +234,18 @@ The MCP server exposes Prometheus metrics at `/metrics`. All 55 tools are automa
 | `aice_cache_requests_total` | Counter | `cache_type`, `result` | Cache hit/miss counts (semantic/session) |
 | `aice_active_sessions` | Gauge | — | Currently active DA sessions |
 | `aice_rlm_requests_total` | Counter | `task_type` | RLM orchestration invocations |
-| `aice_rlm_subqueries` | Histogram | — | Number of sub-queries per RLM run |
+| `aice_rlm_subquery_count` | Histogram | — | Number of sub-queries per RLM run |
 | `aice_ingestion_files_total` | Counter | `parser_type`, `status` | Files processed by ingestion pipeline |
 | `aice_backend_up` | Gauge | `backend` | Backend health (1=up, 0=down) |
 | `aice_review_routing_total` | Counter | `route` | Review gate routing decisions (AUTO/QUICK/FULL) |
+
+The table above lists the core request/latency/cache/session metrics. `metrics.py` defines **25
+metrics** in total. Additional metrics include `aice_cerbos_up` (PDP reachability),
+`aice_rlm_planner_fallbacks_total`, `aice_query_total` / `aice_query_latency_seconds`,
+`aice_cache_hit_rate` / `aice_cache_size`, `aice_error_total`, `aice_ingestion_duration_seconds`,
+and the DA-productivity family (`aice_da_session_duration_seconds`, `aice_da_session_outcomes_total`,
+`aice_da_context_tokens`, `aice_da_first_result_latency_seconds`, `aice_da_pattern_hits_total`,
+`aice_da_llm_tokens_total`).
 
 ### Instrumentation Pattern
 
@@ -270,7 +278,7 @@ If `prometheus_client` is not installed, all metric objects are replaced with `_
 **Dashboard file**: `monitoring/grafana/dashboards/aice-overview.json`
 **Provisioning**: Auto-configured via `monitoring/grafana/provisioning/`
 
-Grafana is pre-provisioned with a Prometheus datasource and a 10-panel overview dashboard. No manual setup is required after `ENABLE_METRICS=true docker compose --profile monitoring up -d`.
+Grafana is pre-provisioned with a Prometheus datasource and a 10-panel overview dashboard, plus six specialized dashboards (cache performance, DA productivity, error rate, ingestion, query latency, silent failures). Provisioning is driven by `monitoring/grafana/provisioning/`; the monitoring stack is deployed via the Kubernetes manifests.
 
 ### AICE Overview Dashboard Panels
 
@@ -299,18 +307,19 @@ Grafana is pre-provisioned with a Prometheus datasource and a 10-panel overview 
 
 ### APScheduler Periodic Health Checks (Sprint 9)
 
-The Kubernetes entrypoint (`mcp/app.py`) runs an APScheduler `BackgroundScheduler` with two periodic jobs:
+The Kubernetes entrypoint (`mcp/app.py`) runs an APScheduler `BackgroundScheduler` with three periodic jobs:
 
 | Job | Interval | Description |
 |-----|----------|-------------|
 | `health_check` | 5 minutes | Pings Neo4j, Qdrant, Redis; logs up/down status |
 | `cache_stats` | 30 minutes | Logs LRU and semantic cache hit rates |
+| `session_reaper` | 2 minutes | Purges expired sessions and updates the active-sessions gauge |
 
 The scheduler shuts down gracefully on SIGTERM/SIGINT. If `apscheduler` is not installed, periodic jobs are silently disabled.
 
-### Docker Compose Health Checks
+### Service Health Checks
 
-All 7 services have health checks in `docker-compose.yml`:
+Each backing service has a health probe defined in the Kubernetes manifests under `mcp/k8s/`:
 
 | Service | Health Check | Interval |
 |---------|-------------|----------|
@@ -336,7 +345,7 @@ The `health_check` tool (public tier) pings all backends and returns their statu
     "postgres": {"status": "up", "latency_ms": 5},
     "cerbos": {"status": "up", "latency_ms": 3}
   },
-  "tool_count": 56,
+  "tool_count": 55,
   "uptime_seconds": 86400
 }
 ```
@@ -353,8 +362,8 @@ A core design principle: **no single backend failure should crash the server**.
 |-------------|--------|-------------|
 | **PostgreSQL** | Audit, feedback, jobs | Operations continue; audit logs lost silently |
 | **Redis** | Sessions | Falls back to in-memory sessions (lost on restart) |
-| **Qdrant** | Vector search | Only graph search available (alpha forced to 0.0) |
-| **Neo4j** | Graph search | Only vector search available (alpha forced to 1.0) |
+| **Qdrant** | Vector search | Only graph search available (effective alpha → 1.0) |
+| **Neo4j** | Graph search | Only vector search available (effective alpha → 0.0) |
 | **Cerbos** | RBAC | Falls back to local tier-check from `tool_tiers.py` |
 
 `PostgresClient` wraps every operation in try/except:
@@ -374,10 +383,11 @@ def insert(self, table, data):
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `src/Observability/metrics.py` | ~170 | Prometheus metrics: 11 metric types, `make_metrics_app()`, NoOp fallback |
-| `src/Observability/postgres_schema.py` | 408 | `PostgresClient` — 7-table schema, auto-creation, CRUD |
-| `src/Configuration/services.py` | 418 | `ObservabilityService` — graph stats, health, metrics |
+| `src/Observability/metrics.py` | 299 | Prometheus metrics: 25 metrics, `_NoOp` fallback |
+| `src/Observability/postgres_schema.py` | 479 | `PostgresClient` — 7-table schema + `da_productivity` view, auto-creation, CRUD |
+| `src/Observability/otel_tracing.py` | — | OpenTelemetry tracing setup (`trace_tool` decorator) |
+| `src/Observability/log_sanitizer.py` | — | Secret-scrubbing log filter |
+| `src/Configuration/services.py` | 414 | `ObservabilityService` — graph stats, health, metrics |
 | `monitoring/prometheus.yml` | ~20 | Prometheus scrape config (mcp-server + self-monitoring) |
-| `monitoring/grafana/dashboards/aice-overview.json` | ~500 | 10-panel Grafana overview dashboard |
-| `monitoring/grafana/provisioning/datasources/prometheus.yml` | ~10 | Grafana datasource auto-provisioning |
-| `monitoring/grafana/provisioning/dashboards/dashboards.yml` | ~10 | Grafana dashboard file provider |
+| `monitoring/grafana/dashboards/*.json` | — | 7 dashboards (overview + cache, DA productivity, error rate, ingestion, query latency, silent failures) |
+| `monitoring/grafana/provisioning/` | — | Grafana datasource + dashboard provisioning |

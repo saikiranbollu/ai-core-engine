@@ -1,7 +1,7 @@
 # Ingestion Pipeline Architecture
 
 **Component**: `src/IngestionPipeline/`
-**Primary class**: `IngestionService` (670 lines)
+**Primary class**: `IngestionService` (997 lines)
 **Backing stores**: Neo4j + Qdrant (write targets), PostgreSQL (job tracking)
 
 ---
@@ -26,7 +26,7 @@ The Ingestion Pipeline transforms raw engineering artifacts (source code, specif
 ```
 Source Files          Connectors              Ingestion Service
 ─────────────        ──────────              ─────────────────
-.c/.h files ──┐                             ┌─ Parse (14 parsers)
+.c/.h files ──┐                             ┌─ Parse (18 parsers)
 .arxml files ─┤                             │
 .pdf files ───┤                             ├─ Extract nodes + relationships
 .xlsx files ──┤──► IngestionService ────────┤
@@ -54,11 +54,11 @@ All ingestion tools require **admin** tier authorization (Cerbos RBAC).
 | Mode | Library method | Scope | Use Case |
 |------|----------------|-------|----------|
 | **Single file** | `ingest_file` | One file | Quick testing, targeted updates |
-| **Module** | `ingest_module_from_repo` | All files in a module directory | Module onboarding |
-| **Batch** | `batch_ingest_modules` | Multiple modules in parallel | Bulk onboarding |
+| **Module** | `ingest_module` | All files in a module directory | Module onboarding |
+| **Batch** | `batch_ingest` | Multiple modules in parallel | Bulk onboarding |
 | **Repository** | `ingest_repository` | Auto-discover and ingest all modules | Initial setup |
 
-`batch_ingest()` uses `ThreadPoolExecutor(max_workers=4)` with `as_completed()` for parallel module processing (~4x speedup).
+`batch_ingest()` uses `ThreadPoolExecutor` with a dynamic worker count (`effective_workers`, reduced to 1 when only a few modules are queued) and `as_completed()` for parallel module processing.
 
 ### Single File Flow
 
@@ -76,7 +76,7 @@ ingest_file(file_path, workspace, module, overwrite=False)
 
 ### Module Discovery
 
-`ingest_module_from_repo` scans a repository directory structure to find all ingestion-eligible files for a given module. It understands the standard AUTOSAR module layout:
+`ingest_module` scans a repository directory structure to find all ingestion-eligible files for a given module. It understands the standard AUTOSAR module layout:
 
 ```
 repo_root/
@@ -92,7 +92,7 @@ repo_root/
 
 ## 3. Parser Architecture
 
-14 specialized parsers handle different file formats. Each parser extracts typed nodes and relationships following the ontology schema.
+18 specialized parsers handle different file formats. Each parser extracts typed nodes and relationships following the ontology schema.
 
 ### Parser Registry
 
@@ -109,7 +109,11 @@ repo_root/
 | `swa_parsers.py` | SW Architecture docs | Components, interfaces, ports, connections | Structure-aware parsing |
 | `illd_swa_parser.py` | iLLD SW Architecture | iLLD-specific architecture elements | Custom parsing |
 | `testspec_parsers.py` | Test specifications | Test cases, test steps, expected results | Structure-aware parsing |
-| `regdef_parser.py` | Register definitions | Registers, bitfields, addresses, reset values | Custom parsing |
+| `sfr_parser.py` | Register definitions | Special-function registers, bitfields, addresses, reset values | Custom parsing |
+| `hw_spec_parser.py` | HW datasheets / SFR specs | Register maps and bitfields from hardware specs | PDF + table parsing |
+| `hw_um_parser.py` / `hw_um_llm_parser.py` | HW user manuals | Peripheral descriptions, register semantics | Structure-aware / LLM-assisted |
+| `srs_dox_parser.py` | SRS + Doxygen | Software requirement specs, doc comments | Structure-aware parsing |
+| `offline_pdf_parser.py` | `.pdf` (offline) | Structured sections without LLM calls | PyMuPDF |
 | `doxygen_parser.py` | Doxygen comments | API documentation, parameter descriptions | Comment extraction |
 | JSON / text | `.json`, `.md`, `.txt`, `.csv` | Generic key-value, text content | Standard library |
 
@@ -146,7 +150,7 @@ Every parser returns a standardized structure:
 
 ### C Parser (libclang)
 
-The C parser (`c_parser.py`, 506 lines) uses libclang to build an AST and extract:
+The C parser (`c_parser.py`, 3009 lines) uses libclang to build an AST and extract:
 - **Functions**: name, signature, parameters (name, type, direction), return type, body hash
 - **Structs/Unions**: name, fields (name, type, default value, bitfield width)
 - **Enums**: name, values (name, numeric value)
@@ -158,7 +162,7 @@ Register accesses are detected by matching known register patterns (e.g., `MODUL
 
 ### PDF Parser (LLM-Assisted)
 
-The PDF parser (`pdf_parser.py`, 215 lines) works with the PDF pipeline (`pdf_pipeline.py`, 957 lines):
+The PDF parser (`pdf_parser.py`, 470 lines) works with the PDF pipeline (`pdf_pipeline.py`, 1270 lines):
 
 1. Extract raw text and tables using PyMuPDF
 2. Apply structure-aware chunking (see [ADR-015](DECISIONS.md#adr-015-structure-aware-chunking-for-autosar-documents)):
@@ -173,9 +177,18 @@ The PDF parser (`pdf_parser.py`, 215 lines) works with the PDF pipeline (`pdf_pi
 
 ## 4. External Connectors
 
-Three connectors integrate with enterprise tools used in AUTOSAR development:
+Four connectors integrate with enterprise tools used in AUTOSAR development. All connectors wrap
+credentials in `SecretStr` (masked in logs/repr, zeroized on close) and emit the same standardized
+node/relationship format as file parsers.
 
-### Jama Connector (998 lines)
+### Bitbucket Connector (778 lines)
+
+Connects to **Bitbucket** for source-code retrieval:
+- Fetches repository files (C/H sources, configuration) for downstream parsing and ingestion
+- Guards file paths against directory traversal (decodes and rejects encoded `../` sequences)
+- Uses `SecretStr`-wrapped credentials and scrubs auth headers on client close
+
+### Jama Connector (1079 lines)
 
 Connects to **Jama Connect** for requirements management:
 - Fetches stakeholder requirements, product requirements, and their relationships
@@ -184,7 +197,7 @@ Connects to **Jama Connect** for requirements management:
 - Supports 29 Jama modules (mcal workspace)
 - Maps Jama relationships (derives-from, verified-by) to Neo4j edges
 
-### Jenkins Connector (1076 lines)
+### Jenkins Connector (1081 lines)
 
 Connects to **Jenkins CI/CD** for build and test results:
 - Fetches build history, test reports, coverage data
@@ -192,7 +205,7 @@ Connects to **Jenkins CI/CD** for build and test results:
 - Extracts compilation warnings and errors
 - Links test results to requirements via test case IDs
 
-### Polarion Connector (1414 lines)
+### Polarion Connector (1466 lines)
 
 Connects to **Polarion ALM** for application lifecycle management:
 - Fetches work items (requirements, defects, test cases)
@@ -324,24 +337,32 @@ For each extracted node:
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `ingestion_service.py` | 670 | Service class, job tracker, file routing |
+| `ingestion_service.py` | 997 | Service class, job tracker, file routing |
+| `batch_ingestion.py` | 772 | Batch / repository ingestion driver |
 | **Parsers/** | | |
-| `Parsers/c_parser.py` | 506 | C source parsing via libclang |
-| `Parsers/arxml_parser.py` | 668 | AUTOSAR ARXML parsing |
+| `Parsers/c_parser.py` | 3009 | C source parsing via libclang |
+| `Parsers/hw_spec_parser.py` | 2616 | HW datasheet / SFR spec parsing |
+| `Parsers/swa_parsers.py` | 1939 | SW Architecture document parsing |
+| `Parsers/swud_parsers.py` | 1605 | SW Unit Design document parsing |
 | `Parsers/ea_parser.py` | 1049 | Enterprise Architect model parsing |
-| `Parsers/swud_parsers.py` | 1522 | SW Unit Design document parsing |
-| `Parsers/swa_parsers.py` | 1339 | SW Architecture document parsing |
-| `Parsers/testspec_parsers.py` | 678 | Test specification parsing |
-| `Parsers/illd_swa_parser.py` | 435 | iLLD-specific SW Architecture |
-| `Parsers/puml_parser.py` | 425 | PlantUML diagram parsing |
-| `Parsers/pdf_parser.py` | 215 | PDF file parsing |
-| `Parsers/xlsx_parser.py` | ~200 | Excel file parsing |
-| `Parsers/rst_parser.py` | ~150 | reStructuredText parsing |
-| `Parsers/regdef_parser.py` | ~200 | Register definition parsing |
-| `Parsers/doxygen_parser.py` | ~200 | Doxygen comment extraction |
+| `Parsers/testspec_parsers.py` | 704 | Test specification parsing |
+| `Parsers/hw_um_parser.py` | 697 | HW user manual parsing |
+| `Parsers/arxml_parser.py` | 668 | AUTOSAR ARXML parsing |
+| `Parsers/offline_pdf_parser.py` | 639 | Offline PDF parsing (no LLM) |
+| `Parsers/illd_swa_parser.py` | 632 | iLLD-specific SW Architecture |
+| `Parsers/hw_um_llm_parser.py` | 509 | LLM-assisted HW user manual parsing |
+| `Parsers/pdf_parser.py` | 470 | PDF file parsing (LLM-assisted) |
+| `Parsers/puml_parser.py` | 262 | PlantUML diagram parsing |
+| `Parsers/srs_dox_parser.py` | 168 | SRS + Doxygen parsing |
+| `Parsers/sfr_parser.py` | 128 | Register (SFR) definition parsing |
+| `Parsers/xlsx_parser.py` | 98 | Excel file parsing |
+| `Parsers/doxygen_parser.py` | 54 | Doxygen comment extraction |
+| `Parsers/rst_parser.py` | 53 | reStructuredText parsing |
+| _Helpers:_ `auto_stub_generator.py` (584), `header_fetcher.py` (195), `ocr_processor.py` (365) | | Stub generation, header fetch, OCR |
 | **Connectors/** | | |
-| `Connectors/JamaConnector.py` | 998 | Jama requirements integration |
-| `Connectors/JenkinsConnector.py` | 1076 | Jenkins CI/CD integration |
-| `Connectors/PolarionConnector.py` | 1414 | Polarion ALM integration |
+| `Connectors/PolarionConnector.py` | 1466 | Polarion ALM integration |
+| `Connectors/JenkinsConnector.py` | 1081 | Jenkins CI/CD integration |
+| `Connectors/JamaConnector.py` | 1079 | Jama requirements integration |
+| `Connectors/BitbucketConnector.py` | 778 | Bitbucket source-code integration |
 | **Incremental/** | | |
 | `Incremental/incremental_ingestion.py` | 469 | Change detection and delta tracking |

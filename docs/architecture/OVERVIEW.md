@@ -103,18 +103,18 @@ AICE is a **knowledge-graph-backed MCP (Model Context Protocol) server** purpose
 | Component | Source Path | Responsibility | Backing Store |
 |-----------|------------|----------------|---------------|
 | **MCP Server** | `mcp/core/mcp_server.py` | 55 tool handlers, ASGI middleware, singleton service factories | — |
-| **Auth & RBAC** | `mcp/core/auth_middleware.py`, `mcp/auth/` | Cerbos PDP, API key → principal resolution, 3-tier RBAC | Cerbos PDP (subprocess) |
+| **Auth & RBAC** | `mcp/core/auth_middleware.py`, `mcp/core/auth/`, `mcp/auth/` (policies) | Cerbos PDP, API key → principal resolution, 3-tier RBAC | Cerbos PDP (subprocess) |
 | **Hybrid RAG / Search** | `src/HybridRAG/code/querier/search_service.py` | Hybrid search pipeline: graph + vector → RRF merge | Neo4j + Qdrant |
 | **Knowledge Intelligence** | `src/HybridRAG/code/querier/knowledge_intelligence.py` | API function lookup, dependency analysis, traceability | Neo4j |
 | **RLM Orchestrator** | `src/HybridRAG/code/querier/rlm_orchestrator.py` | Multi-step retrieval: LLM plans → N sub-queries → synthesis | Neo4j + Qdrant + GPT4IFX |
 | **Context Builder** | `src/HybridRAG/code/querier/context_builder.py` | Token-budget-aware context assembly with 10 priority slots | — (in-memory) |
-| **Ingestion Pipeline** | `src/IngestionPipeline/` | 14 parsers, 3 connectors, incremental ingestion | Neo4j + Qdrant + PostgreSQL |
+| **Ingestion Pipeline** | `src/IngestionPipeline/` | 18 parsers, 4 connectors, incremental ingestion | Neo4j + Qdrant + PostgreSQL |
 | **Memory Layer** | `src/MemoryLayer/` | Sessions (Redis/in-memory), ephemeral sandbox, node sets | Redis + Neo4j |
 | **Review Gate** | `src/ReviewGate/` | Deterministic confidence scoring, feedback loop, result processing | PostgreSQL + Qdrant |
 | **Cache** | `src/Configuration/cache_service.py` | Three-tier cache: LRU exact + FAISS L1 semantic + RediSearch L2 (feature-flagged) | In-memory + FAISS + sentence-transformers + Redis (optional) |
 | **Ontology** | `src/Configuration/services.py` + `ontology.yaml` | Dual-profile ontology (illd/mcal), schema validation | YAML + Neo4j |
-| **Observability** | `src/Observability/postgres_schema.py`, `src/Observability/metrics.py` | 7-table PostgreSQL audit schema, graph statistics, Prometheus metrics | PostgreSQL + Neo4j + Prometheus + Grafana |
-| **KG Construction** | `src/HybridRAG/code/KG/build_knowledge_graph.py` | Full knowledge graph build pipeline (4668 lines) | Neo4j + Qdrant |
+| **Observability** | `src/Observability/postgres_schema.py`, `src/Observability/metrics.py`, `src/Observability/otel_tracing.py` | 7-table PostgreSQL audit schema, graph statistics, 25 Prometheus metrics, OpenTelemetry tracing | PostgreSQL + Neo4j + Prometheus + Grafana |
+| **KG Construction** | `src/HybridRAG/code/KG/build_knowledge_graph.py` | Full knowledge graph build pipeline (8039 lines) | Neo4j + Qdrant |
 
 ---
 
@@ -301,7 +301,8 @@ See [Node Sets Architecture](../NODE_SETS_ARCHITECTURE.md) for the full NodeSet 
 | **Authorization** | Cerbos PDP | latest | 3-tier RBAC policy evaluation |
 | **LLM Proxy** | GPT4IFX | — | Infineon LLM proxy (RLM planning + PDF extraction) |
 | **HTTP Server** | Uvicorn | — | ASGI server for HTTP transport |
-| **Container** | Docker Compose | — | 7-service orchestration |
+| **Container** | Docker (Dockerfile) | — | Multi-stage image (Cerbos PDP + Python 3.12), one pod per replica |
+| **Orchestration** | Kubernetes / OpenShift | — | `mcp/k8s/` manifests, HPA autoscaling, OpenShift Route + BuildConfig, GitLab CI |
 | **Graph Algorithms** | Neo4j APOC + GDS | — | Path finding, community detection |
 | **In-memory Graphs** | NetworkX | — | Ephemeral sandbox per-session KGs |
 
@@ -312,30 +313,37 @@ See [Node Sets Architecture](../NODE_SETS_ARCHITECTURE.md) for the full NodeSet 
 ```
 ai-core-engine/
 ├── mcp/                              # MCP server (entrypoint + tools)
-│   ├── app.py                        #   K8s entrypoint, Cerbos lifecycle
+│   ├── app.py                        #   K8s pod entrypoint: Cerbos PDP + MCP server + APScheduler jobs
 │   ├── core/
-│   │   ├── mcp_server.py             #   55 tool handlers, ASGI middleware
+│   │   ├── mcp_server.py             #   55 tool handlers, ASGI middleware (5263 lines)
 │   │   ├── tool_tiers.py             #   Tool → tier mapping (public/developer/admin)
-│   │   └── auth_middleware.py         #   Cerbos integration, API key resolution
+│   │   ├── auth_middleware.py         #   Cerbos integration, API key resolution
+│   │   ├── rate_limiter.py           #   Per-principal rate limiting
+│   │   ├── streaming.py              #   Streamable-HTTP transport helpers
+│   │   ├── swagger_ui.py            #   OpenAPI / Swagger UI
+│   │   ├── config.py                #   Server configuration
+│   │   └── auth/                    #   Cerbos client: cerbos_client, api_key_registry, principal, local_fallback
 │   ├── auth/
 │   │   ├── api_keys.yaml             #   API key → principal mapping
 │   │   ├── policies/                 #   Cerbos resource policies + derived roles
 │   │   └── .cerbos.yaml              #   Cerbos PDP configuration
 │   └── k8s/
-│       └── deployment.yaml           #   Kubernetes deployment manifest
+│       ├── test/                    #   K8s/OpenShift manifests: mcp-deployment, neo4j, postgres, qdrant, redis, route, secrets
+│       ├── mcp-hpa.yaml             #   HorizontalPodAutoscaler
+│       └── pipeline-cronjob.yaml     #   Scheduled ingestion pipeline CronJob
 │
 ├── src/
 │   ├── HybridRAG/                    # Search, KG, RAG, RLM
 │   │   ├── code/
 │   │   │   ├── querier/
-│   │   │   │   ├── search_service.py       # Hybrid search + RRF (1259 lines)
-│   │   │   │   ├── rlm_orchestrator.py     # Multi-step retrieval (712 lines)
-│   │   │   │   ├── knowledge_intelligence.py # API/dep/trace queries (683 lines)
-│   │   │   │   ├── context_builder.py      # Token-budget assembly (236 lines)
-│   │   │   │   └── kg_node_utils.py        # Node utilities (625 lines)
+│   │   │   │   ├── search_service.py       # Hybrid search + RRF (2750 lines)
+│   │   │   │   ├── rlm_orchestrator.py     # Multi-step retrieval (1031 lines)
+│   │   │   │   ├── knowledge_intelligence.py # API/dep/trace queries (713 lines)
+│   │   │   │   ├── context_builder.py      # Token-budget assembly (262 lines)
+│   │   │   │   └── kg_node_utils.py        # Node utilities (798 lines)
 │   │   │   ├── KG/
-│   │   │   │   ├── build_knowledge_graph.py  # KG construction (4668 lines)
-│   │   │   │   └── query_knowledge_graph.py  # Legacy query module (1595 lines)
+│   │   │   │   ├── build_knowledge_graph.py  # KG construction (8039 lines)
+│   │   │   │   └── query_knowledge_graph.py  # Legacy query module (1738 lines)
 │   │   │   ├── RAG/
 │   │   │   │   ├── hybrid_rag_unified.py     # Profile-agnostic RAG
 │   │   │   │   ├── rag_query_unified.py      # Unified query engine
@@ -345,40 +353,47 @@ ai-core-engine/
 │   │   │   ├── token_manager.py        # GPT4IFX JWT lifecycle
 │   │   │   └── pdf_pipeline.py         # PDF processing pipeline
 │   │   └── config/
-│   │       ├── ontology.yaml           # 6166-line ontology definition
+│   │       ├── ontology.yaml           # 7275-line ontology definition
 │   │       └── storage_config.yaml     # Neo4j + Qdrant connection config
 │   │
 │   ├── IngestionPipeline/            # File parsing + KG ingestion
-│   │   ├── ingestion_service.py      # Service + job tracker (670 lines)
-│   │   ├── Parsers/                  # 14 specialized parsers
-│   │   ├── Connectors/              # Jama, Jenkins, Polarion
+│   │   ├── ingestion_service.py      # Service + job tracker (997 lines)
+│   │   ├── batch_ingestion.py       # Batch / repository ingestion driver
+│   │   ├── Parsers/                  # 18 specialized parsers (C, ARXML, PDF, xlsx, SWA, testspec, ...)
+│   │   ├── Connectors/              # Bitbucket, Jama, Jenkins, Polarion
 │   │   ├── Incremental/             # Git + mtime change detection
 │   │   └── config/                  # Parser configurations
 │   │
 │   ├── MemoryLayer/                  # Sessions + working memory
 │   │   └── memory/
-│   │       ├── working_memory/       # Session + Manager + backends
+│   │       ├── working_memory/       # Session backends (Redis / in-memory)
 │   │       ├── semantic_memory/      # PatternStore (Qdrant-backed)
 │   │       ├── node_sets/           # NodeSet manager + scoped queries
+│   │       ├── session_manager.py   # Session lifecycle + TTL reaper
 │   │       ├── ephemeral_sandbox.py # Per-session in-memory KG
 │   │       ├── context_builder.py   # "Librarian" budget allocator
+│   │       ├── few_shot_library.py  # Few-shot example store
 │   │       ├── ontology_loader.py   # Singleton YAML loader
 │   │       └── domain_session_adapter.py
 │   │
 │   ├── ReviewGate/                   # Confidence + feedback + results
-│   │   ├── confidence.py            # Deterministic scoring (436 lines)
-│   │   └── result_processors.py     # JUnit/VP/Polyspace parsers (709 lines)
+│   │   ├── confidence.py            # Deterministic scoring (465 lines)
+│   │   └── result_processors.py     # JUnit/VP/Polyspace parsers (728 lines)
 │   │
 │   ├── Configuration/                # Cache + ontology services
 │   │   ├── cache_service.py         # LRU + FAISS L1 + RediSearch L2 3-tier cache
+│   │   ├── embedding_singleton.py   # Shared sentence-transformers model
 │   │   └── services.py             # OntologyService + ObservabilityService
 │   │
 │   └── Observability/                # Audit persistence + metrics
 │       ├── postgres_schema.py       # 7-table PostgreSQL schema
-│       └── metrics.py               # Prometheus metrics (11 types + NoOp fallback)
+│       ├── metrics.py               # 25 Prometheus metrics (+ NoOp fallback)
+│       ├── otel_tracing.py          # OpenTelemetry tracing setup
+│       └── log_sanitizer.py         # Secret-scrubbing log filter
 │
-├── docker-compose.yml                # 7-service orchestration
-├── Dockerfile                        # Multi-stage build (Cerbos + Python 3.12)
+├── Dockerfile                        # Multi-stage build (Cerbos PDP + Python 3.12)
+├── .gitlab-ci.yml                    # GitLab CI/CD pipeline
+├── monitoring/                       # Prometheus config + Grafana dashboards
 ├── requirements.txt                  # Python dependencies
 └── docs/                             # Documentation
     ├── DOCUMENTATION.md              # Complete reference (tools, config, API)
@@ -387,7 +402,7 @@ ai-core-engine/
     └── architecture/                 # ← You are here
 ```
 
-**Scale**: ~25,000+ lines of Python, 6,166-line ontology YAML, **55 active MCP tools** across 14 categories, 14 parsers, 3 external connectors, 7 PostgreSQL tables.
+**Scale**: ~88,000 lines of Python across 184 files, 7,275-line ontology YAML, **55 active MCP tools** across 14 categories, 18 parsers, 4 external connectors, 7 PostgreSQL tables.
 
 ---
 
@@ -403,7 +418,7 @@ ai-core-engine/
 | [Review Gate](review-gate.md) | Confidence scoring, feedback, result processing |
 | [Auth & Security](auth-and-security.md) | Cerbos RBAC, API keys, tier model |
 | [Observability](observability.md) | PostgreSQL audit, Prometheus metrics, Grafana dashboards, health checks |
-| [Deployment](deployment.md) | Docker Compose, Kubernetes, Dockerfile |
+| [Deployment](deployment.md) | Kubernetes / OpenShift, Dockerfile, GitLab CI |
 | [DOCUMENTATION.md](../DOCUMENTATION.md) | Full MCP tool reference |
 | [MCP_QUICKSTART.md](../MCP_QUICKSTART.md) | Client setup and usage guide |
 | [NODE_SETS_ARCHITECTURE.md](../NODE_SETS_ARCHITECTURE.md) | NodeSet module isolation design |

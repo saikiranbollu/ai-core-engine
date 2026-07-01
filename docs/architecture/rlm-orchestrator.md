@@ -1,7 +1,7 @@
 # RLM Orchestrator Architecture
 
 **Component**: `src/HybridRAG/code/querier/rlm_orchestrator.py`
-**Primary class**: `RLMOrchestrator` (712 lines)
+**Primary class**: `RLMOrchestrator` (1031 lines)
 **Dependencies**: `SearchService`, `ContextBuilder`, GPT4IFX (LLM proxy)
 
 ---
@@ -28,7 +28,7 @@ The RLM (Retrieval-augmented Language Model) Orchestrator handles **complex mult
 
 However, two MCP tools are exposed at the **developer** tier for visibility and debugging:
 - `rlm_orchestrate` — execute a full orchestration
-- `rlm_preview` — inspect the generated plan without executing it
+- `rlm_plan_preview` — inspect the generated plan without executing it
 
 ---
 
@@ -73,7 +73,7 @@ Domain Assistant
 
 ## 3. Task Types
 
-`RLMTaskType` is an enum with **24 values** covering all V-Model lifecycle phases:
+`RLMTaskType` is an enum with **25 values** covering all V-Model lifecycle phases:
 
 ### Requirements Phase
 
@@ -127,44 +127,46 @@ Domain Assistant
 | `DEBUG_ANALYSIS` | Debug analysis and root cause investigation |
 | `KNOWLEDGE_INGESTION` | Knowledge ingestion workflows |
 | `STOP_TYPING` | Placeholder (unused) |
+| `HSI_ANALYSIS` | Hardware-software interface (HSI) analysis |
 | `GENERIC` | Fallback for unclassified queries |
 
 ---
 
 ## 4. DA-to-Task Mapping
 
-`DA_TASK_MAPPING` maps each of the 21 Domain Assistants to one or more task types:
+`DA_TASK_MAPPING` maps **17 Domain Assistant codes** (the canonical AI Domain Assistant names
+from the Confluence "AI Assistants" space, MCSWAI) to one or more task types. It is a reference
+table only — it is not subscripted at runtime.
 
-| Domain Assistant | Code | Task Types |
-|-----------------|------|------------|
-| Code Generator | CIA | `code_generation`, `bugfix_analysis` |
-| Test Generator | GEST | `test_generation` |
-| Code Reviewer | ACRA | `code_review`, `misra_review` |
-| Architecture Analyst | SAGA | `architecture_analysis` |
-| Architecture Tracer | ATRA | `architecture_traceability` |
-| Requirements Reviewer | REVA | `requirement_review` |
-| Requirements Drafter | PRQ | `requirement_drafting` |
-| Requirements Manager | RMA | `requirement_management` |
-| Config Generator | GECA | `config_generation` |
-| Page Generator | PAGE | `page_generation` |
-| Test Verifier | GEVT | `test_verification` |
-| Test Quality Analyst | ATQA | `test_quality_analysis` |
-| Safety Validator | SAVA | `safety_validation` |
-| Safety Analyst | SAAN | `safety_analysis` |
-| HAZOP Analyst | HZOP | `hazop_analysis` |
-| Data Flow Analyst | DFA | `data_flow_analysis` |
-| MISRA Reviewer | MIRA | `misra_review` |
-| Traceability Analyst | TripleA | `traceability` |
-| Debug Analyst | VoltAI | `debug_analysis` |
-| Knowledge Weaver | KW | `knowledge_ingestion` |
-| Code Transformer | CTA | `code_transformation` |
+| DA Code | Task Types |
+|---------|------------|
+| GEST | `test_generation` |
+| GECA | `config_generation` |
+| GEVT | `test_verification` |
+| ACRA | `code_review`, `misra_review` |
+| ATRA | `architecture_traceability` |
+| ATQA | `test_quality_analysis` |
+| TripleA | `traceability` |
+| REVA | `requirement_review` |
+| SAVA | `safety_validation` |
+| SASA | `safety_analysis` |
+| DaFaA | `data_flow_analysis` |
+| HAZOPA | `hazop_analysis` |
+| PRQGEN | `requirement_drafting` |
+| SWQMA | `quality_management` |
+| J-WIZ | `java_code_generation` |
+| Zephyr | `zephyr_soc_generation` |
+| EDA | `code_generation` (iLLD Embedded Driver Assistant) |
+
+> Note: `quality_management`, `java_code_generation`, and `zephyr_soc_generation` appear as task
+> strings in the mapping but are not members of the `RLMTaskType` enum.
 
 ---
 
 ## 5. Orchestration Flow
 
 ```python
-def orchestrate(self, query, task_type, workspace, module, session_id):
+def run(self, query, task_type, workspace, module, session_id, on_progress=None):
 ```
 
 ### Step 1: Plan
@@ -232,12 +234,12 @@ The planning prompt is **task-type-aware**. Each `RLMTaskType` has domain-specif
 Given the user query: "Generate initialization code for CAN module"
 
 Generate sub-queries to gather:
-1. API function signatures (alpha=0.3, structural)
+1. API function signatures (alpha=0.8, structural)
 2. Configuration struct definitions (alpha=0.8, structural)
-3. Dependency/initialization ordering (alpha=0.3)
-4. Register access patterns (alpha=0.3)
+3. Dependency/initialization ordering (alpha=0.7, structural)
+4. Register access patterns (alpha=0.7, structural)
 5. MISRA compliance rules for init patterns (alpha=0.5)
-6. Similar approved code examples (alpha=0.7, semantic)
+6. Similar approved code examples (alpha=0.3, semantic)
 ```
 
 ### Example: `TEST_GENERATION` Planning
@@ -253,7 +255,14 @@ Generate sub-queries to gather:
 5. Coverage gaps in current test suite (alpha=0.3)
 ```
 
-The per-sub-query alpha values are tuned for the type of information needed: structural lookups use low alpha (graph-heavy), semantic lookups use high alpha (vector-heavy).
+The per-sub-query alpha values are tuned for the type of information needed: structural lookups use **high** alpha (graph-heavy), semantic lookups use **low** alpha (vector-heavy). Recall that alpha weights the graph ranks and `(1 - alpha)` the vector ranks.
+
+### Planner Resilience
+
+The planner LLM call (`_default_llm`) retries on transient OpenAI SDK errors and refreshes the
+GPT4IFX token on a 401. If all retries are exhausted, the orchestrator falls back to a
+deterministic single-step plan and increments the `aice_rlm_planner_fallbacks_total` counter
+(`reason="exhausted"`), so planner degradation is observable in Prometheus.
 
 ---
 
@@ -273,10 +282,10 @@ The synthesis choice depends on total token count — if concatenation fits with
 
 ## 8. Preview Mode
 
-`rlm_preview` returns the generated plan **without executing** the sub-queries:
+`rlm_plan_preview` returns the generated plan **without executing** the sub-queries:
 
 ```python
-preview = rlm.preview(query, task_type, workspace, module)
+preview = rlm.plan_preview(query, task_type)
 # Returns:
 {
     "sub_queries": [...],
@@ -302,5 +311,5 @@ This lets operators:
 | `MAX_STEPS` | 6 | Maximum sub-queries per orchestration |
 | `SUB_BUDGET` | 8000 | Token budget per sub-query step |
 | LLM model | GPT4IFX | Infineon LLM proxy for planning + synthesis |
-| `DA_TASK_MAPPING` | 21 entries | Maps DA names to task types |
+| `DA_TASK_MAPPING` | 17 entries | Maps DA codes to task types |
 | Alpha per step | Varies | Set per sub-query by the planner |

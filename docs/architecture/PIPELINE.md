@@ -81,7 +81,9 @@ requirement traceability edges.
 ### Stage 3 — Vector Search (Qdrant)
 
 Dense retrieval using 384-dimensional embeddings (all-MiniLM-L6-v2 via
-FlashRank, replacing PyTorch/sentence-transformers per ADR-038).
+sentence-transformers, loaded once through the shared `embedding_singleton`).
+FlashRank is used only for cross-encoder reranking in Stage 5 — not for
+embeddings; sentence-transformers (CPU-only PyTorch) remains required.
 
 - **Module**: `src/HybridRAG/code/querier/search_service.py` (implemented as `SearchService._vector_search()`; there is **no** separate `vector_search.py` file)
 - **Fallback**: 384-dim zero-padded embeddings (H18 fix)
@@ -93,7 +95,7 @@ Reciprocal Rank Fusion combines graph and vector result lists into a
 single ranked set. Batch enrichment resolves cross-references and
 attaches metadata (module, file path, confidence scores).
 
-- **Module**: `src/HybridRAG/code/querier/search_service.py` (implemented as `SearchService._merge_results_rrf()`; there is **no** separate `rrf_merge.py` file). Batch enrichment is in `src/HybridRAG/code/querier/batch_graph_resolver.py`.
+- **Module**: `src/HybridRAG/code/querier/search_service.py` (implemented as `SearchService._merge_results_weighted()`, which dispatches to `_merge_illd_rrf()` for the `illd` workspace and `_merge_mcal()` for `mcal`; there is **no** separate `rrf_merge.py` file). Batch enrichment is in `src/HybridRAG/code/querier/batch_graph_resolver.py`.
 - **Token estimation**: `len(text) // 4` (M09 standardization)
 
 ### Stage 5 — Cross-Encoder Reranking (GAP-A01, FlashRank)
@@ -147,8 +149,10 @@ The `alpha` parameter controls the blend between graph and vector search:
 | Alpha | Behavior          |
 |-------|--------------------|
 | 0.0   | Pure vector search |
-| 0.5   | Balanced (default) |
+| 0.5   | Balanced           |
 | 1.0   | Pure graph search  |
+
+Config default: `0.6` (`_DEFAULT_SEARCH_ALPHA`, slightly graph-leaning).
 
 ---
 
@@ -167,6 +171,6 @@ The `alpha` parameter controls the blend between graph and vector search:
 |---------|-----------------------------------------------|
 | ADR-036 | OpenTelemetry adopted for MCP layer only      |
 | ADR-037 | asyncio.TaskGroup replaces Celery             |
-| ADR-038 | FlashRank replaces PyTorch                    |
+| ADR-038 | FlashRank (ONNX) replaces PyTorch cross-encoder for reranking |
 | ADR-040 | Rate limiting via slowapi                     |
 | ADR-041 | CBMC/FMEA domain tools deferred               |

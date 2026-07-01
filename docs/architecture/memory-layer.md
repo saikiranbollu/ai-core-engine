@@ -130,7 +130,7 @@ Ontology validation ensures that sessions reference valid modules and node types
 
 ## 3. Ephemeral Sandbox
 
-`SandboxManager` (535 lines) provides per-session temporary knowledge stores for user-uploaded documents. This lets DAs explore documents that aren't in the main knowledge graph.
+`SandboxManager` (in `ephemeral_sandbox.py`, 3667 lines) provides per-session temporary knowledge stores for user-uploaded documents. This lets DAs explore documents that aren't in the main knowledge graph.
 
 ### Architecture
 
@@ -156,8 +156,9 @@ sandbox_query(query)
 
 | Limit | Value |
 |-------|-------|
-| Max files per session | 20 |
-| Max total size per session | 50 MB |
+| Max file size | 10 MB (per file, `MAX_FILE_SIZE`) |
+| Max chunks per session | 5000 (`max_chunks`) |
+| Max KG-pull nodes per upload | 500 (`MAX_PULL_NODES`) |
 | Lifetime | Destroyed when session ends |
 
 ### Keyword Index
@@ -172,7 +173,7 @@ sandbox_query(query)
 
 ## 4. Semantic Memory (Pattern Store)
 
-`PatternStore` (481 lines) manages **approved patterns** — learned from feedback on DA responses. When a DA response is approved (via the Review Gate), successful patterns are extracted and stored for future reference.
+`PatternStore` (485 lines) manages **approved patterns** — learned from feedback on DA responses. When a DA response is approved (via the Review Gate), successful patterns are extracted and stored for future reference.
 
 ### Storage
 
@@ -269,7 +270,7 @@ The primary context assembler used by MCP tools. Implements a **10-slot token bu
 4. **Second pass**: fill redistributed budget with previously-skipped items
 5. **Hard cap**: if total exceeds `total_budget` (default 8000), trim lowest-relevance items globally
 
-**Token estimation**: `len(text) // 3` — conservative approximation of ~3 characters per token.
+**Token estimation**: `len(text) // 4` — ~4 characters per token (M09 standardization).
 
 **Output**: `render()` assembles slots into sections:
 ```
@@ -294,7 +295,7 @@ Fills greedily with provenance tracking (source of each entry). Used for direct 
 
 ## 7. Ontology Loader
 
-`OntologyLoader` (335 lines) is a **singleton** that loads and provides typed access to `ontology.yaml` (6166 lines).
+`OntologyLoader` (335 lines) is a **singleton** that loads and provides typed access to `ontology.yaml` (7275 lines).
 
 ### Ontology Structure
 
@@ -331,7 +332,7 @@ node_types:
 - `get_property_schema(node_type)` → property definitions
 - `validate_node(node_type, properties)` → check against schema
 
-The singleton pattern ensures the 6166-line YAML is parsed only once and shared across all services.
+The singleton pattern ensures the 7275-line YAML is parsed only once and shared across all services.
 
 ---
 
@@ -343,15 +344,16 @@ The singleton pattern ensures the 6166-line YAML is parsed only once and shared 
 | `working_memory/session.py` | 225 | `Session` and `ContextEntry` dataclasses |
 | `working_memory/manager.py` | 659 | `WorkingMemoryManager`, `SessionBackend` ABC, backends |
 | **semantic_memory/** | | |
-| `semantic_memory/pattern_store.py` | 481 | `PatternStore` — Qdrant-backed CRUD + similarity |
-| `semantic_memory/pattern_index.py` | ~100 | Backward-compatible `PatternIndex` wrapper |
-| `semantic_memory/embedder.py` | ~100 | sentence-transformers wrapper |
+| `semantic_memory/pattern_store.py` | 485 | `PatternStore` — Qdrant-backed CRUD + similarity |
+| `semantic_memory/pattern_index.py` | 98 | Backward-compatible `PatternIndex` wrapper |
+| `semantic_memory/embedder.py` | 187 | sentence-transformers wrapper |
 | **node_sets/** | | |
 | `node_sets/node_set_manager.py` | 372 | `:NodeSet` anchor node CRUD |
 | `node_sets/scoped_query.py` | 424 | NodeSet-scoped query methods |
 | **Root files** | | |
-| `ephemeral_sandbox.py` | 535 | `SandboxManager`, `EphemeralGraph`, `EphemeralVectors` |
-| `context_builder.py` | 220 | "Librarian" context builder |
+| `ephemeral_sandbox.py` | 3667 | `SandboxManager`, `EphemeralSandbox`, `EphemeralGraph`, `EphemeralVectors` |
+| `context_builder.py` | 233 | "Librarian" context builder |
 | `ontology_loader.py` | 335 | Singleton `OntologyLoader` |
 | `domain_session_adapter.py` | 323 | MCP-routed session adapter |
-| `session_manager.py` | 220 | Sprint 2 lightweight compatibility layer |
+| `session_manager.py` | 224 | Sprint 2 lightweight compatibility layer |
+| `few_shot_library.py` | — | Few-shot example store |
